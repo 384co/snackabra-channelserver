@@ -1,0 +1,40 @@
+# Copyright (c) 2016-2021 Magnusson Institute, All Rights Reserved.
+
+# setup:
+# copy this file to the top level and rename it 'wrangler.toml'
+# insert the pertinent id:s from Cloudflare dashboard
+
+# Personal Storage ('s') Server
+# 's' will be the name on CF, ergo "s.<your CF comain>.workers.dev"
+name = "s"
+
+type = 'javascript'
+workers_dev = false
+compatibility_date = "2022-02-01"
+
+# You need to set up these KV namespaces in the CF dashboard, and
+# copy-paste their id:s here. Note that some namespaces are shared
+# with the Room server, in case you're running both.
+kv_namespaces = [
+    { binding = "KEYS_NAMESPACE", preview_id = "", id = "" },
+    { binding = "LEDGER_NAMESPACE", preview_id = "", id = "" },
+    { binding = "IMAGES_NAMESPACE", preview_id = "", id = "" },
+    { binding = "RECOVERY_NAMESPACE", preview_id = "", id = "" }
+]
+
+[build.upload]
+format = "modules"
+dir = "src"
+main = "storage.js"
+
+[[build.upload.rules]]
+type = "ESModule"
+globs = ["**/*.js"]
+
+[miniflare]
+kv_persist = true # Defaults to ./.mf/kv
+[vars]
+
+LEDGER_KEY='{"key_ops":["encrypt"],"ext":true,"kty":"RSA","n":"1I7au5twt64cCoH3GeCteBTyrbZ8kN9VhfnbBngoLI0l8llWFTU69FFR8igBcvUgV7QewrM66AbbE9ZZf8dsaFcSp8iQDPqguRQgRZn0xlpwU37PVsrIoOSsAZ1YbaVs-uhTKg_8E58ylPHwzSBhO45XNgrNMtSIvVU0Bgm3rFskrGifBFlQ7YrZrdqIOoREwomWQdNbPcOYfCTR-eKK7HVAYQp5Tww3ZofUiGCyKnI7alLFY_jiMvP-P5oPTvwQwWPoUmp2T9ZLYsNqI3SeJJuAU5opwZLShzAFdMNxdmKb16gLvICJULoMyJ-4ZL-JhpHhLIc7N5jDgg0T8x0pA7kkqoJBb0ui8a44rFQuBjSCB5S2dFApN0fOqPxWOAWGi2JXbOtv-kK1iiodqEwER6Q_FhuwJGPMBN9b3mRTUMr_art_zW9374Dv-PqNRzRhfvY1XtAXyCZ0yLutk1quxlDQdN-CpdYhrE0K6G_bDnVIFwAOKg64gySPiW1KsXt45GoNcSzoIEZRKnpClxUtQC1vz8FjYCoNpHhGzlhRjSGkGA0OI8rpL04RhZlE_dbwPcucvqEJ0ypPCuE80PYaRbyS1_RERSnpThhMZdWjO7NQDMnAaKeh-VMGD0w4nqYfOx2C1oLvnaz3hgcNrGlVh9UKsBOy04cIUyTjAQ3lcls","e":"AQAB","alg":"RSA-OAEP-256"}'
+SERVER_SECRET="password"
+DOCKER_WS="true"
