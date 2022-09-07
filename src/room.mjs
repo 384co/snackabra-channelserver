@@ -426,10 +426,19 @@ export class ChatRoomAPI {
           return;
         }
 
+        const ack = jsonParseWrapper(msg.data, 'L396');
+        if (ack.type === 'ack') {
+          ack.ack = true;
+          console.log('ack recieved')
+          webSocket.send(JSON.stringify(ack));
+          return;
+        }
+
         if (!receivedUserInfo) {
           // The first message the client sends is the user info message with their pubKey. Save it
           // into their session object and in the visitor list.
           // webSocket.send(JSON.stringify({error: JSON.stringify(msg)}));
+          console.log(msg.data);
           const data = jsonParseWrapper(msg.data, 'L396');
           if (this.room_owner === null || this.room_owner === "") {
             webSocket.close(4000, "This room does not have an owner, or the owner has not enabled it. You cannot leave messages here.");
@@ -449,6 +458,7 @@ export class ChatRoomAPI {
             });
           }
           if (!data.name) {
+            console.log(!data.name)
             webSocket.close(1000, 'The first message should contain the pubKey')
             return;
           }
@@ -493,7 +503,7 @@ export class ChatRoomAPI {
 
           return;
         } else if (jsonParseWrapper(msg.data, 'L449').ready) {
-          if(!session.blockedMessages){
+          if (!session.blockedMessages) {
             return;
           }
           if (this.env.DOCKER_WS) {
