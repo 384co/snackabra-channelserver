@@ -109,13 +109,18 @@ You also need to generate a RSA-OAEP key and push that;
 you need to generate that and copy-paste.
 
 You need to generate the ledger key yourself ('jwk' format), there's a
-few ways to do that, for example open a browser console and enter the
-following Javascript (https://developer.mozilla.org/en-US/docs/Web/API/SubtleCrypto/generateKey#rsa_key_pair_generation):
+few ways to do that. If you are running Node v15 or higher the mint_keys.js script will mint and store them locally:
 
-If you are running Node v15 or higher the mint_keys.js script will mint and store them locally.
+```
+node ./mint_keys.js
+```
+
+Or if you want to me more secure (so that the private key never
+touches your file system), you can for example open any browser
+console and enter the following Javascript
+(https://developer.mozilla.org/en-US/docs/Web/API/SubtleCrypto/generateKey#rsa_key_pair_generation):
 
 ::
-
    let keyPair = await window.crypto.subtle.generateKey(
      {
        name: "RSA-OAEP",
@@ -158,6 +163,35 @@ And point a client to it!
 (*) We are not affiliated with Cloudflare, we're just fans.
 
 Log into the Cloudflare dashboard > Workers > Durable Objects
+
+
+Setup (Development)
+-------------------
+
+If you are developing locally, we suggest https://miniflare.dev/
+
+<details>
+<summary><h2>Click for Details</h2></summary>
+
+Setup is similar as above:
+
+```
+# copy the template 'toml' file for miniflare
+cp setup/miniflare.wrangler.toml wrangler.toml
+```
+
+The only thing you need to change is the "LEDGER_KEY" (to the generated public key).
+
+Then setup packages and run:
+
+```
+npm install
+npm run miniflare
+```
+
+It should fire up on ```http://127.0.0.1:4001```
+
+</details>
 
 
 

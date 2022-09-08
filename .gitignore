@@ -13,3 +13,4 @@ wrangler.toml
 /my_public_key
 /my_private_key
 /.mf/
+node_modules
