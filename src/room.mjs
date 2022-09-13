@@ -526,7 +526,13 @@ export class ChatRoomAPI {
         await this.env.MESSAGES_NAMESPACE.put(key, msg.data);
       } catch (error) {
         // Report any exceptions directly back to the client
-        webSocket.send(JSON.stringify({ error: '[handleSession()] ' + error.message + '\n' + error.stack }));
+	let err_msg = '[handleSession()] ' + error.message + '\n' + error.stack + '\n';
+	console.log(err_msg);
+	try {
+	  webSocket.send(JSON.stringify({ error: err_msg }));
+	} catch {
+	  console.log("(NOTE - getting error on sending error message back to client)");
+	}
       }
     });
 
