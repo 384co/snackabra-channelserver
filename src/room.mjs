@@ -520,7 +520,7 @@ export class ChatRoomAPI {
         _x[key] = jsonParseWrapper(msg.data, 'L466');
         this.broadcast(JSON.stringify(_x))
         await this.storage.put(key, msg.data);
-        console.log("NOW CALLING FUNCTION")
+        console.log("calling endNotifications()");
         await this.sendNotifications(true);
         // webSocket.send(JSON.stringify({ error: err.stack }));
         await this.env.MESSAGES_NAMESPACE.put(key, msg.data);
@@ -628,15 +628,25 @@ export class ChatRoomAPI {
   async postPubKey(request) {
     try {
       const { searchParams } = new URL(request.url);
-      const json = await request.json();
-      const keyType = searchParams.get('type');
-      if (keyType != null) {
-        this.storage.put(keyType, JSON.stringify(json));
-        this.initialize();
+      // const json = await request.json();
+      const str = await request.text();
+      if (str) {
+        const json = await jsonParseWrapper(str, 'L611');
+        const keyType = searchParams.get('type');
+        if (keyType != null) {
+          this.storage.put(keyType, JSON.stringify(json));
+          this.initialize();
+        }
+        return returnResult(request, JSON.stringify({ success: true }), 200);
+      } else {
+        console.log("ERROR: Received blank body in postPubKey(request) (??)");
+        return returnResult(request, JSON.stringify({
+          success: false,
+          error: '[postPubKey()] Received empty request body (??)\n'
+        }), 200);
       }
-      return returnResult(request, JSON.stringify({ success: true }), 200);
     } catch (error) {
-      console.log("Error posting pubKey", error);
+      console.log("ERROR posting pubKey", error);
       return returnResult(request, JSON.stringify({
         success: false,
         error: '[postPubKey()] ' + error.message + '\n' + error.stack
