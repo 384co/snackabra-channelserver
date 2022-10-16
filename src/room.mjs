@@ -875,7 +875,9 @@ export class ChatRoomAPI {
       if (!request.headers.has('authorization')) {
         return false;
       }
-      let auth_parts = request.headers['authorization'].split('.');
+      let authHeader = request.headers['authorization']
+      if (!authHeader) return false
+      let auth_parts = authHeader.split('.');
       if (new Date().getTime() - parseInt(auth_parts[0]) > 60000) {
         return false;
       }
