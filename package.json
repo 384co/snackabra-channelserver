@@ -8,5 +8,11 @@
   "bugs": "https://github.com/snackabra/snackabra-roomserver/issues",
   "homepage": "https://snackabra.io",
   "license": "GPL-3.0-only",
-  "private": false
+  "private": false,
+  "scripts": {
+    "miniflare" : "miniflare src/room.mjs --watch --debug --modules --port 4001 --wrangler-config wrangler.toml"
+  },
+  "devDependencies": {
+    "miniflare": "^2.6.0"
+  }
 }

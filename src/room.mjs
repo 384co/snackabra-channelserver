@@ -520,13 +520,19 @@ export class ChatRoomAPI {
         _x[key] = jsonParseWrapper(msg.data, 'L466');
         this.broadcast(JSON.stringify(_x))
         await this.storage.put(key, msg.data);
-        console.log("NOW CALLING FUNCTION")
+        console.log("calling endNotifications()");
         await this.sendNotifications(true);
         // webSocket.send(JSON.stringify({ error: err.stack }));
         await this.env.MESSAGES_NAMESPACE.put(key, msg.data);
       } catch (error) {
         // Report any exceptions directly back to the client
-        webSocket.send(JSON.stringify({ error: '[handleSession()] ' + error.message + '\n' + error.stack }));
+	let err_msg = '[handleSession()] ' + error.message + '\n' + error.stack + '\n';
+	console.log(err_msg);
+	try {
+	  webSocket.send(JSON.stringify({ error: err_msg }));
+	} catch {
+	  console.log("(NOTE - getting error on sending error message back to client)");
+	}
       }
     });
 
@@ -622,15 +628,25 @@ export class ChatRoomAPI {
   async postPubKey(request) {
     try {
       const { searchParams } = new URL(request.url);
-      const json = await request.json();
-      const keyType = searchParams.get('type');
-      if (keyType != null) {
-        this.storage.put(keyType, JSON.stringify(json));
-        this.initialize();
+      // const json = await request.json();
+      const str = await request.text();
+      if (str) {
+        const json = await jsonParseWrapper(str, 'L611');
+        const keyType = searchParams.get('type');
+        if (keyType != null) {
+          this.storage.put(keyType, JSON.stringify(json));
+          this.initialize();
+        }
+        return returnResult(request, JSON.stringify({ success: true }), 200);
+      } else {
+        console.log("ERROR: Received blank body in postPubKey(request) (??)");
+        return returnResult(request, JSON.stringify({
+          success: false,
+          error: '[postPubKey()] Received empty request body (??)\n'
+        }), 200);
       }
-      return returnResult(request, JSON.stringify({ success: true }), 200);
     } catch (error) {
-      console.log("Error posting pubKey", error);
+      console.log("ERROR posting pubKey", error);
       return returnResult(request, JSON.stringify({
         success: false,
         error: '[postPubKey()] ' + error.message + '\n' + error.stack
@@ -859,7 +875,9 @@ export class ChatRoomAPI {
       if (!request.headers.has('authorization')) {
         return false;
       }
-      let auth_parts = request.headers['authorization'].split('.');
+      let authHeader = request.headers['authorization']
+      if (!authHeader) return false
+      let auth_parts = authHeader.split('.');
       if (new Date().getTime() - parseInt(auth_parts[0]) > 60000) {
         return false;
       }

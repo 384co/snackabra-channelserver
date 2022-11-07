@@ -1,0 +1,42 @@
+# Copyright (c) 2016-2022 Magnusson Institute, All Rights Reserved.
+
+# Setup for MINIFLARE local development of channel server
+
+# setup: copy this file to the top level and rename it 'wrangler.toml'
+# see README for further details.
+
+# Personal Channel ('r' as in 'room') Server
+# 'r' will be the name on CF, ergo "r.<your CF comain>.workers.dev"
+# Ignored when running locally, port used is set in package.json
+name = "r"
+
+type = "javascript"
+workers_dev = false
+compatibility_date = "2022-02-01"
+
+# for miniflare you don't need any IDs
+kv_namespaces = [
+    { binding = "MESSAGES_NAMESPACE", preview_id = "", id ="" },
+    { binding = "KEYS_NAMESPACE", preview_id = "", id ="" },
+    { binding = "LEDGER_NAMESPACE", preview_id = "", id = "" }
+]
+
+[build.upload]
+format = "modules"
+dir = "src"
+main = "./room.mjs"
+rules = [{type = "Data", globs = ["**/*.html"]}]
+
+[durable_objects]
+bindings = [
+    { name = "rooms", class_name = "ChatRoomAPI" },
+]
+
+[miniflare]
+kv_persist = true # Defaults to ./.mf/kv
+durable_objects_persist = true # Defaults to ./.mf/do
+
+[vars]
+DOCKER_WS="true"
+SERVER_SECRET="password"  # this isn't as bad as it looks - all it does is allow somebody to start a new channel
+LEDGER_KEY='{"key_ops":["encr ...'  # see 'README', same (public) key as channel server uses
