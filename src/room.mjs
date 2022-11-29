@@ -259,7 +259,7 @@ export class ChatRoomAPI {
     this.locked = await storage.get('locked') || false;
     this.join_requests = jsonParseWrapper(await storage.get('join_requests') || JSON.stringify([]), 'L223');
     this.accepted_requests = jsonParseWrapper(await storage.get('accepted_requests') || JSON.stringify([]), 'L224');
-    this.storageLimit = await storage.get('storageLimit') || 1024 * 1024 * 1024;
+    this.storageLimit = await storage.get('storageLimit') || 4 * 1024 * 1024 * 1024; // PSM update 4 GiB default
     this.lockedKeys = await (storage.get('lockedKeys')) || {};
     this.deviceIds = jsonParseWrapper(await (storage.get('deviceIds')) || JSON.stringify([]), 'L227');
     this.claimIat = await storage.get('claimIat') || 0;
