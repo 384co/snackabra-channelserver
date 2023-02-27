@@ -14,3 +14,4 @@ wrangler.toml
 /my_private_key
 /.mf/
 node_modules
+yarn.lock

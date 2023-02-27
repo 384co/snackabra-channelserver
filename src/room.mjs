@@ -28,6 +28,7 @@ async function handleErrors(request, func) {
       pair[1].accept();
       pair[1].send(JSON.stringify({ error: '[handleErrors()] ' + err.message + '\n' + err.stack }));
       pair[1].close(1011, "Uncaught exception during session setup");
+      console.log("webSocket close (error)")
       return new Response(null, { status: 101, webSocket: pair[0] });
     } else {
       return returnResult(request, err.stack, 500)
@@ -423,6 +424,7 @@ export class ChatRoomAPI {
       try {
         if (session.quit) {
           webSocket.close(1011, "WebSocket broken.");
+          console.log("webSocket broken")
           return;
         }
 
@@ -433,6 +435,7 @@ export class ChatRoomAPI {
           const data = jsonParseWrapper(msg.data, 'L396');
           if (this.room_owner === null || this.room_owner === "") {
             webSocket.close(4000, "This room does not have an owner, or the owner has not enabled it. You cannot leave messages here.");
+            console.log("no owner - closing")
           }
           let keys = {
             ownerKey: this.room_owner,
@@ -450,6 +453,7 @@ export class ChatRoomAPI {
           }
           if (!data.name) {
             webSocket.close(1000, 'The first message should contain the pubKey')
+            console.log("no pubKey")
             return;
           }
           // const isPreviousVisitor = this.visitors.indexOf(data.name) > -1;
@@ -459,12 +463,14 @@ export class ChatRoomAPI {
             _name = jsonParseWrapper(data.name, 'L412');
           } catch (err) {
             webSocket.close(1000, 'The first message should contain the pubKey in json stringified format')
+            console.log("improper pubKey")
             return;
           }
           const isPreviousVisitor = this.checkJsonExistence(_name, this.visitors);
           const isAccepted = this.checkJsonExistence(_name, this.accepted_requests);
           if (!isPreviousVisitor && this.visitors.length >= this.room_capacity) {
             webSocket.close(4000, 'The room is not accepting any more visitors.');
+            console.log("no more visitors")
             return;
           }
           if (!isPreviousVisitor) {
