@@ -187,6 +187,15 @@ async function lastTimeStamp(room_id, env) {
   }
 }
 
+function postProduction(e, cb, delay, cbargs) {
+  e.waitUntil(new Promise(function (r) {
+    setTimeout(async function () {
+      await cb(cbargs);
+      r();
+    }, delay);
+  }));
+}
+
 // =======================================================================================
 // The ChatRoom Durable Object Class
 //
@@ -260,7 +269,7 @@ export class ChatRoomAPI {
     this.locked = await storage.get('locked') || false;
     this.join_requests = jsonParseWrapper(await storage.get('join_requests') || JSON.stringify([]), 'L223');
     this.accepted_requests = jsonParseWrapper(await storage.get('accepted_requests') || JSON.stringify([]), 'L224');
-    this.storageLimit = await storage.get('storageLimit') || 1024 * 1024 * 1024;
+    this.storageLimit = await storage.get('storageLimit') || 4 * 1024 * 1024 * 1024; // PSM update 4 GiB default
     this.lockedKeys = await (storage.get('lockedKeys')) || {};
     this.deviceIds = jsonParseWrapper(await (storage.get('deviceIds')) || JSON.stringify([]), 'L227');
     this.claimIat = await storage.get('claimIat') || 0;
@@ -499,7 +508,7 @@ export class ChatRoomAPI {
 
           return;
         } else if (jsonParseWrapper(msg.data, 'L449').ready) {
-          if(!session.blockedMessages){
+          if (!session.blockedMessages) {
             return;
           }
           if (this.env.DOCKER_WS) {
@@ -524,21 +533,23 @@ export class ChatRoomAPI {
 
         let _x = {}
         _x[key] = jsonParseWrapper(msg.data, 'L466');
-        this.broadcast(JSON.stringify(_x))
+        await this.broadcast(JSON.stringify(_x))
         await this.storage.put(key, msg.data);
-        console.log("calling endNotifications()");
-        await this.sendNotifications(true);
+
+
+        // await this.sendNotifications(true);
+
         // webSocket.send(JSON.stringify({ error: err.stack }));
         await this.env.MESSAGES_NAMESPACE.put(key, msg.data);
       } catch (error) {
         // Report any exceptions directly back to the client
-	let err_msg = '[handleSession()] ' + error.message + '\n' + error.stack + '\n';
-	console.log(err_msg);
-	try {
-	  webSocket.send(JSON.stringify({ error: err_msg }));
-	} catch {
-	  console.log("(NOTE - getting error on sending error message back to client)");
-	}
+        let err_msg = '[handleSession()] ' + error.message + '\n' + error.stack + '\n';
+        console.log(err_msg);
+        try {
+          webSocket.send(JSON.stringify({ error: err_msg }));
+        } catch {
+          console.log("(NOTE - getting error on sending error message back to client)");
+        }
       }
     });
 
@@ -553,11 +564,12 @@ export class ChatRoomAPI {
   }
 
   // broadcast() broadcasts a message to all clients.
-  broadcast(message) {
+  async broadcast(message) {
     if (typeof message !== "string") {
       message = JSON.stringify(message);
     }
-
+    console.log("calling sendWebNotifications()", message);
+    await this.sendWebNotifications(message);
     // Iterate over all the sessions sending them messages.
     let quitters = [];
     this.sessions = this.sessions.filter(session => {
@@ -1198,6 +1210,43 @@ export class ChatRoomAPI {
       }
     } else {
       console.log('Set ISS and APS_KEY env vars to enable apple notifications')
+    }
+
+  }
+
+  async sendWebNotifications(message) {
+    console.log("Sending web notification", message)
+    message = JSON.parse(message)
+    if (message?.type === 'ack') return
+    var coeff = 1000 * 60 * 1;
+    var date = new Date(); 
+    var rounded = new Date(Math.round(date.getTime() / coeff) * coeff)
+    try {
+      const options = {
+        method: "POST",
+        body: JSON.stringify({
+          "channel_id": this.room_id,
+          "notification": {
+            silent: false,
+            // replace notification in the queue, this limits message spam. 
+            // We are limited in how we want to deliever notifications because of the encryption of messages
+            // We limit the number of notifications to 1 per minute
+            tag: `${this.room_id}${rounded}`,
+            title: "You have a new message!",
+            vibration: [100, 50, 100, 50, 350],
+            // requireInteraction: true,
+          }
+        }),
+        headers: {
+          "Content-Type": "application/json"
+        }
+      }
+      // console.log("Sending web notification", options)
+      return await this.env.notifications.fetch("https://notifications.384.dev/notify", options)
+    } catch (err) {
+      console.log(err)
+      console.log("Error sending web notification")
+      return err
     }
 
   }

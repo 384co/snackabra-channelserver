@@ -19,6 +19,6 @@ try {
     );
     let my_private_key = await crypto.webcrypto.subtle.exportKey("jwk", keyPair.privateKey);
     let my_public_key = await crypto.webcrypto.subtle.exportKey("jwk", keyPair.publicKey);
-    await fs.writeFile('./my_public_key',JSON.stringify(my_public_key));
-    await fs.writeFile('./my_private_key',JSON.stringify(my_private_key));
+    await fs.writeFile('./my_public_key', JSON.stringify(my_public_key));
+    await fs.writeFile('./my_private_key', JSON.stringify(my_private_key));
 })()
