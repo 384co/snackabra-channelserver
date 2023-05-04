@@ -105,20 +105,19 @@ room, or migrate a room over from somewhere else.
 
 It will prompt you to enter the secret.
 
-You also need to generate a RSA-OAEP key and push that;
-you need to generate that and copy-paste.
+You also need to generate a RSA-OAEP key for the ledger, in 'jwk' format.
+This is used for internal communication of storage allocation approvals.
 
-You need to generate the ledger key yourself ('jwk' format), there's a
-few ways to do that. If you are running Node v15 or higher the mint_keys.js script will mint and store them locally:
+There are a few ways to do that. If you are running Node v15 or higher
+the mint_keys.js script will mint and store them locally:
 
 ```
 node ./mint_keys.js
 ```
 
-Or if you want to me more secure (so that the private key never
-touches your file system), you can for example open any browser
-console and enter the following Javascript
-(https://developer.mozilla.org/en-US/docs/Web/API/SubtleCrypto/generateKey#rsa_key_pair_generation):
+Or if you want to be more secure (so that the private key never
+touches your file system), you can for, example open any browser
+console and enter the following Javascript:
 
 ::
    let keyPair = await window.crypto.subtle.generateKey(
@@ -135,6 +134,7 @@ console and enter the following Javascript
    let my_public_key = await window.crypto.subtle.exportKey("jwk", keyPair.publicKey);
    JSON.stringify(my_public_key);
 
+(See https://developer.mozilla.org/en-US/docs/Web/API/SubtleCrypto/generateKey#rsa_key_pair_generation)
 
 And you should get something like:
 

@@ -18,6 +18,39 @@
 
 */
 
+const DEBUG = true;
+const DEBUG2 = false;
+
+if (DEBUG) console.log("++++ room.mjs loaded ++++ DEBUG is enabled ++++")
+if (DEBUG2) console.log("++++ DEBUG2 (verbose) enabled ++++")
+
+// TODO: future refactor will be calculating internally in units
+//       of 4KB bytes. This allows for (2^64) bytes storage per channel.
+//       Also, future change will allocate any object budgeted by a 
+//       channel an "address", eg so that everything, ever allocated
+//       by one channel could be conceived of as a single heap, 
+//       within which the start of any shard can be addressed by a 
+//       52-bit "pointer" to a 4KB boundary (and thus can be kept
+//       safely in a Javascript Number). 
+
+const STORAGE_SIZE_UNIT = 4096;
+
+// Currently minimum (raw) storage is set to 32KB. This will not
+// be LOWERED, but future design changes may RAISE that. 
+const STORAGE_SIZE_MIN = 8 * STORAGE_SIZE_UNIT;
+
+// Current maximum (raw) storage is set to 32MB. This may change.
+const STORAGE_SIZE_MAX = 8192 * STORAGE_SIZE_UNIT;
+
+// minimum when creating (budding) a new channel
+const NEW_CHANNEL_MINIMUM_BUDGET = 32 * 1024 * 1024; // 8 MB
+
+// new channel budget (bootstrap) is 3 GB (about $1)
+const NEW_CHANNEL_BUDGET = 3 * 1024 * 1024 * 1024; // 3 GB
+
+// sanity check - set a max at one petabyte (2^50)
+const MAX_BUDGET_TRANSFER = 1024 * 1024 * 1024 * 1024 * 1024; // 1 PB
+
 
 async function handleErrors(request, func) {
   try {
@@ -58,30 +91,32 @@ function jsonParseWrapper(str, loc) {
 }
 
 
-function returnResult(request, contents, s) {
+function returnResult(_request, contents, s) {
   const corsHeaders = {
     "Access-Control-Allow-Methods": "POST, OPTIONS, GET",
     "Access-Control-Allow-Headers": "Content-Type, authorization",
     "Access-Control-Allow-Credentials": "true",
     'Content-Type': 'application/json;',
-    "Access-Control-Allow-Origin": request.headers.get("Origin"),
+    "Access-Control-Allow-Origin": "*" /* request.headers.get("Origin") */,
   }
+  if (DEBUG) console.log("returnResult() contents:", contents, "status:", s)
   return new Response(contents, { status: s, headers: corsHeaders });
 }
 
-function exit(request) {
-  const corsHeaders = {
-    "Access-Control-Allow-Methods": "POST, OPTIONS, GET",
-    "Access-Control-Allow-Headers": "Content-Type, authorization",
-    "Access-Control-Allow-Credentials": "true",
-    'Content-Type': 'application/json;',
-    "Access-Control-Allow-Origin": request.headers.get("Origin"),
-  }
-  return new Response(JSON.stringify({ message: 'script exited' }), { status: 200, headers: corsHeaders });
-}
+// function exit(request) {
+//   const corsHeaders = {
+//     "Access-Control-Allow-Methods": "POST, OPTIONS, GET",
+//     "Access-Control-Allow-Headers": "Content-Type, authorization",
+//     "Access-Control-Allow-Credentials": "true",
+//     'Content-Type': 'application/json;',
+//     "Access-Control-Allow-Origin": request.headers.get("Origin"),
+//   }
+//   return new Response(JSON.stringify({ message: 'script exited' }), { status: 200, headers: corsHeaders });
+// }
 
 export default {
   async fetch(request, env) {
+    if (DEBUG) console.log(`fetch called: ${request.url}`)
     return await handleErrors(request, async () => {
 
       let url = new URL(request.url);
@@ -93,58 +128,56 @@ export default {
           return handleApiRequest(path.slice(1), request, env);
 
         default:
-          return returnResult(request, JSON.stringify({ error: "Not found" }), 404)
+          return returnResult(request, JSON.stringify({ error: "Not found (must give API endpoint)" }), 404)
         //return new Response("Not found", { status: 404 });
       }
     });
   }
 }
 
+// 'name' is room/channel name, 'path' is the rest of the path
+async function callDurableObject(name, path, request, env) {
+  if (DEBUG) {
+    console.log("callDurableObject() name:", name, "path:", path)
+    if (DEBUG2) { console.log(request); console.log(env) }
+  }
+  // const pubKey = await fetch("https://m063.dpn.workers.dev/api/v1/pubKeys?roomId=" + name)
+  // if (pubKey?.error) return returnResult(request, JSON.stringify({ error: "Not found" }), 404);
+  let roomId = env.rooms.idFromName(name);
+  let roomObject = env.rooms.get(roomId);
+  let newUrl = new URL(request.url);
+  newUrl.pathname = "/" + name + "/" + path.join("/");
+  if (DEBUG2) { console.log("callDurableObject() newUrl:"); console.log(newUrl); }
+  return roomObject.fetch(newUrl, request); 
+}
 
+
+// 'path' is the request path, starting AFTER '/api'
 async function handleApiRequest(path, request, env) {
-  // We've received at API request. Route the request based on the path.
-
+  if (DEBUG) { console.log(`handleApiRequest() path:`); console.log(path); }
   switch (path[0]) {
     case "room": {
-      // Request for `/api/room/...`.
-
-      // OK, the request is for `/api/room/<name>/...`. It's time to route to the Durable Object
-      // for the specific room.
-      let name = path[1];
-      /*
-      const pubKey = await fetch("https://m063.dpn.workers.dev/api/v1/pubKeys?roomId=" + name)
-      if (pubKey?.error) {
-        return returnResult(request, JSON.stringify({ error: "Not found" }), 404);
-      }
-
-       */
-      let id = env.rooms.idFromName(name);
-      let roomObject = env.rooms.get(id);
-      let newUrl = new URL(request.url);
-      newUrl.pathname = "/" + path.slice(1).join("/");
-      return roomObject.fetch(newUrl, request);
+      // request is for '/api/room/...', we route (relay) it to the matching durable object
+      // TODO: many requests can probably be handled here, without routing to the durable object
+      return callDurableObject(path[1], path.slice(2), request, env);
     }
-
     case "notifications": {
       let reqData = await request.json();
       let roomList = reqData.rooms;
       let deviceIdentifier = reqData.identifier;
-      console.log("Registering notifications", roomList, deviceIdentifier)
+      if (DEBUG) console.log("Registering notifications", roomList, deviceIdentifier)
       for (let i = 0; i < roomList.length; i++) {
-        console.log("In loop");
-        console.log("ROOM ID", roomList[i])
+        if (DEBUG) { console.log("In loop"); console.log("ROOM ID", roomList[i]); }
         let id = env.rooms.idFromName(roomList[i]);
-
         let roomObject = env.rooms.get(id);
         let newUrl = new URL(request.url);
         newUrl.pathname = "/" + roomList[i] + "/registerDevice";
         newUrl.searchParams.append("id", deviceIdentifier)
-        console.log("URL for room", newUrl)
+        if (DEBUG) console.log("URL for room", newUrl)
         roomObject.fetch(newUrl, request);
       }
       return returnResult(request, JSON.stringify({ status: "Successfully received" }), 200);
     }
-
     case "getLastMessageTimes": {
       try {
         const _rooms = await request.json();
@@ -158,10 +191,8 @@ async function handleApiRequest(path, request, env) {
         return returnResult(request, JSON.stringify({ error: '[getLastMessageTimes] ' + error.message + '\n' + error.stack }), 500);
       }
     }
-
     default:
-      return returnResult(request, JSON.stringify({ error: "Not found" }), 404)
-    //return new Response("Not found", { status: 404 });
+      return returnResult(request, JSON.stringify({ error: "Not found (this is an API endpoint, the URI was malformed)" }), 404)
   }
 }
 
@@ -232,6 +263,8 @@ export class ChatRoomAPI {
     this.claimIat = 0;
     this.notificationToken = {};
     this.personalRoom = false;
+    // 2023.04.03: new fields
+    this.motherChannel = '';
   }
 
   // need the initialize method to restore state of room when the worker is updated
@@ -269,23 +302,53 @@ export class ChatRoomAPI {
     this.locked = await storage.get('locked') || false;
     this.join_requests = jsonParseWrapper(await storage.get('join_requests') || JSON.stringify([]), 'L223');
     this.accepted_requests = jsonParseWrapper(await storage.get('accepted_requests') || JSON.stringify([]), 'L224');
-    this.storageLimit = await storage.get('storageLimit') || 4 * 1024 * 1024 * 1024; // PSM update 4 GiB default
+    // this.storageLimit = await storage.get('storageLimit') || 4 * 1024 * 1024 * 1024; // PSM update 4 GiB default
+    // 2023.05.03: new pattern, storageLimit should ALWAYS be present
+    this.storageLimit = await storage.get('storageLimit')
+    if (!this.storageLimit) {
+      const ledgerData = await this.env.LEDGER_NAMESPACE.get(room_id);
+      if (ledgerData) {
+        const { size, mother } = jsonParseWrapper(ledgerData, 'L311');
+        this.storageLimit = size
+        this.motherChannel = mother
+        if (DEBUG) console.log(`found storageLimit in ledger: ${this.storageLimit}`)
+      } else {
+        if (DEBUG) console.log("storageLimit is undefined in initialize, setting to default")
+        this.storageLimit = NEW_CHANNEL_BUDGET;
+      }
+      await storage.put('storageLimit', this.storageLimit);
+    }
     this.lockedKeys = await (storage.get('lockedKeys')) || {};
     this.deviceIds = jsonParseWrapper(await (storage.get('deviceIds')) || JSON.stringify([]), 'L227');
     this.claimIat = await storage.get('claimIat') || 0;
     this.notificationToken = await storage.get('notificationToken') || "";
-    /*
-    for (let i = 0; i < this.accepted_requests.length; i++) {
-      this.lockedKeys[this.accepted_requests[i]] = await storage.get(this.accepted_requests[i]);
-    }
-    */
+    // for (let i = 0; i < this.accepted_requests.length; i++)
+    //   this.lockedKeys[this.accepted_requests[i]] = await storage.get(this.accepted_requests[i]);
     this.motd = await storage.get('motd') || '';
+
+    // 2023.05.03 some new items
+    if (!this.motherChannel) {
+      this.motherChannel = await storage.get('motherChannel') || 'BOOTSTRAP';
+    }
+    await storage.put('motherChannel', this.motherChannel);
+    if (DEBUG) console.log(`motherChannel: ${this.motherChannel}`)
+
+    if (DEBUG) {
+      console.log("Done creating room:")
+      console.log("room_id: ", this.room_id)
+      if (DEBUG2) console.log(this) 
+    }
   }
 
   async fetch(request) {
     if (!this.initializePromise) {
+      if (DEBUG) {
+        console.log("forcing an initialization of new room:\n");
+        console.log(request.url)
+      }
       this.initializePromise = this.initialize((new URL(request.url)).pathname.split('/')[1]);
     }
+    // make sure "we" are ready to go
     await this.initializePromise;
     if (this.verified_guest === '') {
       this.verified_guest = this.getKey('guestKey');
@@ -302,6 +365,12 @@ export class ChatRoomAPI {
       // url.pathname = "/" + url.pathname.split('/').slice(2).join("/");
       let url_pathname = "/" + url.pathname.split('/').slice(2).join("/")
       let new_url = new URL(url.origin + url_pathname)
+
+      if (DEBUG2) {
+        console.log("fetch() top new_url: ", new_url)
+        console.log("fetch() top new_url.pathname: ", new_url.pathname)
+      }
+
       switch (new_url.pathname) {
         case "/websocket": {
           if (request.headers.get("Upgrade") != "websocket") {
@@ -317,90 +386,82 @@ export class ChatRoomAPI {
         case "/oldMessages": {
           return await this.handleOldMessages(request);
         }
-
         case "/updateRoomCapacity": {
           return (await this.verifyCookie(request) || this.verifyAuthSign(request)) ? await this.handleRoomCapacityChange(request) : returnResult(request, JSON.stringify({ error: "Owner verification failed" }, 500));
           // return await this.handleRoomCapacityChange(request);
         }
-
         case "/getRoomCapacity": {
           return (await this.verifyCookie(request) || this.verifyAuthSign(request)) ? await this.getRoomCapacity(request) : returnResult(request, JSON.stringify({ error: "Owner verification failed" }, 500));
           // return await this.getRoomCapacity(request);
         }
-
         case "/getPubKeys": {
           return (await this.verifyCookie(request) || this.verifyAuthSign(request)) ? await this.getPubKeys(request) : returnResult(request, JSON.stringify({ error: "Owner verification failed" }, 500));
           // return await this.getPubKeys(request);
         }
-
         case "/getJoinRequests": {
           return (await this.verifyCookie(request) || this.verifyAuthSign(request)) ? await this.getJoinRequests(request) : returnResult(request, JSON.stringify({ error: "Owner verification failed" }, 500));
           // return await this.getJoinRequests(request);
         }
-
         case "/lockRoom": {
           return (await this.verifyCookie(request) || this.verifyAuthSign(request)) ? await this.lockRoom(request) : returnResult(request, JSON.stringify({ error: "Owner verification failed" }, 500));
           // return await this.lockRoom(request);
         }
-
         case "/acceptVisitor": {
           return (await this.verifyCookie(request) || this.verifyAuthSign(request)) ? await this.acceptVisitor(request) : returnResult(request, JSON.stringify({ error: "Owner verification failed" }, 500));
           // return await this.acceptVisitor(request);
         }
-
         case "/roomLocked": {
           return await this.isRoomLocked(request);
           // return await this.isRoomLocked(request);
         }
-
         case "/ownerUnread": {
           return (await this.verifyCookie(request) || this.verifyAuthSign(request)) ? await this.getOwnerUnreadMessages(request) : returnResult(request, JSON.stringify({ error: "Owner verification failed" }, 500));
         }
-
         case "/motd": {
           return await this.setMOTD(request);
         }
-
         case "/ownerKeyRotation": {
           return await this.ownerKeyRotation(request);
         }
-
         case "/storageRequest": {
           return await this.handleNewStorage(request);
         }
-
         case "/getAdminData": {
           return (await this.verifyCookie(request) || this.verifyAuthSign(request)) ? await this.handleAdminDataRequest(request) : returnResult(request, JSON.stringify({ error: "Owner verification failed" }, 500));
         }
-
         case "/registerDevice": {
           return this.registerDevice(request);
         }
-
         case "/downloadData": {
           return await this.downloadAllData(request);
         }
-
         case "/uploadRoom": {
           return await this.uploadData(request);
         }
-
+        case "/budd": {
+          return (await this.verifyCookie(request) || this.verifyAuthSign(request)) ? await this.handleBuddRequest(request) : returnResult(request, JSON.stringify({ error: "Owner verification failed" }, 500));
+        }
+        case "/getStorageLimit": {
+          return (await this.verifyCookie(request) || this.verifyAuthSign(request)) ? await this.getStorageLimit(request) : returnResult(request, JSON.stringify({ error: "Owner verification failed" }, 500));
+        }
+        case "/getMother": {
+          // only owner (or hosting provider) can get mother
+          return (await this.verifyCookie(request) || this.verifyAuthSign(request)) ? await this.getMother(request) : returnResult(request, JSON.stringify({ error: "Owner verification failed" }, 500));
+        }
         case "/authorizeRoom": {
           return await this.authorizeRoom(request);
         }
-
         case "/postPubKey": {
           return await this.postPubKey(request);
         }
-
         default:
-          return returnResult(request, JSON.stringify({ error: "Not found-" + new_url.pathname }), 404)
+          return returnResult(request, JSON.stringify({ error: "Not found " + new_url.pathname }), 404)
         //return new Response("Not found", { status: 404 });
       }
     });
   }
 
-  async handleSession(webSocket, ip) {
+  async handleSession(webSocket, _ip) {
     //await this.initialize();
     webSocket.accept();
     // Create our session and add it to the sessions list.
@@ -568,7 +629,7 @@ export class ChatRoomAPI {
     if (typeof message !== "string") {
       message = JSON.stringify(message);
     }
-    console.log("calling sendWebNotifications()", message);
+    if (DEBUG) console.log("calling sendWebNotifications()", message);
     await this.sendWebNotifications(message);
     // Iterate over all the sessions sending them messages.
     let quitters = [];
@@ -826,14 +887,32 @@ export class ChatRoomAPI {
     }
   }
 
+  
+  // NOTE: current design limits this to 2^52 bytes, future limit will be 2^64 bytes
+  roundSize(size, roundUp = true) {
+    size = Number(size)
+    if (size === Infinity) return Infinity; // special case
+    if (size <= STORAGE_SIZE_MIN) size = STORAGE_SIZE_MIN;
+    if (size > (2 ** 52)) throw new Error(`Storage size too large (max 2^52 and we got ${size})`);
+    const exp1 = Math.floor(Math.log2(size));
+    const exp2 = exp1 - 3;
+    const frac = Math.floor(size / (2 ** exp2));
+    const result = frac << exp2;
+    if ((size > result) && roundUp) return result + (2 ** exp2);
+    else return result;
+  }
+
+
+  /**
+   * channels approve storage by creating storage token out of their budget
+   */
   async handleNewStorage(request) {
     try {
       const { searchParams } = new URL(request.url);
-      const size = searchParams.get('size');
+      const size = this.roundSize(searchParams.get('size'));
       const storageLimit = this.storageLimit;
-      if (size > storageLimit) {
-        return returnResult(request, JSON.stringify({ error: 'Not sufficient storage' }), 200);
-      }
+      if (size > storageLimit) return returnResult(request, JSON.stringify({ error: 'Not sufficient storage budget left in channel' }), 500);
+      if (size > STORAGE_SIZE_MAX) return returnResult(request, JSON.stringify({ error: `Storage size too large (max ${STORAGE_SIZE_MAX} bytes)` }), 500);
       this.storageLimit = storageLimit - size;
       this.storage.put('storageLimit', this.storageLimit);
       const token_buffer = crypto.getRandomValues(new Uint8Array(48)).buffer;
@@ -841,7 +920,6 @@ export class ChatRoomAPI {
       const token_hash = this.arrayBufferToBase64(token_hash_buffer);
       const kv_data = { used: false, size: size };
       const kv_resp = await this.env.LEDGER_NAMESPACE.put(token_hash, JSON.stringify(kv_data));
-      console.log(this.ledgerKey)
       const encrypted_token_id = this.arrayBufferToBase64(await crypto.subtle.encrypt({ name: "RSA-OAEP" }, this.ledgerKey, token_buffer));
       const hashed_room_id = this.arrayBufferToBase64(await crypto.subtle.digest('SHA-256', (new TextEncoder).encode(this.room_id)));
       const token = { token_hash: token_hash, hashed_room_id: hashed_room_id, encrypted_token_id: encrypted_token_id };
@@ -850,6 +928,148 @@ export class ChatRoomAPI {
       return returnResult(request, JSON.stringify({ error: '[handleNewStorage()] ' + error.message + '\n' + error.stack }), 500)
     }
   }
+
+  async getStorageLimit(request) {
+    try {
+      return returnResult(request, JSON.stringify({ storageLimit: this.storageLimit }), 200);
+    } catch (error) {
+      return returnResult(request, JSON.stringify({ error: '[getCurrentStorage()] ' + error.message + '\n' + error.stack }), 500)
+    }
+  }
+
+
+  async getMother(request) {
+    try {
+      return returnResult(request, JSON.stringify({ motherChannel: this.motherChannel }), 200);
+    } catch (error) {
+      return returnResult(request, JSON.stringify({ error: '[getMother()] ' + error.message + '\n' + error.stack }), 500)
+    }
+  }
+
+
+  transferBudgetLegal(transferBudget) {
+    // first check if the transfer budget is a number
+    if (isNaN(transferBudget)) return false;
+    // then check if it's within the allowed range
+    return ((transferBudget > 0) && (transferBudget <= MAX_BUDGET_TRANSFER));
+  }
+
+  /*
+     Transfer storage budget from one channel to another. Use the target
+     channel's budget, and just get the channel ID from the request
+     and look up and increment it's budget.
+  */
+  async handleBuddRequest(request) {
+    try {
+      if (DEBUG2) console.log(request)
+      const _secret = this.env.SERVER_SECRET;
+      const { searchParams } = new URL(request.url);
+      const targetChannel = searchParams.get('targetChannel');
+      let transferBudget = this.roundSize(searchParams.get('transferBudget'));
+      const serverSecret = searchParams.get('serverSecret');
+
+      if (!targetChannel) return returnResult(request, JSON.stringify({ error: '[budd()]: No target channel specified' }), 500, 50);
+
+      if (this.room_id === targetChannel) {
+        // we are the benefactor
+        const size = transferBudget;
+        if (!this.transferBudgetLegal(size)) return returnResult(request, JSON.stringify({ error: `[budd()]: Transfer budget not legal (${size})` }), 500, 50);
+        if ((serverSecret) && (serverSecret === _secret)) {
+          // we are the target channel, so we're being asked to accept budgeta
+          const roomInitialized = !(this.room_owner === "" || this.room_owner === null);
+          if (roomInitialized) {
+            // simple case, all is lined up and approved, and we've been initialized
+            const newStorageLimit = this.storageLimit + size;
+            this.storageLimit = newStorageLimit;
+            await this.storage.put('storageLimit', newStorageLimit);
+            if (DEBUG) 
+            console.log(`[budd()]: Transferring ${size} bytes from ${this.room_id.slice(0, 12)}... to ${targetChannel.slice(0, 12)}... (new recipient storage limit: ${newStorageLimit})`);
+            returnResult(request, JSON.stringify({ success: true }), 200)
+          } else {
+            // we don't exist yet, so we convert this call to a self-approved 'upload'
+            console.log("================ ARE WE EVER CALLED?? ================")
+            // let data = await request.arrayBuffer();
+            // let jsonString = new TextDecoder().decode(data);
+            // let jsonData = jsonParseWrapper(jsonString, 'L937');
+            // if (jsonData.hasOwnProperty("SERVER_SECRET")) return returnResult(request, JSON.stringify({ error: `[budd()]: SERVER_SECRET set? Huh?` }), 500, 50);
+            // jsonData["SERVER_SECRET"] = _secret;
+            // if (size < NEW_CHANNEL_MINIMUM_BUDGET)
+            //   return returnResult(request, JSON.stringify({ error: `Not enough storage request for a new channel (minimum is ${this.NEW_CHANNEL_MINIMUM_BUDGET} bytes)` }), 500);
+            // jsonData["size"] = size;
+            // let newRequest = new Request(request.url, {
+            //   method: 'POST',
+            //   headers: request.headers,
+            //   body: JSON.stringify(jsonData)
+            // });
+            // if (DEBUG) {
+            //   console.log("[budd()]: Converting request to upload request:");
+            //   console.log(newRequest);
+            // }
+            // await this.env.LEDGER_NAMESPACE.put(targetChannel, JSON.stringify(size));
+            // if (DEBUG) { 
+            //   console.log('++++ putting budget in ledger ... reading back:');
+            //   console.log(await this.env.LEDGER_NAMESPACE.get(targetChannel));
+            // }
+            // return callDurableObject(targetChannel, 'uploadRoom', newRequest, this.env)
+            return returnResult(request, JSON.stringify({ error: '[handleBuddRequest()] problems (L994)'}), 500)
+
+          }
+        } else {
+          return returnResult(request, JSON.stringify({ error: '[budd()]: Authentication of transfer failed' }), 500, 50);
+        }
+      } else {
+        // it's another channel, taken out of ours
+        if (!this.storageLimit) return returnResult(request, JSON.stringify({ error: `[budd()]: Mother channel (${this.room_id.slice(0, 12)}...) either does not exist, or has not been initialized, or lacks storage budget` }), 500, 50);
+        if ((!transferBudget) || (transferBudget === Infinity)) transferBudget = this.storageLimit; // strip it
+        if (transferBudget > this.storageLimit) return returnResult(request, JSON.stringify({ error: '[budd()]: Not enough storage budget in mother channel for request' }), 500, 50);
+        const size = transferBudget
+        const newStorageLimit = this.storageLimit - size;
+        this.storageLimit = newStorageLimit;
+        await this.storage.put('storageLimit', newStorageLimit);
+
+        if (DEBUG) console.log(`[budd()]: Removing ${size} bytes from ${this.room_id.slice(0, 12)}... and forwarding to ${targetChannel.slice(0, 12)}... (new mother storage limit: ${newStorageLimit} bytes)`);
+        // await this.env.LEDGER_NAMESPACE.put(targetChannel, JSON.stringify(size));
+        // if (DEBUG) { 
+        //   console.log('++++ putting budget in ledger ... reading back:');
+        //   console.log(await this.env.LEDGER_NAMESPACE.get(targetChannel));
+        // }
+
+        let data = await request.arrayBuffer();
+        let jsonString = new TextDecoder().decode(data);
+        let jsonData = jsonParseWrapper(jsonString, 'L1018');
+        if (jsonData.hasOwnProperty("SERVER_SECRET")) return returnResult(request, JSON.stringify({ error: `[budd()]: SERVER_SECRET set? Huh?` }), 500, 50);
+        jsonData["SERVER_SECRET"] = _secret;
+        if (size < NEW_CHANNEL_MINIMUM_BUDGET)
+          return returnResult(request, JSON.stringify({ error: `Not enough storage request for a new channel (minimum is ${this.NEW_CHANNEL_MINIMUM_BUDGET} bytes)` }), 500);
+        jsonData["size"] = size;
+        jsonData["motherChannel"] = this.room_id; // we leave a birth certificate behind
+        let newUrl = new URL(request.url);
+        newUrl.pathname = `/api/room/${targetChannel}/uploadRoom`;
+        let newRequest = new Request(newUrl, {
+          method: 'POST',
+          body: JSON.stringify(jsonData),
+          headers: {
+            'Content-Type': 'application/json'
+          }
+        });
+        if (DEBUG) {
+          console.log("[budd()]: Converting request to upload request:");
+          if (DEBUG2) console.log(newRequest);
+        }
+        await this.env.LEDGER_NAMESPACE.put(targetChannel, JSON.stringify({mother: this.room_id, size: size}));
+        if (DEBUG) {
+          console.log('++++ putting budget in ledger ... reading back:');
+          console.log(await this.env.LEDGER_NAMESPACE.get(targetChannel));
+        }
+        return callDurableObject(targetChannel, ['uploadRoom'], newRequest, this.env)
+
+        // return callDurableObject(targetChannel, [ `budd?targetChannel=${targetChannel}&transferBudget=${size}&serverSecret=${_secret}` ], request, this.env);
+      }
+    } catch (error) {
+      return returnResult(request, JSON.stringify({ error: '[handleBuddRequest()] failed (transfer may have been lost)' + error.message + '\n' + error.stack }), 500)
+    }
+  }
+
 
   async handleAdminDataRequest(request) {
     try {
@@ -923,7 +1143,7 @@ export class ChatRoomAPI {
         ["verify"]);
       return await window.crypto.subtle.verify("HMAC", verificationKey, this.base64ToArrayBuffer(sign), new TextEncoder().encode(auth_parts[0]));
     } catch (error) {
-      console.log("Error verifying sign", error.stack)
+      console.log("Error verifying (owner) signature", error.stack)
       return false;
     }
   }
@@ -968,14 +1188,14 @@ export class ChatRoomAPI {
   }
 
   async jwtSign(payload, secret, options) {
-    console.log("Trying to create sign: ", payload, typeof payload, secret, typeof secret)
+    if (DEBUG) console.log("Trying to create sign: ", payload, typeof payload, secret, typeof secret)
     if (payload === null || typeof payload !== 'object')
       throw new Error('payload must be an object')
     if (typeof secret !== 'string')
       throw new Error('secret must be a string')
     const importAlgorithm = { name: 'ECDSA', namedCurve: 'P-256', hash: { name: 'SHA-256' } }
 
-    console.log("PAST THROWS")
+    if (DEBUG) console.log("PAST THROWS")
     payload.iat = Math.floor(Date.now() / 1000)
     this.claimIat = payload.iat;
     this.storage.put("claimIat", this.claimIat)
@@ -992,7 +1212,7 @@ export class ChatRoomAPI {
     } else
       keyData = this._utf8ToUint8Array(secret)
     const key = await crypto.subtle.importKey(keyFormat, keyData, importAlgorithm, false, ['sign'])
-    console.log("GOT KEY: ", key);
+    if (DEBUG) console.log("GOT KEY: ", key);
     const signature = await crypto.subtle.sign(importAlgorithm, key, this._utf8ToUint8Array(partialToken))
     return `${partialToken}.${this.jwtStringify(new Uint8Array(signature))}`
   }
@@ -1147,23 +1367,23 @@ export class ChatRoomAPI {
   }
 
   registerDevice(request) {
-    console.log("Registering device")
+    if (DEBUG) console.log("Registering device")
     const { searchParams } = new URL(request.url);
     this.deviceIds = [...new Set(this.deviceIds)];
     let deviceId = searchParams.get("id");
     if (!this.deviceIds.includes(deviceId)) {
       this.deviceIds.push(deviceId);
     }
-    console.log(this.deviceIds);
+    if (DEBUG) console.log(this.deviceIds);
     this.storage.put("deviceIds", JSON.stringify(this.deviceIds));
     return returnResult(request, JSON.stringify({ success: true }), 200);
   }
 
   async sendNotifications(dev = true) {
-    console.log("Trying to send notifications", this.claimIat)
+    if (DEBUG) console.log("Trying to send notifications", this.claimIat)
     let jwtToken = this.notificationToken;
     if ((this.claimIat - (Math.round(new Date().getTime() / 1000))) > 3000 || jwtToken === "" && this.env.ISS && this.env.APS_KEY) {
-      console.log("Refreshing token")
+      if (DEBUG) console.log("Refreshing token")
       const claim = { iss: this.env.ISS };
       const pemKey = this.env.APS_KEY;
       // console.log("IN IF CLAUSE", claim, pemKey);
@@ -1188,11 +1408,11 @@ export class ChatRoomAPI {
       notificationJSON.aps["mutable-content"] = true;
       notificationJSON.aps["interruption-level"] = "active";
       let notification = JSON.stringify(notificationJSON)
-      console.log("TOKEN", jwtToken, this.deviceIds[0], notification)
+      if (DEBUG) console.log("TOKEN", jwtToken, this.deviceIds[0], notification)
       let base = dev ? "https://api.sandbox.push.apple.com/3/device/" : "https://api.push.apple.com/3/device/"
       // console.log("DEVICE LENGTH: ", this.deviceIds.length)
       for (let i = 0; i < this.deviceIds.length; i++) {
-        console.log("Pinging: ", this.deviceIds[i]);
+        if (DEBUG) console.log("Pinging: ", this.deviceIds[i]);
         const device_token = this.deviceIds[i];
         let url = base + device_token;
         let request = {
@@ -1205,17 +1425,17 @@ export class ChatRoomAPI {
           body: notification
         }
         let req = await fetch(url, request);
-        console.log("Request is: ", url, JSON.stringify(request))
-        console.log('APPLE RESPONSE', req);
+        if (DEBUG) console.log("Request is: ", url, JSON.stringify(request))
+        if (DEBUG) console.log('APPLE RESPONSE', req);
       }
     } else {
-      console.log('Set ISS and APS_KEY env vars to enable apple notifications')
+      if (DEBUG) console.log('Set ISS and APS_KEY env vars to enable apple notifications')
     }
 
   }
 
   async sendWebNotifications(message) {
-    console.log("Sending web notification", message)
+    if (DEBUG) console.log("Sending web notification", message)
     message = JSON.parse(message)
     if (message?.type === 'ack') return
     var coeff = 1000 * 60 * 1;
@@ -1251,7 +1471,6 @@ export class ChatRoomAPI {
 
   }
 
-
   async downloadAllData(request) {
     let storage = await this.storage.list();
     let data = {
@@ -1285,22 +1504,36 @@ export class ChatRoomAPI {
     return new Response(dataBlob, { status: 200, headers: corsHeaders });
   }
 
-
+  // used to create channels (from scratch) (or upload from backup)
+  // TODO: can this overwrite a channel on the server?  is that ok?  (even if it's the owner)
   async uploadData(request) {
+    if (DEBUG) { console.log("== uploadData() =="); if (DEBUG2) console.log(request); }
     let _secret = this.env.SERVER_SECRET;
     let data = await request.arrayBuffer();
     let jsonString = new TextDecoder().decode(data);
-    let jsonData = jsonParseWrapper(jsonString, 'L1126');
+    let jsonData = jsonParseWrapper(jsonString, 'L1416');
     let roomInitialized = !(this.room_owner === "" || this.room_owner === null);
     let requestAuthorized = jsonData.hasOwnProperty("SERVER_SECRET") && jsonData["SERVER_SECRET"] === _secret;
     let allowed = (roomInitialized && this.room_owner === jsonData["roomOwner"]) || requestAuthorized
-
     if (allowed) {
+      if (DEBUG) console.log("uploadData() allowed")
       for (let key in jsonData) {
-        await this.storage.put(key, jsonData[key]);
+        // 2023.05.03: added filter to what properties are propagated (interface ChannelData)
+        //             eg previous problem was it happily added SERVER_SECRET to DO storage
+        if (DEBUG2) console.log("uploadData() key: ", key, "value: ", jsonData[key])
+        if (["roomId", "channelId", "ownerKey", "encryptionKey", "signKey", "motherChannel"].includes(key))
+          await this.storage.put(key, jsonData[key]);
+        else
+          if (DEBUG) console.log("**** uploadData() key not allowed: ", key)
       }
       this.personalRoom = true;
       this.storage.put("personalRoom", true);
+      // if 'size' is provided in request, and request is authorized, set storageLimit
+      if (jsonData.hasOwnProperty("size")) {
+        let size = jsonData["size"];
+        await this.storage.put("storageLimit", size);
+      }
+      // note that for a new room, "initialize" will fetch data from "this.storage" into object
       this.initialize(this.room_id)
       return returnResult(request, JSON.stringify({ success: true }), 200);
     } else {
@@ -1310,7 +1543,6 @@ export class ChatRoomAPI {
       }, 200));
     }
   }
-
 
   async authorizeRoom(request) {
     let _secret = this.env.SERVER_SECRET;
