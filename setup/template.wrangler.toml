@@ -4,9 +4,9 @@
 # copy this file to the top level and rename it 'wrangler.toml'
 # insert the pertinent id:s from Cloudflare dashboard
 
-# Personal Room ('r') Server
-# 'r' will be the name on CF, ergo "r.<your CF comain>.workers.dev"
-name = "r"
+# Personal Room ('c') Server
+# 'c' will be the name on CF, eg "c.<your CF comain>.workers.dev"
+name = "c"
 
 type = "javascript"
 workers_dev = true
@@ -28,10 +28,10 @@ kv_namespaces = [
 [build.upload]
 format = "modules"
 dir = "src"
-main = "./room.mjs"
+main = "./index.js"
 rules = [{type = "Data", globs = ["**/*.html"]}]
 
 [durable_objects]
 bindings = [
-  { name = "rooms", class_name = "ChatRoomAPI" },
+  { name = "channels", class_name = "ChannelServer" },
 ]

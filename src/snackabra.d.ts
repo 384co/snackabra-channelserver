@@ -1,0 +1,1 @@
+../../snackabra-jslib/snackabra.d.ts
