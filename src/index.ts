@@ -270,8 +270,7 @@ async function handleApiRequest(path: Array<string>, request: Request, env: EnvT
         return returnResult(request, JSON.stringify({ error: "Not found (this is an API endpoint, the URI was malformed)" }), 404)
     }
   } catch (error: any) {
-    console.log(error);
-    return returnResult(request, JSON.stringify({ error: `[API Call error] [${request.url}]: \n` + error.message + '\n' + error.stack }), 500);
+    return returnError(request, `[API Call error] [${request.url}]: \n` + error.message + '\n' + error.stack, 500);
   }
 }
 
@@ -505,7 +504,7 @@ export class ChannelServer implements DurableObject {
       // into their session object and in the visitor list.
       if (!this.#channelKeys) {
         webSocket.close(4000, "This room does not have an owner, or the owner has not enabled it. You cannot interact with it yet.");
-        console.log("no owner - closing")
+        if (DEBUG) console.log("no owner - closing")
       }
       const data = jsonParseWrapper(msg.data.toString(), 'L733');
       if (data.pem) {
@@ -616,16 +615,16 @@ export class ChannelServer implements DurableObject {
       } catch (error: any) {
         // Report any exceptions directly back to the client
         const err_msg = '[handleSession()] ' + error.message + '\n' + error.stack + '\n';
-        console.log(err_msg);
+        if (DEBUG2) console.log(err_msg);
         try {
           webSocket.send(JSON.stringify({ error: err_msg }));
         } catch {
-          console.log("(NOTE - getting error on sending error message back to client)");
+          console.log(`ERROR: was unable to propagate error to client: ${err_msg}`);
         }
       }
     });
 
-    // On "close" and "error" events, remove matching sessions, and broadcast a quit
+    // On "close" and "error" events, remove matching sessions
     const closeOrErrorHandler = () => {
       session.quit = true; // tells any closure to go away
       this.sessions = this.sessions.filter(member => member !== session);
@@ -634,7 +633,7 @@ export class ChannelServer implements DurableObject {
     webSocket.addEventListener("error", closeOrErrorHandler);
   }
 
-  // broadcast() broadcasts a message to all clients.
+  // broadcasts a message to all clients.
   async #broadcast(message: any) {
     if (typeof message !== "string")
       message = JSON.stringify(message);
@@ -884,7 +883,7 @@ export class ChannelServer implements DurableObject {
           returnResult(request, JSON.stringify({ success: true }), 200)
         } else {
           // we don't exist yet, so we convert this call to a self-approved 'upload'
-          console.log("================ ARE WE EVER CALLED?? ================")
+          if (DEBUG) console.log("================ ARE WE EVER CALLED?? ================")
           // let data = await request.arrayBuffer();
           // let jsonString = new TextDecoder().decode(data);
           // let jsonData = jsonParseWrapper(jsonString, 'L937');
