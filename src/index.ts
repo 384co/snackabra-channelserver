@@ -101,25 +101,8 @@ type EnvType = {
 //
 type ResponseCode = 101 | 200 | 400 | 401 | 403 | 404 | 405 | 418 | 429 | 500 | 501 | 507;
 
-// this handles UNEXPECTED errors
-async function handleErrors(request: Request, func: () => Promise<Response>) {
-  try {
-    return await func();
-  } catch (err: any) {
-    if (request.headers.get("Upgrade") == "websocket") {
-      let pair = new WebSocketPair();
-      pair[1].accept();
-      pair[1].send(JSON.stringify({ error: '[handleErrors()] ' + err.message + '\n' + err.stack }));
-      pair[1].close(1011, "Uncaught exception during session setup");
-      console.log("webSocket close (error)")
-      return returnResult(request, null, 101, 0);
-    } else {
-      return returnResult(request, err.stack, 500)
-    }
-  }
-}
 
-function returnResult(_request: Request, contents: any, s: ResponseCode, delay = 0) {
+function returnResult(_request: Request, contents: any, status: ResponseCode, delay = 0) {
   const corsHeaders = {
     "Access-Control-Allow-Methods": "POST, OPTIONS, GET",
     "Access-Control-Allow-Headers": "Content-Type, authorization",
@@ -129,16 +112,40 @@ function returnResult(_request: Request, contents: any, s: ResponseCode, delay =
   }
   return new Promise<Response>((resolve) => {
     setTimeout(() => {
-      if (DEBUG) console.log("returnResult() contents:", contents, "status:", s)
-      resolve(new Response(contents, { status: s, headers: corsHeaders }));
+      if (DEBUG) console.log("returnResult() contents:", contents, "status:", status)
+      resolve(new Response(contents, { status: status, headers: corsHeaders }));
     }, delay);
   });
 }
 
-function returnError(_request: Request, errorString: string, status: ResponseCode) {
+function returnError(_request: Request, errorString: string, status: ResponseCode, delay = 0) {
   console.log("ERROR: (status: " + status + ")\n" + errorString);
+  if (!delay && ((status == 401) || (status == 403))) delay = 50; // delay if auth-related
   return returnResult(_request, `{ "error": "${errorString}" }`, status);
 }
+
+// this handles UNEXPECTED errors
+async function handleErrors(request: Request, func: () => Promise<Response>) {
+  try {
+    return await func();
+  } catch (err: any) {
+    if (err instanceof Error) {
+      if (request.headers.get("Upgrade") == "websocket") {
+        const pair = new WebSocketPair();
+        pair[1].accept();
+        pair[1].send(JSON.stringify({ error: '[handleErrors()] ' + err.message + '\n' + err.stack }));
+        pair[1].close(1011, "Uncaught exception during session setup");
+        console.log("webSocket close (error)")
+        return returnResult(request, null, 101);
+      } else {
+        return returnResult(request, err.stack, 500)
+      }
+    } else {
+      return returnError(request, "Unknown error type (?) in top level", 500);
+    }
+  }
+}
+``
 
 /**
  * API calls are in one of two forms:
@@ -259,7 +266,7 @@ async function handleApiRequest(path: Array<string>, request: Request, env: EnvT
         {
           try {
             const _rooms: any = await request.json();
-            let lastMessageTimes: Array<any> = [];
+            const lastMessageTimes: Array<any> = [];
             for (let i = 0; i < _rooms.length; i++) {
               lastMessageTimes[_rooms[i]] = await lastTimeStamp(_rooms[i], env);
             }
@@ -410,7 +417,7 @@ export class ChannelServer implements DurableObject {
   // need the initialize method to restore state of room when the worker is updated
   #initialize(room_id: SBChannelId): Promise<boolean> {
     return new Promise((resolve, reject) => {
-      let ledgerKeyString = this.env.LEDGER_KEY;
+      const ledgerKeyString = this.env.LEDGER_KEY;
       this.room_id = room_id;
       if (ledgerKeyString) {
         // ledger is RSA-OAEP so we do not use sbCrypto
@@ -446,7 +453,7 @@ export class ChannelServer implements DurableObject {
       this.verified_guest = await this.#getKey('guestKey') || '';
     }
     return await handleErrors(request, async () => {
-      let url = new URL(request.url);
+      const url = new URL(request.url);
 
       // // SSO code - this would optionally verify public key from a public record room->key
       // if (this.room_owner === '') {
@@ -458,8 +465,8 @@ export class ChannelServer implements DurableObject {
 
       this.room_id = url.pathname.split('/')[1];
       // url.pathname = "/" + url.pathname.split('/').slice(2).join("/");
-      let url_pathname = "/" + url.pathname.split('/').slice(2).join("/")
-      let new_url = new URL(url.origin + url_pathname)
+      const url_pathname = "/" + url.pathname.split('/').slice(2).join("/")
+      const new_url = new URL(url.origin + url_pathname)
       if (DEBUG2) {
         console.log("fetch() top new_url: ", new_url)
         console.log("fetch() top new_url.pathname: ", new_url.pathname)
@@ -471,15 +478,15 @@ export class ChannelServer implements DurableObject {
         if (apiCall === "/websocket") {
           if (request.headers.get("Upgrade") != "websocket")
             return returnError(request, "Expected websocket", 400);
-          let ip = request.headers.get("CF-Connecting-IP");
-          let pair = new WebSocketPair();
+          const ip = request.headers.get("CF-Connecting-IP");
+          const pair = new WebSocketPair();
           await this.#handleSession(pair[1], ip);
           return new Response(null, { status: 101, webSocket: pair[0] });
         } else if (this.ownerCalls[apiCall]) {
           if (await this.#verifyAuth(request)) {
             return await this.ownerCalls[apiCall]!(request);
           } else {
-            return returnResult(request, JSON.stringify({ error: "Owner verification failed (restricted API call)" }), 401);
+            return returnError(request, "Owner verification failed (restricted API call)", 401);
           }
         } else if (this.visitorCalls[apiCall]) {
           return await this.visitorCalls[apiCall]!(request);
@@ -497,14 +504,14 @@ export class ChannelServer implements DurableObject {
 
   // fetch most recent messages from local (worker) KV
   async #getRecentMessages(howMany: number, cursor = ''): Promise<Map<string, unknown>> {
-    let listOptions: DurableObjectListOptions = { limit: howMany, prefix: this.room_id, reverse: true };
+    const listOptions: DurableObjectListOptions = { limit: howMany, prefix: this.room_id, reverse: true };
     if (cursor !== '')
       listOptions.startAfter = cursor;
-    let keys = Array.from((await this.storage.list(listOptions)).keys());
+    const keys = Array.from((await this.storage.list(listOptions)).keys());
     // see this blog post for details on why we're setting allowConcurrency:
     // https://blog.cloudflare.com/durable-objects-easy-fast-correct-choose-three/
-    let getOptions: DurableObjectGetOptions = { allowConcurrency: true };
-    let messageList = this.storage.get(keys, getOptions);
+    const getOptions: DurableObjectGetOptions = { allowConcurrency: true };
+    const messageList = this.storage.get(keys, getOptions);
     if (DEBUG) {
       console.log("getRecentMessages() messageList:")
       console.log(await messageList)
@@ -513,7 +520,7 @@ export class ChannelServer implements DurableObject {
   }
 
   #setupSession(session: SessionType, msg: any) {
-    let webSocket = session.webSocket;
+    const webSocket = session.webSocket;
     try {
       // The first message the client sends is the user info message with their pubKey. Save it
       // into their session object and in the visitor list.
@@ -530,7 +537,7 @@ export class ChannelServer implements DurableObject {
         webSocket.send(JSON.stringify({ error: "ERROR: First message needs to contain pubKey" }));
         return;
       }
-      let _name: JsonWebKey = jsonParseWrapper(data.name, 'L578');
+      const _name: JsonWebKey = jsonParseWrapper(data.name, 'L578');
       const isPreviousVisitor = sbCrypto.lookupKey(_name, this.visitors) >= 0;
       const isAccepted = sbCrypto.lookupKey(_name, this.accepted_requests) >= 0;
       if (!isPreviousVisitor && this.visitors.length >= this.room_capacity) {
@@ -571,7 +578,7 @@ export class ChannelServer implements DurableObject {
     // the initial user info (message which would be the client's pubKey)
 
     // Create our session and add it to the sessions list.
-    let session: SessionType = {
+    const session: SessionType = {
       name: '',
       room_id: '',
       webSocket: webSocket,
@@ -612,15 +619,15 @@ export class ChannelServer implements DurableObject {
         // to a 42-bit string of 0s and 1s (which allows efficient prefix search). This format
         // allows timestamps up to some time in September, 2248, by which time we will be
         // counting from the founding date of our Mars escape colony anyway.
-        let tsNum = Math.max(Date.now(), this.lastTimestamp + 1);
+        const tsNum = Math.max(Date.now(), this.lastTimestamp + 1);
         this.lastTimestamp = tsNum;
         this.storage.put('lastTimestamp', tsNum)
-        let ts = tsNum.toString(2).padStart(42, "0");
+        const ts = tsNum.toString(2).padStart(42, "0");
 
         // appending timestamp to channel id.
         const key = this.room_id + ts;
 
-        let _x: Dictionary<string> = {}
+        const _x: Dictionary<string> = {}
         _x[key] = jsonParseWrapper(msg.data.toString(), 'L812');
         await this.#broadcast(JSON.stringify(_x))
         await this.storage.put(key, msg.data);
@@ -629,7 +636,7 @@ export class ChannelServer implements DurableObject {
         await this.env.MESSAGES_NAMESPACE.put(key, msg.data);
       } catch (error: any) {
         // Report any exceptions directly back to the client
-        let err_msg = '[handleSession()] ' + error.message + '\n' + error.stack + '\n';
+        const err_msg = '[handleSession()] ' + error.message + '\n' + error.stack + '\n';
         console.log(err_msg);
         try {
           webSocket.send(JSON.stringify({ error: err_msg }));
@@ -640,7 +647,7 @@ export class ChannelServer implements DurableObject {
     });
 
     // On "close" and "error" events, remove matching sessions, and broadcast a quit
-    let closeOrErrorHandler = () => {
+    const closeOrErrorHandler = () => {
       session.quit = true; // tells any closure to go away
       this.sessions = this.sessions.filter(member => member !== session);
     };
@@ -697,9 +704,9 @@ export class ChannelServer implements DurableObject {
     }
     // otherwise it's keys managed by SSO / server
     if (type === 'ownerKey') {
-      let _keys_id = (await this.env.KEYS_NAMESPACE.list({ prefix: this.room_id + '_ownerKey' })).keys.map(key => key.name);
+      const _keys_id = (await this.env.KEYS_NAMESPACE.list({ prefix: this.room_id + '_ownerKey' })).keys.map(key => key.name);
       if (_keys_id.length == 0) return null;
-      let keys = _keys_id.map(async key => await this.env.KEYS_NAMESPACE.get(key));
+      const keys = _keys_id.map(async key => await this.env.KEYS_NAMESPACE.get(key));
       return await keys[keys.length - 1];
     } else if (type === 'ledgerKey') {
       return await this.env.KEYS_NAMESPACE.get(type);
@@ -733,7 +740,7 @@ export class ChannelServer implements DurableObject {
   }
 
   async #acceptVisitor(request: Request) {
-    let data = await request.json();
+    const data = await request.json();
     const acceptPubKey: JsonWebKey = jsonParseWrapper((data as any).pubKey, 'L783');
     // const ind = this.join_requests.indexOf((data as any).pubKey as string);
     const ind = sbCrypto.lookupKey(acceptPubKey, this.join_requests);
@@ -770,7 +777,7 @@ export class ChannelServer implements DurableObject {
   }
 
   async #setMOTD(request: Request) {
-    let data = await request.json();
+    const data = await request.json();
     this.motd = (data as any).motd;
     this.storage.put('motd', this.motd);
     return returnResult(request, JSON.stringify({ motd: this.motd }), 200);
@@ -962,18 +969,18 @@ export class ChannelServer implements DurableObject {
       //   console.log(await this.env.LEDGER_NAMESPACE.get(targetChannel));
       // }
 
-      let data = await request.arrayBuffer();
-      let jsonString = new TextDecoder().decode(data);
-      let jsonData = jsonParseWrapper(jsonString, 'L1018');
+      const data = await request.arrayBuffer();
+      const jsonString = new TextDecoder().decode(data);
+      const jsonData = jsonParseWrapper(jsonString, 'L1018');
       if (jsonData.hasOwnProperty("SERVER_SECRET")) return returnResult(request, JSON.stringify({ error: `[budd()]: SERVER_SECRET set? Huh?` }), 500, 50);
       jsonData["SERVER_SECRET"] = _secret;
       if (size < NEW_CHANNEL_MINIMUM_BUDGET)
         return returnResult(request, JSON.stringify({ error: `Not enough storage request for a new channel (minimum is ${NEW_CHANNEL_MINIMUM_BUDGET} bytes)` }), 500);
       jsonData["size"] = size;
       jsonData["motherChannel"] = this.room_id; // we leave a birth certificate behind
-      let newUrl = new URL(request.url);
+      const newUrl = new URL(request.url);
       newUrl.pathname = `/api/room/${targetChannel}/uploadRoom`;
-      let newRequest = new Request(newUrl, {
+      const newRequest = new Request(newUrl, {
         method: 'POST',
         body: JSON.stringify(jsonData),
         headers: {
@@ -1009,7 +1016,7 @@ export class ChannelServer implements DurableObject {
     const _sign = base64ToArrayBuffer(decodeURIComponent(sign));
     const encoder = new TextEncoder();
     const encoded = encoder.encode(contents);
-    let verified = await crypto.subtle.verify(
+    const verified = await crypto.subtle.verify(
       { name: 'ECDSA', hash: 'SHA-256' },
       secretKey,
       _sign,
@@ -1019,9 +1026,9 @@ export class ChannelServer implements DurableObject {
   }
 
   async #verifyCookie(request: Request) {
-    let cookies: any = {};
+    const cookies: any = {};
     request.headers.has('cookie') && request.headers.get('cookie')!.split(';').forEach(function (cookie) {
-      let parts = cookie.match(/(.*?)=(.*)$/)
+      const parts = cookie.match(/(.*?)=(.*)$/)
       if (parts)
         cookies[parts[1].trim()] = (parts[2] || '').trim();
     });
@@ -1044,15 +1051,15 @@ export class ChannelServer implements DurableObject {
       return false;
     if (!request.headers.has('authorization'))
       return false;
-    let authHeader = request.headers.get('authorization');
+    const authHeader = request.headers.get('authorization');
     if (!authHeader) return false
-    let auth_parts = authHeader.split('.');
+    const auth_parts = authHeader.split('.');
     if (new Date().getTime() - parseInt(auth_parts[0]) > 60000)
       return false;
-    let sign = auth_parts[1];
-    let ownerKey = this.#channelKeys!.ownerKey
-    let roomSignKey = this.#channelKeys!.signKey
-    let verificationKey = await crypto.subtle.deriveKey(
+    const sign = auth_parts[1];
+    const ownerKey = this.#channelKeys!.ownerKey
+    const roomSignKey = this.#channelKeys!.signKey
+    const verificationKey = await crypto.subtle.deriveKey(
       {
         name: "ECDH",
         public: ownerKey
@@ -1081,9 +1088,9 @@ export class ChannelServer implements DurableObject {
     if (DEBUG) console.log("Sending web notification", message)
     message = JSON.parse(message)
     // if (message?.type === 'ack') return
-    let coeff = 1000 * 60 * 1;
-    let date = new Date();
-    let rounded = new Date(Math.round(date.getTime() / coeff) * coeff)
+    const coeff = 1000 * 60 * 1;
+    const date = new Date();
+    const rounded = new Date(Math.round(date.getTime() / coeff) * coeff)
     try {
       const options = {
         method: "POST",
@@ -1114,7 +1121,7 @@ export class ChannelServer implements DurableObject {
   }
 
   async #downloadAllData(request: Request) {
-    let data: any = {
+    const data: any = {
       roomId: this.room_id,
       ownerKey: this.room_owner,
       channelKeys: this.#channelKeys,
@@ -1131,7 +1138,7 @@ export class ChannelServer implements DurableObject {
       data.pubKeys = this.visitors;
       data.roomCapacity = this.room_capacity;
     }
-    let dataBlob = new TextEncoder().encode(JSON.stringify(data));
+    const dataBlob = new TextEncoder().encode(JSON.stringify(data));
     return returnResult(request, dataBlob, 200);
   }
 
@@ -1139,16 +1146,16 @@ export class ChannelServer implements DurableObject {
   // TODO: can this overwrite a channel on the server?  is that ok?  (even if it's the owner)
   async #uploadData(request: Request) {
     if (DEBUG) { console.log("== uploadData() =="); if (DEBUG2) console.log(request); }
-    let _secret = this.env.SERVER_SECRET;
-    let data = await request.arrayBuffer();
-    let jsonString = new TextDecoder().decode(data);
-    let jsonData = jsonParseWrapper(jsonString, 'L1416');
-    let roomInitialized = this.room_owner != null;
-    let requestAuthorized = jsonData.hasOwnProperty("SERVER_SECRET") && jsonData["SERVER_SECRET"] === _secret;
-    let allowed = (roomInitialized && this.room_owner === jsonData["roomOwner"]) || requestAuthorized
+    const _secret = this.env.SERVER_SECRET;
+    const data = await request.arrayBuffer();
+    const jsonString = new TextDecoder().decode(data);
+    const jsonData = jsonParseWrapper(jsonString, 'L1416');
+    const roomInitialized = this.room_owner != null;
+    const requestAuthorized = jsonData.hasOwnProperty("SERVER_SECRET") && jsonData["SERVER_SECRET"] === _secret;
+    const allowed = (roomInitialized && this.room_owner === jsonData["roomOwner"]) || requestAuthorized
     if (allowed) {
       if (DEBUG) console.log("uploadData() allowed")
-      for (let key in jsonData) {
+      for (const key in jsonData) {
         // 2023.05.03: added filter to what properties are propagated (interface ChannelData)
         //             eg previous problem was it happily added SERVER_SECRET to DO storage
         if (DEBUG2) console.log("uploadData() key: ", key, "value: ", jsonData[key])
@@ -1161,7 +1168,7 @@ export class ChannelServer implements DurableObject {
       this.storage.put("personalRoom", 'true');
       // if 'size' is provided in request, and request is authorized, set storageLimit
       if (jsonData.hasOwnProperty("size")) {
-        let size = jsonData["size"];
+        const size = jsonData["size"];
         await this.storage.put("storageLimit", size);
       }
       // note that for a new room, "initialize" will fetch data from "this.storage" into object
@@ -1176,11 +1183,11 @@ export class ChannelServer implements DurableObject {
   }
 
   async #authorizeRoom(request: Request) {
-    let _secret = this.env.SERVER_SECRET;
-    let jsonData: any = await request.json();
-    let requestAuthorized = jsonData.hasOwnProperty("SERVER_SECRET") && jsonData["SERVER_SECRET"] === _secret;
+    const _secret = this.env.SERVER_SECRET;
+    const jsonData: any = await request.json();
+    const requestAuthorized = jsonData.hasOwnProperty("SERVER_SECRET") && jsonData["SERVER_SECRET"] === _secret;
     if (requestAuthorized) {
-      for (let key in jsonData) {
+      for (const key in jsonData) {
         await this.storage.put("room_owner", jsonData["ownerKey"]);
       }
       this.personalRoom = true;
