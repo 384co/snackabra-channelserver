@@ -66,6 +66,12 @@ import {
 
 const sbCrypto = new SBCrypto()
 
+import type { DurableObjectNamespace, Fetcher, KVNamespace, DurableObject,
+  DurableObjectStorage, JsonWebKey, DurableObjectState, DurableObjectListOptions, 
+  DurableObjectGetOptions, CryptoKey
+} from "@cloudflare/workers-types";
+import { Response, WebSocketPair, WebSocket, Request, crypto } from "@cloudflare/workers-types";
+
 // this section has some type definitions that helps us with CF types
 type EnvType = {
   // ChannelServerAPI
@@ -1023,7 +1029,7 @@ export class ChannelServer implements DurableObject {
     const verificationKey = await crypto.subtle.deriveKey(
       {
         name: "ECDH",
-        public: ownerKey
+        $public: ownerKey  // looks like possible issues with cloudflare worker types?
       },
       roomSignKey,
       {
@@ -1047,6 +1053,11 @@ export class ChannelServer implements DurableObject {
 
   // TODO: review this, it sends a return value that is not used
   async #sendWebNotifications(message: string) {
+    const envNotifications = this.env.notifications
+    if (!envNotifications) {
+      if (DEBUG) console.log("Cannot send web notifications (expected behavior if you're running locally")
+      return;
+    }
     if (DEBUG) console.log("Sending web notification", message)
     message = JSON.parse(message)
     // if (message?.type === 'ack') return
@@ -1074,7 +1085,7 @@ export class ChannelServer implements DurableObject {
         }
       }
       // console.log("Sending web notification", options)
-      return await this.env.notifications.fetch("https://notifications.384.dev/notify", options)
+      return await envNotifications.fetch("https://notifications.384.dev/notify", options)
     } catch (err) {
       console.log(err)
       console.log("Error sending web notification")

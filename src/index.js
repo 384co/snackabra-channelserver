@@ -17,10 +17,11 @@
    License along with this program.  If not, see www.gnu.org/licenses/
 
 */
+/* 384co internal note: scratch code in e062 */
 const DEBUG = true;
 const DEBUG2 = false;
 if (DEBUG)
-    console.log("++++ room.mjs loaded ++++ DEBUG is enabled ++++");
+    console.log("++++ channel.mjs loaded ++++ DEBUG is enabled ++++");
 if (DEBUG2)
     console.log("++++ DEBUG2 (verbose) enabled ++++");
 // TODO: future refactor will be calculating internally in units
@@ -43,83 +44,135 @@ const NEW_CHANNEL_MINIMUM_BUDGET = 32 * 1024 * 1024; // 8 MB
 const NEW_CHANNEL_BUDGET = 3 * 1024 * 1024 * 1024; // 3 GB
 // sanity check - set a max at one petabyte (2^50)
 const MAX_BUDGET_TRANSFER = 1024 * 1024 * 1024 * 1024 * 1024; // 1 PB
+// see notes in jslib on owner key rotation
+const ALLOW_OWNER_KEY_ROTATION = false;
+import { arrayBufferToBase64, base64ToArrayBuffer, jsonParseWrapper, SBCrypto } from './snackabra.js';
+const sbCrypto = new SBCrypto();
+import { Response, WebSocketPair, Request, crypto } from "@cloudflare/workers-types";
+function returnResult(_request, contents, status, delay = 0) {
+    const corsHeaders = {
+        "Access-Control-Allow-Methods": "POST, OPTIONS, GET",
+        "Access-Control-Allow-Headers": "Content-Type, authorization",
+        "Access-Control-Allow-Credentials": "true",
+        "Access-Control-Allow-Origin": "*" /* request.headers.get("Origin") */,
+        "Content-Type": "application/json;",
+    };
+    return new Promise((resolve) => {
+        setTimeout(() => {
+            if (DEBUG)
+                console.log("returnResult() contents:", contents, "status:", status);
+            resolve(new Response(contents, { status: status, headers: corsHeaders }));
+        }, delay);
+    });
+}
+function returnError(_request, errorString, status, delay = 0) {
+    console.log("ERROR: (status: " + status + ")\n" + errorString);
+    if (!delay && ((status == 401) || (status == 403)))
+        delay = 50; // delay if auth-related
+    return returnResult(_request, `{ "error": "${errorString}" }`, status);
+}
+// this handles UNEXPECTED errors
 async function handleErrors(request, func) {
     try {
         return await func();
     }
     catch (err) {
-        if (request.headers.get("Upgrade") == "websocket") {
-            let pair = new WebSocketPair();
-            pair[1].accept();
-            pair[1].send(JSON.stringify({ error: '[handleErrors()] ' + err.message + '\n' + err.stack }));
-            pair[1].close(1011, "Uncaught exception during session setup");
-            console.log("webSocket close (error)");
-            return new Response(null, { status: 101, webSocket: pair[0] });
+        if (err instanceof Error) {
+            if (request.headers.get("Upgrade") == "websocket") {
+                const pair = new WebSocketPair();
+                pair[1].accept();
+                pair[1].send(JSON.stringify({ error: '[handleErrors()] ' + err.message + '\n' + err.stack }));
+                pair[1].close(1011, "Uncaught exception during session setup");
+                console.log("webSocket close (error)");
+                return returnResult(request, null, 101);
+            }
+            else {
+                return returnResult(request, err.stack, 500);
+            }
         }
         else {
-            return returnResult(request, err.stack, 500);
-            //return new Response(err.stack, { status: 500 });
+            return returnError(request, "Unknown error type (?) in top level", 500);
         }
     }
 }
-// so many problems with JSON parsing, adding a wrapper to capture more info
-function jsonParseWrapper(str, loc) {
-    try {
-        return JSON.parse(str);
-    }
-    catch (error) {
-        // sometimes it's an embedded string
-        try {
-            return JSON.parse(eval(str));
-        }
-        catch {
-            // let's try one more thing
-            try {
-                return JSON.parse(str.slice(1, -1));
-            }
-            catch {
-                // we'll throw the original error
-                throw new Error('JSON.parse() error at ' + loc + ' (tried eval and slice): ' + error.message + '\nString was: ' + str);
-            }
-        }
-    }
-}
-function returnResult(_request, contents, s) {
-    const corsHeaders = {
-        "Access-Control-Allow-Methods": "POST, OPTIONS, GET",
-        "Access-Control-Allow-Headers": "Content-Type, authorization",
-        "Access-Control-Allow-Credentials": "true",
-        'Content-Type': 'application/json;',
-        "Access-Control-Allow-Origin": "*" /* request.headers.get("Origin") */,
-    };
-    if (DEBUG)
-        console.log("returnResult() contents:", contents, "status:", s);
-    return new Response(contents, { status: s, headers: corsHeaders });
-}
-// function exit(request) {
-//   const corsHeaders = {
-//     "Access-Control-Allow-Methods": "POST, OPTIONS, GET",
-//     "Access-Control-Allow-Headers": "Content-Type, authorization",
-//     "Access-Control-Allow-Credentials": "true",
-//     'Content-Type': 'application/json;',
-//     "Access-Control-Allow-Origin": request.headers.get("Origin"),
-//   }
-//   return new Response(JSON.stringify({ message: 'script exited' }), { status: 200, headers: corsHeaders });
-// }
+/**
+ * API calls are in one of two forms:
+ *
+ * ::
+ *
+ *     /api/<api_call>/
+ *     /api/room/<id>/<api_call>/
+ *
+ * The first form is asynchronous, the latter is synchronous.
+ * A 'sync' call means that there's only a single server endpoint
+ * that is handling calls. The channel id thus constitutes
+ * the point of synchronization.
+ *
+ * Currently, api calls are strictly one or the other. That will
+ * likely change.
+ *
+ * Finally, one api endpoint is special:
+ *
+ * ::
+ *
+ *     /api/room/<id>/websocket
+ *
+ * Which will upgrade protocol to a websocket connection.
+ *
+ * Previous design was divided into separate shard and channel
+ * servers, but this version is merged. For historical continuity,
+ * below we divide them into shard and channel calls.
+ *
+ * ::
+ *
+ *     Shard API:
+ *     /api/storeRequest/
+ *     /api/storeData/
+ *     /api/fetchData/
+ *     /api/migrateStorage/
+ *     /api/fetchDataMigration/
+ *
+ *     Channel API (async):
+ *     /api/notifications/       : sign up for notifications (disabled)
+ *     /api/getLastMessageTimes/ : queries multiple channels for last message timestamp
+ *
+ *     Channel API (synchronous)          : [O] means [Owner] only
+ *     /api/room/<ID>/websocket           : connect to channel socket (wss protocol)
+ *     /api/room/<ID>/oldMessages
+ *     /api/room/<ID>/updateRoomCapacity  : [O]
+ *     /api/room/<ID>/budd                : [O]
+ *     /api/room/<ID>/getStorageLimit     : [O]
+ *     /api/room/<ID>/getMother           : [O]
+ *     /api/room/<ID>/getRoomCapacity     : [O]
+ *     /api/room/<ID>/getPubKeys          : [O]
+ *     /api/room/<ID>/getJoinRequests     : [O]
+ *     /api/room/<ID>/lockRoom            : [O]
+ *     /api/room/<ID>/acceptVisitor       : [O]
+ *     /api/room/<ID>/roomLocked
+ *     /api/room/<ID>/ownerUnread         : [O]
+ *     /api/room/<ID>/motd                : [O]
+ *     /api/room/<ID>/ownerKeyRotation    : [O] (deprecated)
+ *     /api/room/<ID>/storageRequest
+ *     /api/room/<ID>/getAdminData        : [O]
+ *     /api/room/<ID>/registerDevice      : (disabled)
+ *     /api/room/<ID>/downloadData
+ *     /api/room/<ID>/uploadRoom          : (admin only)
+ *     /api/room/<ID>/authorizeRoom       : (admin only)
+ *     /api/room/<ID>/postPubKey
+ *
+ */
 export default {
     async fetch(request, env) {
         if (DEBUG)
             console.log(`fetch called: ${request.url}`);
         return await handleErrors(request, async () => {
-            let url = new URL(request.url);
-            let path = url.pathname.slice(1).split('/');
+            const url = new URL(request.url);
+            const path = url.pathname.slice(1).split('/');
             switch (path[0]) {
-                case "api":
-                    // This is a request for `/api/...`, call the API handler.
+                case "api": // /api/... is only case currently
                     return handleApiRequest(path.slice(1), request, env);
                 default:
-                    return returnResult(request, JSON.stringify({ error: "Not found (must give API endpoint)" }), 404);
-                //return new Response("Not found", { status: 404 });
+                    return returnError(request, "Not found (must give API endpoint)", 404);
             }
         });
     }
@@ -133,11 +186,12 @@ async function callDurableObject(name, path, request, env) {
             console.log(env);
         }
     }
+    // // SSO use case: fetch from another server to get pubkeys
     // const pubKey = await fetch("https://m063.dpn.workers.dev/api/v1/pubKeys?roomId=" + name)
     // if (pubKey?.error) return returnResult(request, JSON.stringify({ error: "Not found" }), 404);
-    let roomId = env.rooms.idFromName(name);
-    let roomObject = env.rooms.get(roomId);
-    let newUrl = new URL(request.url);
+    const roomId = env.channels.idFromName(name);
+    const roomObject = env.channels.get(roomId);
+    const newUrl = new URL(request.url);
     newUrl.pathname = "/" + name + "/" + path.join("/");
     if (DEBUG2) {
         console.log("callDurableObject() newUrl:");
@@ -151,186 +205,142 @@ async function handleApiRequest(path, request, env) {
         console.log(`handleApiRequest() path:`);
         console.log(path);
     }
-    switch (path[0]) {
-        case "room": {
-            // request is for '/api/room/...', we route (relay) it to the matching durable object
-            // TODO: many requests can probably be handled here, without routing to the durable object
-            return callDurableObject(path[1], path.slice(2), request, env);
-        }
-        case "notifications": {
-            let reqData = await request.json();
-            let roomList = reqData.rooms;
-            let deviceIdentifier = reqData.identifier;
-            if (DEBUG)
-                console.log("Registering notifications", roomList, deviceIdentifier);
-            for (let i = 0; i < roomList.length; i++) {
-                if (DEBUG) {
-                    console.log("In loop");
-                    console.log("ROOM ID", roomList[i]);
+    try {
+        switch (path[0]) {
+            case "room":
+            case "channel":
+                return callDurableObject(path[1], path.slice(2), request, env);
+            case "notifications":
+                return returnError(request, "Device (Apple) notifications are disabled (use web notifications)", 400);
+            case "getLastMessageTimes":
+                {
+                    const _rooms = await request.json();
+                    const lastMessageTimes = [];
+                    for (let i = 0; i < _rooms.length; i++) {
+                        lastMessageTimes[_rooms[i]] = await lastTimeStamp(_rooms[i], env);
+                    }
+                    return returnResult(request, JSON.stringify(lastMessageTimes), 200);
                 }
-                let id = env.rooms.idFromName(roomList[i]);
-                let roomObject = env.rooms.get(id);
-                let newUrl = new URL(request.url);
-                newUrl.pathname = "/" + roomList[i] + "/registerDevice";
-                newUrl.searchParams.append("id", deviceIdentifier);
-                if (DEBUG)
-                    console.log("URL for room", newUrl);
-                roomObject.fetch(newUrl, request);
-            }
-            return returnResult(request, JSON.stringify({ status: "Successfully received" }), 200);
+            default:
+                return returnResult(request, JSON.stringify({ error: "Not found (this is an API endpoint, the URI was malformed)" }), 404);
         }
-        case "getLastMessageTimes": {
-            try {
-                const _rooms = await request.json();
-                let lastMessageTimes = {};
-                for (let i = 0; i < _rooms.length; i++) {
-                    lastMessageTimes[_rooms[i]] = await lastTimeStamp(_rooms[i], env);
-                }
-                return returnResult(request, JSON.stringify(lastMessageTimes), 200);
-            }
-            catch (error) {
-                console.log(error);
-                return returnResult(request, JSON.stringify({ error: '[getLastMessageTimes] ' + error.message + '\n' + error.stack }), 500);
-            }
-        }
-        default:
-            return returnResult(request, JSON.stringify({ error: "Not found (this is an API endpoint, the URI was malformed)" }), 404);
+    }
+    catch (error) {
+        return returnError(request, `[API Call error] [${request.url}]: \n` + error.message + '\n' + error.stack, 500);
     }
 }
 async function lastTimeStamp(room_id, env) {
-    try {
-        let list_response = await env.MESSAGES_NAMESPACE.list({ "prefix": room_id });
-        let message_keys = list_response.keys.map((res) => {
-            return res.name;
-        });
-        if (message_keys.length === 0) {
-            return '0';
-        }
-        while (!list_response.list_complete) {
-            list_response = await env.MESSAGES_NAMESPACE.list({ "cursor": list_response.cursor });
-            message_keys = [...message_keys, list_response.keys];
-        }
-        return message_keys[message_keys.length - 1].slice(room_id.length);
-    }
-    catch (error) {
-        console.log(error);
+    let list_response = await env.MESSAGES_NAMESPACE.list({ "prefix": room_id });
+    let message_keys = list_response.keys.map((res) => {
+        return res.name;
+    });
+    if (message_keys.length === 0)
         return '0';
+    while (!list_response.list_complete) {
+        list_response = await env.MESSAGES_NAMESPACE.list({ "cursor": list_response.cursor });
+        message_keys = [...message_keys, list_response.keys];
     }
+    return message_keys[message_keys.length - 1].slice(room_id.length);
 }
-function postProduction(e, cb, delay, cbargs) {
-    e.waitUntil(new Promise(function (r) {
-        setTimeout(async function () {
-            await cb(cbargs);
-            r();
-        }, delay);
-    }));
-}
-// =======================================================================================
-// The ChatRoom Durable Object Class
-//
-// ChatRoom implements a Durable Object that coordinates an individual
-// chat room. Participants connect to the room using WebSockets, and
-// the room broadcasts messages from each participant to all others.
-//
-export class ChatRoomAPI {
+/**
+ *
+ * ChannelServer Durable Object Class
+ *
+ * One instance per channel/room.
+ *
+ * Note: historically channels were referred to as 'rooms'.
+ */
+export class ChannelServer {
+    storage;
+    env;
+    initializePromise = null;
+    sessions = [];
+    #channelKeys;
+    room_id = '';
+    room_owner = null; // duplicate, placeholder / TODO cleanup
+    // config?: ChannelConfig;
+    ownerCalls;
+    visitorCalls;
+    adminCalls;
+    // We keep track of the last-seen message's timestamp just so that we can assign monotonically
+    // increasing timestamps even if multiple messages arrive simultaneously (see below).
+    lastTimestamp = 0;
+    storageLimit = 0;
+    verified_guest = '';
+    visitors = [];
+    join_requests = [];
+    accepted_requests = [];
+    // tracks history of lock keys
+    lockedKeys = [];
+    room_capacity = 20;
+    ownerUnread = 0;
+    locked = false;
+    motd = '';
+    ledgerKey = null;
+    personalRoom = false;
+    // these are in #channelKeys (TODO cleanup)
+    // room_owner: JsonWebKey | null = null;
+    // verified_guest: string | null = null;
+    // encryptionKey: string | null = null;
+    // signKey: string | null = null;
+    motherChannel = '';
+    messagesCursor = null; // used for 'startAfter' option
     constructor(state, env) {
+        // NOTE:
+        // durable object storage has a different API than global KV, see:
+        // https://developers.cloudflare.com/workers/runtime-apis/durable-objects/#transactional-storage-api
         this.storage = state.storage;
         this.env = env;
-        this.sessions = [];
-        // We keep track of the last-seen message's timestamp just so that we can assign monotonically
-        // increasing timestamps even if multiple messages arrive simultaneously (see below).
-        this.lastTimestamp = 0;
-        this.room_id = '';
-        this.room_owner = '';
-        this.room_capacity = 20;
-        this.visitors = [];
-        this.ownerUnread = 0;
-        this.locked = false;
-        this.encryptionKey = null;
-        this.lockedKeys = {};
-        this.join_requests = [];
-        this.accepted_requests = [];
-        this.motd = '';
-        this.verified_guest = '';
-        this.signKey = null;
-        this.storageLimit = 0;
-        this.ledgerKey = null;
-        this.deviceIds = [];
-        this.claimIat = 0;
-        this.notificationToken = {};
-        this.personalRoom = false;
-        // 2023.04.03: new fields
-        this.motherChannel = '';
+        this.ownerCalls = {
+            "/acceptVisitor": this.#acceptVisitor.bind(this),
+            "/budd": this.#handleBuddRequest.bind(this),
+            "/getAdminData": this.#handleAdminDataRequest.bind(this),
+            "/getJoinRequests": this.#getJoinRequests.bind(this),
+            "/getMother": this.#getMother.bind(this),
+            "/getPubKeys": this.#getPubKeys.bind(this),
+            "/getRoomCapacity": this.#getRoomCapacity.bind(this),
+            "/getStorageLimit": this.#getStorageLimit.bind(this),
+            "/lockRoom": this.#lockRoom.bind(this),
+            "/motd": this.#setMOTD.bind(this),
+            "/ownerKeyRotation": this.#ownerKeyRotation.bind(this),
+            "/ownerUnread": this.#getOwnerUnreadMessages.bind(this),
+            "/updateRoomCapacity": this.#handleRoomCapacityChange.bind(this),
+        };
+        this.visitorCalls = {
+            "/downloadData": this.#downloadAllData.bind(this),
+            "/oldMessages": this.#handleOldMessages.bind(this),
+            "/postPubKey": this.#postPubKey.bind(this),
+            "/registerDevice": this.#registerDevice.bind(this),
+            "/roomlocked": this.#isRoomLocked.bind(this),
+            "/storageRequest": this.#handleNewStorage.bind(this),
+        };
+        this.adminCalls = {
+            "/authorizeRoom": this.#authorizeRoom.bind(this),
+            "/uploadRoom": this.#uploadData.bind(this)
+        };
     }
     // need the initialize method to restore state of room when the worker is updated
-    async initialize(room_id) {
-        /*
-              return exit(request);
-         */
-        const storage = this.storage;
-        this.lastTimestamp = await storage.get('lastTimestamp') || 0;
-        this.room_id = room_id;
-        this.personalRoom = await storage.get('personalRoom') || false;
-        // this.room_owner = await storage.get('room_owner');
-        // this.encryptionKey = await storage.get('encryptionKey');
-        /*if (typeof this.room_owner === 'undefined' || typeof this.encryptionKey === 'undefined') {
-          const keyFetch_json = await fetch("https://m063.dpn.workers.dev/api/v1/pubKeys?roomId=" + this.room_id)
-          this.room_owner = JSON.stringify(keyFetch_json.ownerKey);
-          this.encryptionKey = JSON.stringify(keyFetch_json.encryptionKey);
-        }*/
-        this.room_owner = await this.getKey('ownerKey');
-        this.verified_guest = await this.getKey('guestKey');
-        this.signKey = await this.getKey('signKey');
-        this.encryptionKey = await this.getKey('encryptionKey');
-        let ledgerKeyString = await this.getKey('ledgerKey');
-        if (ledgerKeyString != null && ledgerKeyString !== "") {
-            this.ledgerKey = await crypto.subtle.importKey("jwk", jsonParseWrapper(ledgerKeyString, 'L217'), { name: "RSA-OAEP", hash: 'SHA-256' }, true, ["encrypt"]) || null;
-        }
-        this.room_capacity = await storage.get('room_capacity') || 20;
-        this.visitors = jsonParseWrapper(await storage.get('visitors') || JSON.stringify([]), 'L220');
-        this.ownerUnread = await storage.get('ownerUnread') || 0;
-        this.locked = await storage.get('locked') || false;
-        this.join_requests = jsonParseWrapper(await storage.get('join_requests') || JSON.stringify([]), 'L223');
-        this.accepted_requests = jsonParseWrapper(await storage.get('accepted_requests') || JSON.stringify([]), 'L224');
-        // this.storageLimit = await storage.get('storageLimit') || 4 * 1024 * 1024 * 1024; // PSM update 4 GiB default
-        // 2023.05.03: new pattern, storageLimit should ALWAYS be present
-        this.storageLimit = await storage.get('storageLimit');
-        if (!this.storageLimit) {
-            const ledgerData = await this.env.LEDGER_NAMESPACE.get(room_id);
-            if (ledgerData) {
-                const { size, mother } = jsonParseWrapper(ledgerData, 'L311');
-                this.storageLimit = size;
-                this.motherChannel = mother;
-                if (DEBUG)
-                    console.log(`found storageLimit in ledger: ${this.storageLimit}`);
+    #initialize(room_id) {
+        return new Promise((resolve, reject) => {
+            const ledgerKeyString = this.env.LEDGER_KEY;
+            this.room_id = room_id;
+            if (ledgerKeyString) {
+                // ledger is RSA-OAEP so we do not use sbCrypto
+                crypto.subtle.importKey("jwk", jsonParseWrapper(ledgerKeyString, 'L217'), { name: "RSA-OAEP", hash: 'SHA-256' }, true, ["encrypt"]).then((ledgerKey) => {
+                    this.ledgerKey = ledgerKey;
+                    if (DEBUG) {
+                        console.log("Done creating room:");
+                        console.log("room_id: ", this.room_id);
+                        if (DEBUG2)
+                            console.log(this);
+                    }
+                    resolve(true);
+                });
             }
             else {
-                if (DEBUG)
-                    console.log("storageLimit is undefined in initialize, setting to default");
-                this.storageLimit = NEW_CHANNEL_BUDGET;
+                reject("Failed to initialize ChannelServer (no ledgerKey?)");
             }
-            await storage.put('storageLimit', this.storageLimit);
-        }
-        this.lockedKeys = await (storage.get('lockedKeys')) || {};
-        this.deviceIds = jsonParseWrapper(await (storage.get('deviceIds')) || JSON.stringify([]), 'L227');
-        this.claimIat = await storage.get('claimIat') || 0;
-        this.notificationToken = await storage.get('notificationToken') || "";
-        // for (let i = 0; i < this.accepted_requests.length; i++)
-        //   this.lockedKeys[this.accepted_requests[i]] = await storage.get(this.accepted_requests[i]);
-        this.motd = await storage.get('motd') || '';
-        // 2023.05.03 some new items
-        if (!this.motherChannel) {
-            this.motherChannel = await storage.get('motherChannel') || 'BOOTSTRAP';
-        }
-        await storage.put('motherChannel', this.motherChannel);
-        if (DEBUG)
-            console.log(`motherChannel: ${this.motherChannel}`);
-        if (DEBUG) {
-            console.log("Done creating room:");
-            console.log("room_id: ", this.room_id);
-            if (DEBUG2)
-                console.log(this);
-        }
+        });
     }
     async fetch(request) {
         if (!this.initializePromise) {
@@ -338,297 +348,230 @@ export class ChatRoomAPI {
                 console.log("forcing an initialization of new room:\n");
                 console.log(request.url);
             }
-            this.initializePromise = this.initialize((new URL(request.url)).pathname.split('/')[1]);
+            this.initializePromise = this.#initialize((new URL(request.url)).pathname.split('/')[1]);
         }
         // make sure "we" are ready to go
         await this.initializePromise;
         if (this.verified_guest === '') {
-            this.verified_guest = this.getKey('guestKey');
+            this.verified_guest = await this.#getKey('guestKey') || '';
         }
         return await handleErrors(request, async () => {
-            let url = new URL(request.url);
-            /* if (this.room_owner === '') {
-              this.room_id = url.pathname.split('/')[1];
-              const keyFetch_json = await fetch("https://m063.dpn.workers.dev/api/v1/pubKeys?roomId=" + this.room_id)
-              this.room_owner = JSON.stringify(keyFetch_json.ownerKey);
-              this.encryptionKey = JSON.stringify(keyFetch_json.encryptionKey);
-            }*/
+            const url = new URL(request.url);
+            // // SSO code - this would optionally verify public key from a public record room->key
+            // if (this.room_owner === '') {
+            //   this.room_id = url.pathname.split('/')[1];
+            //   const keyFetch_json = await fetch("https://m063.dpn.workers.dev/api/v1/pubKeys?roomId=" + this.room_id)
+            //   this.room_owner = JSON.stringify(keyFetch_json.ownerKey);
+            //   this.encryptionKey = JSON.stringify(keyFetch_json.encryptionKey);
+            // }
             this.room_id = url.pathname.split('/')[1];
             // url.pathname = "/" + url.pathname.split('/').slice(2).join("/");
-            let url_pathname = "/" + url.pathname.split('/').slice(2).join("/");
-            let new_url = new URL(url.origin + url_pathname);
+            const url_pathname = "/" + url.pathname.split('/').slice(2).join("/");
+            const new_url = new URL(url.origin + url_pathname);
             if (DEBUG2) {
                 console.log("fetch() top new_url: ", new_url);
                 console.log("fetch() top new_url.pathname: ", new_url.pathname);
             }
-            switch (new_url.pathname) {
-                case "/websocket": {
-                    if (request.headers.get("Upgrade") != "websocket") {
-                        return new Response("expected websocket", { status: 400 });
-                    }
-                    // this.room_id = request.url;
-                    let ip = request.headers.get("CF-Connecting-IP");
-                    let pair = new WebSocketPair();
-                    await this.handleSession(pair[1], ip);
+            // API section, all *synchronous* API calls are routed trough here
+            const apiCall = new_url.pathname;
+            try {
+                if (apiCall === "/websocket") {
+                    if (request.headers.get("Upgrade") != "websocket")
+                        return returnError(request, "Expected websocket", 400);
+                    const ip = request.headers.get("CF-Connecting-IP");
+                    const pair = new WebSocketPair();
+                    await this.#handleSession(pair[1], ip);
                     return new Response(null, { status: 101, webSocket: pair[0] });
                 }
-                case "/oldMessages": {
-                    return await this.handleOldMessages(request);
+                else if (this.ownerCalls[apiCall]) {
+                    if (await this.#verifyAuth(request)) {
+                        return await this.ownerCalls[apiCall](request);
+                    }
+                    else {
+                        return returnError(request, "Owner verification failed (restricted API call)", 401);
+                    }
                 }
-                case "/updateRoomCapacity": {
-                    return (await this.verifyCookie(request) || this.verifyAuthSign(request)) ? await this.handleRoomCapacityChange(request) : returnResult(request, JSON.stringify({ error: "Owner verification failed" }, 500));
-                    // return await this.handleRoomCapacityChange(request);
+                else if (this.visitorCalls[apiCall]) {
+                    return await this.visitorCalls[apiCall](request);
                 }
-                case "/getRoomCapacity": {
-                    return (await this.verifyCookie(request) || this.verifyAuthSign(request)) ? await this.getRoomCapacity(request) : returnResult(request, JSON.stringify({ error: "Owner verification failed" }, 500));
-                    // return await this.getRoomCapacity(request);
+                else if (this.adminCalls[apiCall]) {
+                    // these calls will self-authenticate
+                    return await this.adminCalls[apiCall](request);
                 }
-                case "/getPubKeys": {
-                    return (await this.verifyCookie(request) || this.verifyAuthSign(request)) ? await this.getPubKeys(request) : returnResult(request, JSON.stringify({ error: "Owner verification failed" }, 500));
-                    // return await this.getPubKeys(request);
+                else {
+                    return returnError(request, "API endpoint not found: " + apiCall, 404);
                 }
-                case "/getJoinRequests": {
-                    return (await this.verifyCookie(request) || this.verifyAuthSign(request)) ? await this.getJoinRequests(request) : returnResult(request, JSON.stringify({ error: "Owner verification failed" }, 500));
-                    // return await this.getJoinRequests(request);
-                }
-                case "/lockRoom": {
-                    return (await this.verifyCookie(request) || this.verifyAuthSign(request)) ? await this.lockRoom(request) : returnResult(request, JSON.stringify({ error: "Owner verification failed" }, 500));
-                    // return await this.lockRoom(request);
-                }
-                case "/acceptVisitor": {
-                    return (await this.verifyCookie(request) || this.verifyAuthSign(request)) ? await this.acceptVisitor(request) : returnResult(request, JSON.stringify({ error: "Owner verification failed" }, 500));
-                    // return await this.acceptVisitor(request);
-                }
-                case "/roomLocked": {
-                    return await this.isRoomLocked(request);
-                    // return await this.isRoomLocked(request);
-                }
-                case "/ownerUnread": {
-                    return (await this.verifyCookie(request) || this.verifyAuthSign(request)) ? await this.getOwnerUnreadMessages(request) : returnResult(request, JSON.stringify({ error: "Owner verification failed" }, 500));
-                }
-                case "/motd": {
-                    return await this.setMOTD(request);
-                }
-                case "/ownerKeyRotation": {
-                    return await this.ownerKeyRotation(request);
-                }
-                case "/storageRequest": {
-                    return await this.handleNewStorage(request);
-                }
-                case "/getAdminData": {
-                    return (await this.verifyCookie(request) || this.verifyAuthSign(request)) ? await this.handleAdminDataRequest(request) : returnResult(request, JSON.stringify({ error: "Owner verification failed" }, 500));
-                }
-                case "/registerDevice": {
-                    return this.registerDevice(request);
-                }
-                case "/downloadData": {
-                    return await this.downloadAllData(request);
-                }
-                case "/uploadRoom": {
-                    return await this.uploadData(request);
-                }
-                case "/budd": {
-                    return (await this.verifyCookie(request) || this.verifyAuthSign(request)) ? await this.handleBuddRequest(request) : returnResult(request, JSON.stringify({ error: "Owner verification failed" }, 500));
-                }
-                case "/getStorageLimit": {
-                    return (await this.verifyCookie(request) || this.verifyAuthSign(request)) ? await this.getStorageLimit(request) : returnResult(request, JSON.stringify({ error: "Owner verification failed" }, 500));
-                }
-                case "/getMother": {
-                    // only owner (or hosting provider) can get mother
-                    return (await this.verifyCookie(request) || this.verifyAuthSign(request)) ? await this.getMother(request) : returnResult(request, JSON.stringify({ error: "Owner verification failed" }, 500));
-                }
-                case "/authorizeRoom": {
-                    return await this.authorizeRoom(request);
-                }
-                case "/postPubKey": {
-                    return await this.postPubKey(request);
-                }
-                default:
-                    return returnResult(request, JSON.stringify({ error: "Not found " + new_url.pathname }), 404);
-                //return new Response("Not found", { status: 404 });
+            }
+            catch (error) {
+                return returnError(request, `API ERROR [${apiCall}]: ${error.message} \n ${error.stack}`, 500);
             }
         });
     }
-    async handleSession(webSocket, _ip) {
-        //await this.initialize();
+    // fetch most recent messages from local (worker) KV
+    async #getRecentMessages(howMany, cursor = '') {
+        const listOptions = { limit: howMany, prefix: this.room_id, reverse: true };
+        if (cursor !== '')
+            listOptions.startAfter = cursor;
+        const keys = Array.from((await this.storage.list(listOptions)).keys());
+        // see this blog post for details on why we're setting allowConcurrency:
+        // https://blog.cloudflare.com/durable-objects-easy-fast-correct-choose-three/
+        const getOptions = { allowConcurrency: true };
+        const messageList = this.storage.get(keys, getOptions);
+        if (DEBUG) {
+            console.log("getRecentMessages() messageList:");
+            console.log(await messageList);
+        }
+        return messageList;
+    }
+    #setupSession(session, msg) {
+        const webSocket = session.webSocket;
+        try {
+            // The first message the client sends is the user info message with their pubKey. Save it
+            // into their session object and in the visitor list.
+            if (!this.#channelKeys) {
+                webSocket.close(4000, "This room does not have an owner, or the owner has not enabled it. You cannot interact with it yet.");
+                if (DEBUG)
+                    console.log("no owner - closing");
+            }
+            const data = jsonParseWrapper(msg.data.toString(), 'L733');
+            if (data.pem) {
+                webSocket.send(JSON.stringify({ error: "ERROR: PEM formats no longer used" }));
+                return;
+            }
+            if (!data.name) {
+                webSocket.send(JSON.stringify({ error: "ERROR: First message needs to contain pubKey" }));
+                return;
+            }
+            const _name = jsonParseWrapper(data.name, 'L578');
+            const isPreviousVisitor = sbCrypto.lookupKey(_name, this.visitors) >= 0;
+            const isAccepted = sbCrypto.lookupKey(_name, this.accepted_requests) >= 0;
+            if (!isPreviousVisitor && this.visitors.length >= this.room_capacity) {
+                webSocket.close(4000, 'ERROR: The room is not accepting any more visitors.');
+                return;
+            }
+            if (!isPreviousVisitor) {
+                this.visitors.push(jsonParseWrapper(data.name, 'L594'));
+                this.storage.put('visitors', JSON.stringify(this.visitors));
+            }
+            if (this.locked) {
+                if (!isAccepted && !isPreviousVisitor) {
+                    this.join_requests.push(data.name);
+                    this.storage.put('join_requests', JSON.stringify(this.join_requests));
+                }
+                else {
+                    // TODO: this mechanism needs testing
+                    const encrypted_key = this.lockedKeys[sbCrypto.lookupKey(_name, this.lockedKeys)];
+                    this.#channelKeys.lockedKey = encrypted_key;
+                }
+            }
+            session.name = data.name;
+            webSocket.send(JSON.stringify({ ready: true, keys: this.#channelKeys, motd: this.motd, roomLocked: this.locked }));
+            session.room_id = "" + data.room_id;
+            // Note that we've now received the user info message for this session
+            session.receivedUserInfo = true;
+        }
+        catch (err) {
+            webSocket.send(JSON.stringify({ error: "ERROR: problem setting up session: " + err.message + '\n' + err.stack }));
+            return;
+        }
+    }
+    async #handleSession(webSocket, _ip) {
         webSocket.accept();
+        // We don't send any messages to the client until it has sent us 
+        // the initial user info (message which would be the client's pubKey)
         // Create our session and add it to the sessions list.
-        // We don't send any messages to the client until it has sent us the initial user info
-        // message which would be the client's pubKey
-        let session = { webSocket, blockedMessages: [] };
+        const session = {
+            name: '',
+            room_id: '',
+            webSocket: webSocket,
+            blockedMessages: await this.#getRecentMessages(100),
+            quit: false,
+            receivedUserInfo: false,
+        };
+        // track active connections
         this.sessions.push(session);
-        let storage = await this.storage.list({ reverse: true, limit: 100, prefix: this.room_id });
-        let keys = [...storage.keys()];
-        keys.reverse();
-        let backlog = {};
-        keys.forEach(key => {
-            try {
-                backlog[key] = jsonParseWrapper(storage.get(key), 'L371');
-            }
-            catch (error) {
-                webSocket.send(JSON.stringify({ error: '[handleSession()] ' + error.message + '\n' + error.stack }));
-            }
-        });
-        //session.blockedMessages.push(JSON.stringify({...storage}))
-        //let backlog = [...storage.values()];
-        //backlog.reverse();
-        //backlog.forEach(value => {
-        //  session.blockedMessages.push(value);
-        //});
-        session.blockedMessages = [...session.blockedMessages, JSON.stringify(backlog)];
-        // Set event handlers to receive messages.
-        let receivedUserInfo = false;
         webSocket.addEventListener("message", async (msg) => {
             try {
                 if (session.quit) {
-                    webSocket.close(1011, "WebSocket broken.");
-                    console.log("webSocket broken");
+                    webSocket.close(1011, "WebSocket broken (got a quit).");
                     return;
                 }
-                if (!receivedUserInfo) {
-                    // The first message the client sends is the user info message with their pubKey. Save it
-                    // into their session object and in the visitor list.
-                    // webSocket.send(JSON.stringify({error: JSON.stringify(msg)}));
-                    const data = jsonParseWrapper(msg.data, 'L396');
-                    if (this.room_owner === null || this.room_owner === "") {
-                        webSocket.close(4000, "This room does not have an owner, or the owner has not enabled it. You cannot leave messages here.");
-                        console.log("no owner - closing");
-                    }
-                    let keys = {
-                        ownerKey: this.room_owner,
-                        guestKey: this.verified_guest,
-                        encryptionKey: this.encryptionKey,
-                        signKey: this.signKey
-                    };
-                    if (data.pem) {
-                        keys = await this.convertToPem({
-                            ownerKey: this.room_owner,
-                            guestKey: this.verified_guest,
-                            encryptionKey: this.encryptionKey,
-                            signKey: this.signKey
-                        });
-                    }
-                    if (!data.name) {
-                        webSocket.close(1000, 'The first message should contain the pubKey');
-                        console.log("no pubKey");
+                if (!session.receivedUserInfo) {
+                    this.#setupSession(session, msg);
+                    return;
+                }
+                if (jsonParseWrapper(msg.data.toString(), 'L788').ready) {
+                    // the client sends a "ready" message when it can start receiving
+                    if (!session.blockedMessages)
                         return;
-                    }
-                    // const isPreviousVisitor = this.visitors.indexOf(data.name) > -1;
-                    // const isAccepted = this.accepted_requests.indexOf(data.name) > -1;
-                    let _name;
-                    try {
-                        _name = jsonParseWrapper(data.name, 'L412');
-                    }
-                    catch (err) {
-                        webSocket.close(1000, 'The first message should contain the pubKey in json stringified format');
-                        console.log("improper pubKey");
-                        return;
-                    }
-                    const isPreviousVisitor = this.checkJsonExistence(_name, this.visitors);
-                    const isAccepted = this.checkJsonExistence(_name, this.accepted_requests);
-                    if (!isPreviousVisitor && this.visitors.length >= this.room_capacity) {
-                        webSocket.close(4000, 'The room is not accepting any more visitors.');
-                        console.log("no more visitors");
-                        return;
-                    }
-                    if (!isPreviousVisitor) {
-                        this.visitors.push(data.name);
-                        this.storage.put('visitors', JSON.stringify(this.visitors));
-                    }
-                    if (this.locked) {
-                        if (!isAccepted && !isPreviousVisitor) {
-                            this.join_requests.push(data.name);
-                            this.storage.put('join_requests', JSON.stringify(this.join_requests));
-                        }
-                        else {
-                            // const encrypted_key = this.lockedKeys[data.name];
-                            const encrypted_key = this.lockedKeys[this.getLockedKey(_name)];
-                            keys['locked_key'] = encrypted_key;
-                        }
-                    }
-                    session.name = data.name;
-                    webSocket.send(JSON.stringify({ ready: true, keys: keys, motd: this.motd, roomLocked: this.locked }));
-                    // session.room_id = "" + data.room_id;
                     // Deliver all the messages we queued up since the user connected.
-                    // Note that we've now received the user info message.
-                    receivedUserInfo = true;
+                    webSocket.send(JSON.stringify(session.blockedMessages));
+                    session.blockedMessages.clear();
                     return;
                 }
-                else if (jsonParseWrapper(msg.data, 'L449').ready) {
-                    if (!session.blockedMessages) {
-                        return;
-                    }
-                    if (this.env.DOCKER_WS) {
-                        session.blockedMessages.forEach(queued => {
-                            webSocket.send(queued);
-                        });
-                        delete session.blockedMessages;
-                        return;
-                    }
-                    webSocket.send(session.blockedMessages);
-                    delete session.blockedMessages;
-                    return;
-                }
+                // convenience for owner to know what it's seen
                 this.ownerUnread += 1;
-                let ts = Math.max(Date.now(), this.lastTimestamp + 1);
-                this.lastTimestamp = ts;
-                this.storage.put('lastTimestamp', this.lastTimestamp);
-                ts = ts.toString(2);
-                while (ts.length < 42)
-                    ts = "0" + ts;
+                // This part is important. Time stamps are monotonically increasing, but if two messages
+                // arrive simultaneously, they'll have the same timestamp. To avoid this, we always set
+                // the timestamp to be at least one millisecond greater than the last timestamp we saw.
+                // We store it as an integer in lastTimestamp, but in the message it is encoded as up
+                // to a 42-bit string of 0s and 1s (which allows efficient prefix search). This format
+                // allows timestamps up to some time in September, 2248, by which time we will be
+                // counting from the founding date of our Mars escape colony anyway.
+                const tsNum = Math.max(Date.now(), this.lastTimestamp + 1);
+                this.lastTimestamp = tsNum;
+                this.storage.put('lastTimestamp', tsNum);
+                const ts = tsNum.toString(2).padStart(42, "0");
+                // appending timestamp to channel id.
                 const key = this.room_id + ts;
-                let _x = {};
-                _x[key] = jsonParseWrapper(msg.data, 'L466');
-                await this.broadcast(JSON.stringify(_x));
+                const _x = {};
+                _x[key] = jsonParseWrapper(msg.data.toString(), 'L812');
+                // Here is the main workhorse ... actualy send the message to every listener
+                await this.#broadcast(JSON.stringify(_x));
+                // and store it for posterity both local and global KV
                 await this.storage.put(key, msg.data);
-                // await this.sendNotifications(true);
-                // webSocket.send(JSON.stringify({ error: err.stack }));
                 await this.env.MESSAGES_NAMESPACE.put(key, msg.data);
             }
             catch (error) {
                 // Report any exceptions directly back to the client
-                let err_msg = '[handleSession()] ' + error.message + '\n' + error.stack + '\n';
-                console.log(err_msg);
+                const err_msg = '[handleSession()] ' + error.message + '\n' + error.stack + '\n';
+                if (DEBUG2)
+                    console.log(err_msg);
                 try {
                     webSocket.send(JSON.stringify({ error: err_msg }));
                 }
                 catch {
-                    console.log("(NOTE - getting error on sending error message back to client)");
+                    console.log(`ERROR: was unable to propagate error to client: ${err_msg}`);
                 }
             }
         });
-        // On "close" and "error" events, remove the WebSocket from the sessions list and broadcast
-        // a quit message.
-        let closeOrErrorHandler = evt => {
-            session.quit = true;
+        // On "close" and "error" events, remove matching sessions
+        const closeOrErrorHandler = () => {
+            session.quit = true; // tells any closure to go away
             this.sessions = this.sessions.filter(member => member !== session);
         };
         webSocket.addEventListener("close", closeOrErrorHandler);
         webSocket.addEventListener("error", closeOrErrorHandler);
     }
-    // broadcast() broadcasts a message to all clients.
-    async broadcast(message) {
-        if (typeof message !== "string") {
+    // broadcasts a message to all clients.
+    async #broadcast(message) {
+        if (typeof message !== "string")
             message = JSON.stringify(message);
-        }
         if (DEBUG)
             console.log("calling sendWebNotifications()", message);
-        await this.sendWebNotifications(message);
+        await this.#sendWebNotifications(message);
         // Iterate over all the sessions sending them messages.
-        let quitters = [];
         this.sessions = this.sessions.filter(session => {
             if (session.name) {
                 try {
                     session.webSocket.send(message);
-                    if (session.name === this.room_owner) {
+                    if (session.name === this.#channelKeys?.ownerPubKeyX)
                         this.ownerUnread -= 1;
-                    }
                     return true;
                 }
                 catch (err) {
                     session.quit = true;
-                    quitters.push(session);
-                    return false;
+                    return false; // delete session
                 }
             }
             else {
@@ -640,47 +583,29 @@ export class ChatRoomAPI {
         });
         this.storage.put('ownerUnread', this.ownerUnread);
     }
-    async handleOldMessages(request) {
-        try {
-            const { searchParams } = new URL(request.url);
-            const currentMessagesLength = searchParams.get('currentMessagesLength');
-            let storage = await this.storage.list({
-                reverse: true,
-                limit: 100 + currentMessagesLength,
-                prefix: this.room_id
-            });
-            let keys = [...storage.keys()];
-            keys = keys.slice(currentMessagesLength);
-            keys.reverse();
-            let backlog = {};
-            keys.forEach(key => {
-                try {
-                    backlog[key] = jsonParseWrapper(storage.get(key), 'L531');
-                }
-                catch (error) {
-                    console.log(error);
-                }
-            });
-            return returnResult(request, JSON.stringify(backlog), 200);
-        }
-        catch (error) {
-            console.log("Error fetching older messages: ", error);
-            return returnResult(request, JSON.stringify({ error: "Could not fetch older messages" }), 500);
-        }
+    async #handleOldMessages(request) {
+        const { searchParams } = new URL(request.url);
+        const currentMessagesLength = Number(searchParams.get('currentMessagesLength')) || 100;
+        const cursor = searchParams.get('cursor') || '';
+        return returnResult(request, JSON.stringify(this.#getRecentMessages(currentMessagesLength, cursor)), 200);
     }
-    async getKey(type) {
+    async #getKey(type) {
         if (this.personalRoom) {
-            if (type === 'ledgerKey') {
+            // keys managed by owner
+            if (type === 'ledgerKey')
                 return this.env.LEDGER_KEY;
-            }
-            return await this.storage.get(type);
-        }
-        if (type === 'ownerKey') {
-            let _keys_id = (await this.env.KEYS_NAMESPACE.list({ prefix: this.room_id + '_ownerKey' })).keys.map(key => key.name);
-            if (_keys_id.length == 0) {
+            const ret = await this.storage.get(type);
+            if (ret)
+                return ret;
+            else
                 return null;
-            }
-            let keys = _keys_id.map(async (key) => await this.env.KEYS_NAMESPACE.get(key));
+        }
+        // otherwise it's keys managed by SSO / server
+        if (type === 'ownerKey') {
+            const _keys_id = (await this.env.KEYS_NAMESPACE.list({ prefix: this.room_id + '_ownerKey' })).keys.map(key => key.name);
+            if (_keys_id.length == 0)
+                return null;
+            const keys = _keys_id.map(async (key) => await this.env.KEYS_NAMESPACE.get(key));
             return await keys[keys.length - 1];
         }
         else if (type === 'ledgerKey') {
@@ -688,139 +613,75 @@ export class ChatRoomAPI {
         }
         return await this.env.KEYS_NAMESPACE.get(this.room_id + '_' + type);
     }
-    async postPubKey(request) {
-        try {
-            const { searchParams } = new URL(request.url);
-            // const json = await request.json();
-            const str = await request.text();
-            if (str) {
-                const json = await jsonParseWrapper(str, 'L611');
-                const keyType = searchParams.get('type');
-                if (keyType != null) {
-                    this.storage.put(keyType, JSON.stringify(json));
-                    this.initialize();
-                }
-                return returnResult(request, JSON.stringify({ success: true }), 200);
-            }
-            else {
-                console.log("ERROR: Received blank body in postPubKey(request) (??)");
-                return returnResult(request, JSON.stringify({
-                    success: false,
-                    error: '[postPubKey()] Received empty request body (??)\n'
-                }), 200);
-            }
-        }
-        catch (error) {
-            console.log("ERROR posting pubKey", error);
-            return returnResult(request, JSON.stringify({
-                success: false,
-                error: '[postPubKey()] ' + error.message + '\n' + error.stack
-            }), 200);
-        }
+    // deprecated (and this was flawed), see notes in jslib
+    async #postPubKey(request) {
+        return returnError(request, "postPubKey is deprecated", 400);
     }
-    async handleRoomCapacityChange(request) {
-        try {
-            const { searchParams } = new URL(request.url);
-            const newLimit = searchParams.get('capacity');
-            this.room_capacity = newLimit;
-            this.storage.put('room_capacity', this.room_capacity);
-            return returnResult(request, JSON.stringify({ capacity: newLimit }), 200);
-        }
-        catch (error) {
-            console.log("Could not change room capacity: ", error);
-            return returnResult(request, JSON.stringify({ error: "Could not change room capacity" }), 500);
-        }
+    async #handleRoomCapacityChange(request) {
+        const { searchParams } = new URL(request.url);
+        const newLimit = searchParams.get('capacity');
+        this.room_capacity = Number(newLimit) || this.room_capacity;
+        this.storage.put('room_capacity', this.room_capacity);
+        return returnResult(request, JSON.stringify({ capacity: newLimit }), 200);
     }
-    async getRoomCapacity(request) {
-        try {
-            return returnResult(request, JSON.stringify({ capacity: this.room_capacity }), 200);
-        }
-        catch (error) {
-            return returnResult(request, JSON.stringify({ error: "Could not fetch room capacity" }));
-        }
+    async #getRoomCapacity(request) {
+        return returnResult(request, JSON.stringify({ capacity: this.room_capacity }), 200);
     }
-    async getOwnerUnreadMessages(request) {
+    async #getOwnerUnreadMessages(request) {
         return returnResult(request, JSON.stringify({ unreadMessages: this.ownerUnread }), 200);
     }
-    async getPubKeys(request) {
+    async #getPubKeys(request) {
         return returnResult(request, JSON.stringify({ keys: this.visitors }), 200);
     }
-    async acceptVisitor(request) {
-        try {
-            let data;
-            data = await request.json();
-            const ind = this.join_requests.indexOf(data.pubKey);
-            if (ind > -1) {
-                this.accepted_requests = [...this.accepted_requests, ...this.join_requests.splice(ind, 1)];
-                this.lockedKeys[data.pubKey] = data.lockedKey;
-                this.storage.put('accepted_requests', JSON.stringify(this.accepted_requests));
-                this.storage.put('lockedKeys', this.lockedKeys);
-                this.storage.put('join_requests', JSON.stringify(this.join_requests));
-                return returnResult(request, JSON.stringify({}), 200);
-            }
-            return returnResult(request, JSON.stringify({ error: "Could not accept visitor" }), 500);
-        }
-        catch (e) {
-            console.log("Could not accept visitor: ", e);
-            return returnResult(request, JSON.stringify({ error: "Could not accept visitor" }), 500);
-        }
-    }
-    async lockRoom(request) {
-        try {
-            this.locked = true;
-            for (let i = 0; i < this.visitors.length; i++) {
-                if (this.accepted_requests.indexOf(this.visitors[i]) < 0 && this.join_requests.indexOf(this.visitors[i]) < 0) {
-                    this.join_requests.push(this.visitors[i]);
-                }
-            }
+    async #acceptVisitor(request) {
+        const data = await request.json();
+        const acceptPubKey = jsonParseWrapper(data.pubKey, 'L783');
+        // const ind = this.join_requests.indexOf((data as any).pubKey as string);
+        const ind = sbCrypto.lookupKey(acceptPubKey, this.join_requests);
+        if (ind >= 0) {
+            this.accepted_requests = [...this.accepted_requests, ...this.join_requests.splice(ind, 1)];
+            this.lockedKeys[data.pubKey] = data.lockedKey;
+            this.storage.put('accepted_requests', JSON.stringify(this.accepted_requests));
+            this.storage.put('lockedKeys', this.lockedKeys);
             this.storage.put('join_requests', JSON.stringify(this.join_requests));
-            this.storage.put('locked', this.locked);
-            return returnResult(request, JSON.stringify({ locked: this.locked }), 200);
+            return returnResult(request, JSON.stringify({}), 200);
         }
-        catch (error) {
-            console.log("Could not lock room: ", error);
-            return returnResult(request, JSON.stringify({ error: "Could not restrict room" }), 500);
+        else {
+            return returnError(request, "Could not accept visitor (visitor not found)", 400);
         }
     }
-    async getJoinRequests(request) {
-        try {
-            return returnResult(request, JSON.stringify({ join_requests: this.join_requests }), 200);
-        }
-        catch (error) {
-            return returnResult(request, JSON.stringify({ error: 'Could not get join requests' }), 500);
-        }
+    async #lockRoom(request) {
+        this.locked = true;
+        for (let i = 0; i < this.visitors.length; i++)
+            if (this.accepted_requests.indexOf(this.visitors[i]) < 0 && this.join_requests.indexOf(this.visitors[i]) < 0)
+                this.join_requests.push(this.visitors[i]);
+        this.storage.put('join_requests', JSON.stringify(this.join_requests));
+        this.storage.put('locked', this.locked);
+        return returnResult(request, JSON.stringify({ locked: this.locked }), 200);
     }
-    async isRoomLocked(request) {
-        try {
-            return returnResult(request, JSON.stringify({ locked: this.locked }), 200);
-        }
-        catch (error) {
-            console.log(error);
-            return returnResult(request, JSON.stringify({ error: 'Could not get restricted status' }), 500);
-        }
+    async #getJoinRequests(request) {
+        return returnResult(request, JSON.stringify({ join_requests: this.join_requests }), 200);
     }
-    async setMOTD(request) {
-        try {
-            let data;
-            data = await request.json();
-            this.motd = data.motd;
-            this.storage.put('motd', this.motd);
-            return returnResult(request, JSON.stringify({ motd: this.motd }), 200);
-        }
-        catch (e) {
-            console.log("Could not set message of the day: ", e);
-            return returnResult(request, JSON.stringify({ error: "Could not set message of the day" }), 200);
-        }
+    async #isRoomLocked(request) {
+        return returnResult(request, JSON.stringify({ locked: this.locked }), 200);
     }
-    async ownerKeyRotation(request) {
-        try {
+    async #setMOTD(request) {
+        const data = await request.json();
+        this.motd = data.motd;
+        this.storage.put('motd', this.motd);
+        return returnResult(request, JSON.stringify({ motd: this.motd }), 200);
+    }
+    // TODO: we do not allow owner key rotations, but we need to add
+    // regular key rotation(s), so keeping this as template code
+    async #ownerKeyRotation(request) {
+        if (ALLOW_OWNER_KEY_ROTATION) {
             let _tries = 3;
             let _timeout = 10000;
-            let _success = await this.checkRotation(1);
+            let _success = await this.#checkRotation(1);
             if (!_success) {
                 while (_tries > 0) {
                     _tries -= 1;
-                    _success = await this.checkRotation(_timeout);
+                    _success = await this.#checkRotation(_timeout);
                     if (_success) {
                         break;
                     }
@@ -830,8 +691,10 @@ export class ChatRoomAPI {
                     return returnResult(request, JSON.stringify({ success: false }), 200);
                 }
             }
-            const _updatedKey = await this.getKey('ownerKey');
-            // this.broadcast(JSON.stringify({ control: true, ownerKeyChanged: true, ownerKey: _updatedKey }));
+            // const _updatedKey = await this.getKey('ownerKey');
+            const _updatedKey = this.room_owner;
+            // ehm .. why was this removed?
+            this.#broadcast(JSON.stringify({ control: true, ownerKeyChanged: true, ownerKey: _updatedKey }));
             this.room_owner = _updatedKey;
             // Now pushing all accepted requests back to join requests
             this.join_requests = [...this.join_requests, ...this.accepted_requests];
@@ -842,35 +705,19 @@ export class ChatRoomAPI {
             this.storage.put('accepted_requests', JSON.stringify(this.accepted_requests));
             return returnResult(request, JSON.stringify({ success: true }), 200);
         }
-        catch (error) {
-            console.log("Check for owner key rotation failed: ", error);
-            return returnResult(request, JSON.stringify({
-                success: false,
-                error: '[ownerKeyRotation()] ' + error.message + '\n' + error.stack
-            }), 200);
+        else {
+            return returnError(request, "Owner key rotation not allowed", 405);
         }
     }
-    async checkRotation(_timeout) {
-        try {
-            await new Promise(resolve => setTimeout(resolve, _timeout));
-            /* return new Promise((resolve) => {
-              setTimeout(async () => {
-                if (await this.getKey('ownerKey') !== this.room_owner) {
-                  resolve(true);
-                }
-                resolve(false);
-              }, _timeout)
-            })*/
-            return await this.getKey('ownerKey') !== this.room_owner;
-        }
-        catch (error) {
-            console.log("Error while checking for owner key rotation: ", error);
-            return false;
-        }
+    // clumsy event handling to track change; TODO cleanup
+    async #checkRotation(_timeout) {
+        await new Promise((resolve) => setTimeout(() => {
+            resolve(true);
+        }, _timeout));
+        return (true);
     }
     // NOTE: current design limits this to 2^52 bytes, future limit will be 2^64 bytes
-    roundSize(size, roundUp = true) {
-        size = Number(size);
+    #roundSize(size, roundUp = true) {
         if (size === Infinity)
             return Infinity; // special case
         if (size <= STORAGE_SIZE_MIN)
@@ -889,48 +736,33 @@ export class ChatRoomAPI {
     /**
      * channels approve storage by creating storage token out of their budget
      */
-    async handleNewStorage(request) {
-        try {
-            const { searchParams } = new URL(request.url);
-            const size = this.roundSize(searchParams.get('size'));
-            const storageLimit = this.storageLimit;
-            if (size > storageLimit)
-                return returnResult(request, JSON.stringify({ error: 'Not sufficient storage budget left in channel' }), 500);
-            if (size > STORAGE_SIZE_MAX)
-                return returnResult(request, JSON.stringify({ error: `Storage size too large (max ${STORAGE_SIZE_MAX} bytes)` }), 500);
-            this.storageLimit = storageLimit - size;
-            this.storage.put('storageLimit', this.storageLimit);
-            const token_buffer = crypto.getRandomValues(new Uint8Array(48)).buffer;
-            const token_hash_buffer = await crypto.subtle.digest('SHA-256', token_buffer);
-            const token_hash = this.arrayBufferToBase64(token_hash_buffer);
-            const kv_data = { used: false, size: size };
-            const kv_resp = await this.env.LEDGER_NAMESPACE.put(token_hash, JSON.stringify(kv_data));
-            const encrypted_token_id = this.arrayBufferToBase64(await crypto.subtle.encrypt({ name: "RSA-OAEP" }, this.ledgerKey, token_buffer));
-            const hashed_room_id = this.arrayBufferToBase64(await crypto.subtle.digest('SHA-256', (new TextEncoder).encode(this.room_id)));
-            const token = { token_hash: token_hash, hashed_room_id: hashed_room_id, encrypted_token_id: encrypted_token_id };
-            return returnResult(request, JSON.stringify(token), 200);
-        }
-        catch (error) {
-            return returnResult(request, JSON.stringify({ error: '[handleNewStorage()] ' + error.message + '\n' + error.stack }), 500);
-        }
+    async #handleNewStorage(request) {
+        const { searchParams } = new URL(request.url);
+        const size = this.#roundSize(Number(searchParams.get('size')));
+        const storageLimit = this.storageLimit;
+        if (size > storageLimit)
+            return returnError(request, 'Not sufficient storage budget left in channel', 507);
+        if (size > STORAGE_SIZE_MAX)
+            return returnResult(request, `Storage size too large (max ${STORAGE_SIZE_MAX} bytes)`, 413);
+        this.storageLimit = storageLimit - size;
+        this.storage.put('storageLimit', this.storageLimit);
+        const token_buffer = crypto.getRandomValues(new Uint8Array(48)).buffer;
+        const token_hash_buffer = await crypto.subtle.digest('SHA-256', token_buffer);
+        const token_hash = arrayBufferToBase64(token_hash_buffer);
+        const kv_data = { used: false, size: size };
+        const kv_resp = await this.env.LEDGER_NAMESPACE.put(token_hash, JSON.stringify(kv_data));
+        const encrypted_token_id = arrayBufferToBase64(await crypto.subtle.encrypt({ name: "RSA-OAEP" }, this.ledgerKey, token_buffer));
+        const hashed_room_id = arrayBufferToBase64(await crypto.subtle.digest('SHA-256', (new TextEncoder).encode(this.room_id)));
+        const token = { token_hash: token_hash, hashed_room_id: hashed_room_id, encrypted_token_id: encrypted_token_id };
+        return returnResult(request, JSON.stringify(token), 200);
     }
-    async getStorageLimit(request) {
-        try {
-            return returnResult(request, JSON.stringify({ storageLimit: this.storageLimit }), 200);
-        }
-        catch (error) {
-            return returnResult(request, JSON.stringify({ error: '[getCurrentStorage()] ' + error.message + '\n' + error.stack }), 500);
-        }
+    async #getStorageLimit(request) {
+        return returnResult(request, JSON.stringify({ storageLimit: this.storageLimit }), 200);
     }
-    async getMother(request) {
-        try {
-            return returnResult(request, JSON.stringify({ motherChannel: this.motherChannel }), 200);
-        }
-        catch (error) {
-            return returnResult(request, JSON.stringify({ error: '[getMother()] ' + error.message + '\n' + error.stack }), 500);
-        }
+    async #getMother(request) {
+        return returnResult(request, JSON.stringify({ motherChannel: this.motherChannel }), 200);
     }
-    transferBudgetLegal(transferBudget) {
+    #transferBudgetLegal(transferBudget) {
         // first check if the transfer budget is a number
         if (isNaN(transferBudget))
             return false;
@@ -942,471 +774,201 @@ export class ChatRoomAPI {
        channel's budget, and just get the channel ID from the request
        and look up and increment it's budget.
     */
-    async handleBuddRequest(request) {
-        try {
-            if (DEBUG2)
-                console.log(request);
-            const _secret = this.env.SERVER_SECRET;
-            const { searchParams } = new URL(request.url);
-            const targetChannel = searchParams.get('targetChannel');
-            let transferBudget = this.roundSize(searchParams.get('transferBudget'));
-            const serverSecret = searchParams.get('serverSecret');
-            if (!targetChannel)
-                return returnResult(request, JSON.stringify({ error: '[budd()]: No target channel specified' }), 500, 50);
-            if (this.room_id === targetChannel) {
-                // we are the benefactor
-                const size = transferBudget;
-                if (!this.transferBudgetLegal(size))
-                    return returnResult(request, JSON.stringify({ error: `[budd()]: Transfer budget not legal (${size})` }), 500, 50);
-                if ((serverSecret) && (serverSecret === _secret)) {
-                    // we are the target channel, so we're being asked to accept budgeta
-                    const roomInitialized = !(this.room_owner === "" || this.room_owner === null);
-                    if (roomInitialized) {
-                        // simple case, all is lined up and approved, and we've been initialized
-                        const newStorageLimit = this.storageLimit + size;
-                        this.storageLimit = newStorageLimit;
-                        await this.storage.put('storageLimit', newStorageLimit);
-                        if (DEBUG)
-                            console.log(`[budd()]: Transferring ${size} bytes from ${this.room_id.slice(0, 12)}... to ${targetChannel.slice(0, 12)}... (new recipient storage limit: ${newStorageLimit})`);
-                        returnResult(request, JSON.stringify({ success: true }), 200);
-                    }
-                    else {
-                        // we don't exist yet, so we convert this call to a self-approved 'upload'
-                        console.log("================ ARE WE EVER CALLED?? ================");
-                        // let data = await request.arrayBuffer();
-                        // let jsonString = new TextDecoder().decode(data);
-                        // let jsonData = jsonParseWrapper(jsonString, 'L937');
-                        // if (jsonData.hasOwnProperty("SERVER_SECRET")) return returnResult(request, JSON.stringify({ error: `[budd()]: SERVER_SECRET set? Huh?` }), 500, 50);
-                        // jsonData["SERVER_SECRET"] = _secret;
-                        // if (size < NEW_CHANNEL_MINIMUM_BUDGET)
-                        //   return returnResult(request, JSON.stringify({ error: `Not enough storage request for a new channel (minimum is ${this.NEW_CHANNEL_MINIMUM_BUDGET} bytes)` }), 500);
-                        // jsonData["size"] = size;
-                        // let newRequest = new Request(request.url, {
-                        //   method: 'POST',
-                        //   headers: request.headers,
-                        //   body: JSON.stringify(jsonData)
-                        // });
-                        // if (DEBUG) {
-                        //   console.log("[budd()]: Converting request to upload request:");
-                        //   console.log(newRequest);
-                        // }
-                        // await this.env.LEDGER_NAMESPACE.put(targetChannel, JSON.stringify(size));
-                        // if (DEBUG) { 
-                        //   console.log('++++ putting budget in ledger ... reading back:');
-                        //   console.log(await this.env.LEDGER_NAMESPACE.get(targetChannel));
-                        // }
-                        // return callDurableObject(targetChannel, 'uploadRoom', newRequest, this.env)
-                        return returnResult(request, JSON.stringify({ error: '[handleBuddRequest()] problems (L994)' }), 500);
-                    }
+    async #handleBuddRequest(request) {
+        if (DEBUG2)
+            console.log(request);
+        const _secret = this.env.SERVER_SECRET;
+        const { searchParams } = new URL(request.url);
+        const targetChannel = searchParams.get('targetChannel');
+        let transferBudget = this.#roundSize(Number(searchParams.get('transferBudget')));
+        const serverSecret = searchParams.get('serverSecret');
+        if (!targetChannel)
+            return returnError(request, '[budd()]: No target channel specified', 400);
+        if (this.room_id === targetChannel) {
+            // we are the benefactor
+            const size = transferBudget;
+            if (!this.#transferBudgetLegal(size))
+                return returnError(request, `[budd()]: Transfer budget not legal (${size})`, 400);
+            if ((serverSecret) && (serverSecret === _secret)) {
+                // we are the target channel, so we're being asked to accept budgeta
+                const roomInitialized = !(this.room_owner === "" || this.room_owner === null);
+                if (roomInitialized) {
+                    // simple case, all is lined up and approved, and we've been initialized
+                    const newStorageLimit = this.storageLimit + size;
+                    this.storageLimit = newStorageLimit;
+                    await this.storage.put('storageLimit', newStorageLimit);
+                    if (DEBUG)
+                        console.log(`[budd()]: Transferring ${size} bytes from ${this.room_id.slice(0, 12)}... to ${targetChannel.slice(0, 12)}... (new recipient storage limit: ${newStorageLimit})`);
+                    returnResult(request, JSON.stringify({ success: true }), 200);
                 }
                 else {
-                    return returnResult(request, JSON.stringify({ error: '[budd()]: Authentication of transfer failed' }), 500, 50);
+                    // we don't exist yet, so we convert this call to a self-approved 'upload'
+                    if (DEBUG)
+                        console.log("================ ARE WE EVER CALLED?? ================");
+                    // let data = await request.arrayBuffer();
+                    // let jsonString = new TextDecoder().decode(data);
+                    // let jsonData = jsonParseWrapper(jsonString, 'L937');
+                    // if (jsonData.hasOwnProperty("SERVER_SECRET")) return returnResult(request, JSON.stringify({ error: `[budd()]: SERVER_SECRET set? Huh?` }), 500, 50);
+                    // jsonData["SERVER_SECRET"] = _secret;
+                    // if (size < NEW_CHANNEL_MINIMUM_BUDGET)
+                    //   return returnResult(request, JSON.stringify({ error: `Not enough storage request for a new channel (minimum is ${this.NEW_CHANNEL_MINIMUM_BUDGET} bytes)` }), 500);
+                    // jsonData["size"] = size;
+                    // let newRequest = new Request(request.url, {
+                    //   method: 'POST',
+                    //   headers: request.headers,
+                    //   body: JSON.stringify(jsonData)
+                    // });
+                    // if (DEBUG) {
+                    //   console.log("[budd()]: Converting request to upload request:");
+                    //   console.log(newRequest);
+                    // }
+                    // await this.env.LEDGER_NAMESPACE.put(targetChannel, JSON.stringify(size));
+                    // if (DEBUG) { 
+                    //   console.log('++++ putting budget in ledger ... reading back:');
+                    //   console.log(await this.env.LEDGER_NAMESPACE.get(targetChannel));
+                    // }
+                    // return callDurableObject(targetChannel, 'uploadRoom', newRequest, this.env)
+                    return returnResult(request, JSON.stringify({ error: '[handleBuddRequest()] problems (L994)' }), 500);
                 }
             }
             else {
-                // it's another channel, taken out of ours
-                if (!this.storageLimit)
-                    return returnResult(request, JSON.stringify({ error: `[budd()]: Mother channel (${this.room_id.slice(0, 12)}...) either does not exist, or has not been initialized, or lacks storage budget` }), 500, 50);
-                if ((!transferBudget) || (transferBudget === Infinity))
-                    transferBudget = this.storageLimit; // strip it
-                if (transferBudget > this.storageLimit)
-                    return returnResult(request, JSON.stringify({ error: '[budd()]: Not enough storage budget in mother channel for request' }), 500, 50);
-                const size = transferBudget;
-                const newStorageLimit = this.storageLimit - size;
-                this.storageLimit = newStorageLimit;
-                await this.storage.put('storageLimit', newStorageLimit);
-                if (DEBUG)
-                    console.log(`[budd()]: Removing ${size} bytes from ${this.room_id.slice(0, 12)}... and forwarding to ${targetChannel.slice(0, 12)}... (new mother storage limit: ${newStorageLimit} bytes)`);
-                // await this.env.LEDGER_NAMESPACE.put(targetChannel, JSON.stringify(size));
-                // if (DEBUG) { 
-                //   console.log('++++ putting budget in ledger ... reading back:');
-                //   console.log(await this.env.LEDGER_NAMESPACE.get(targetChannel));
-                // }
-                let data = await request.arrayBuffer();
-                let jsonString = new TextDecoder().decode(data);
-                let jsonData = jsonParseWrapper(jsonString, 'L1018');
-                if (jsonData.hasOwnProperty("SERVER_SECRET"))
-                    return returnResult(request, JSON.stringify({ error: `[budd()]: SERVER_SECRET set? Huh?` }), 500, 50);
-                jsonData["SERVER_SECRET"] = _secret;
-                if (size < NEW_CHANNEL_MINIMUM_BUDGET)
-                    return returnResult(request, JSON.stringify({ error: `Not enough storage request for a new channel (minimum is ${this.NEW_CHANNEL_MINIMUM_BUDGET} bytes)` }), 500);
-                jsonData["size"] = size;
-                jsonData["motherChannel"] = this.room_id; // we leave a birth certificate behind
-                let newUrl = new URL(request.url);
-                newUrl.pathname = `/api/room/${targetChannel}/uploadRoom`;
-                let newRequest = new Request(newUrl, {
-                    method: 'POST',
-                    body: JSON.stringify(jsonData),
-                    headers: {
-                        'Content-Type': 'application/json'
-                    }
-                });
-                if (DEBUG) {
-                    console.log("[budd()]: Converting request to upload request:");
-                    if (DEBUG2)
-                        console.log(newRequest);
-                }
-                await this.env.LEDGER_NAMESPACE.put(targetChannel, JSON.stringify({ mother: this.room_id, size: size }));
-                if (DEBUG) {
-                    console.log('++++ putting budget in ledger ... reading back:');
-                    console.log(await this.env.LEDGER_NAMESPACE.get(targetChannel));
-                }
-                return callDurableObject(targetChannel, ['uploadRoom'], newRequest, this.env);
-                // return callDurableObject(targetChannel, [ `budd?targetChannel=${targetChannel}&transferBudget=${size}&serverSecret=${_secret}` ], request, this.env);
-            }
-        }
-        catch (error) {
-            return returnResult(request, JSON.stringify({ error: '[handleBuddRequest()] failed (transfer may have been lost)' + error.message + '\n' + error.stack }), 500);
-        }
-    }
-    async handleAdminDataRequest(request) {
-        try {
-            return returnResult(request, JSON.stringify({
-                join_requests: this.join_requests,
-                capacity: this.room_capacity
-            }), 200);
-        }
-        catch (error) {
-            return returnResult(request, JSON.stringify({ error: 'Could not get admin data' }), 500);
-        }
-    }
-    async verifyCookie(request) {
-        // Parse cookie code from https://stackoverflow.com/questions/51812422/node-js-how-can-i-get-cookie-value-by-cookie-name-from-request
-        try {
-            let cookies = {};
-            request.headers.has('cookie') && request.headers.get('cookie').split(';').forEach(function (cookie) {
-                let parts = cookie.match(/(.*?)=(.*)$/);
-                cookies[parts[1].trim()] = (parts[2] || '').trim();
-            });
-            if (!cookies.hasOwnProperty('token_' + this.room_id)) {
-                return false;
-            }
-            const verificationKey = await crypto.subtle.importKey("jwk", jsonParseWrapper(await this.env.KEYS_NAMESPACE.get(this.room_id + '_authorizationKey'), 'L778'), {
-                name: "ECDSA",
-                namedCurve: "P-384"
-            }, false, ['verify']);
-            const auth_parts = cookies['token_' + this.room_id].split('.');
-            const payload = auth_parts[0];
-            const sign = auth_parts[1];
-            return (await this.verifySign(verificationKey, sign, payload + '_' + this.room_id) && ((new Date()).getTime() - parseInt(payload)) < 86400000);
-        }
-        catch (error) {
-            return false;
-        }
-    }
-    async verifyAuthSign(request) {
-        try {
-            if (!request.headers.has('authorization')) {
-                return false;
-            }
-            let authHeader = request.headers['authorization'];
-            if (!authHeader)
-                return false;
-            let auth_parts = authHeader.split('.');
-            if (new Date().getTime() - parseInt(auth_parts[0]) > 60000) {
-                return false;
-            }
-            let sign = auth_parts[1];
-            let ownerKey = await window.crypto.subtle.importKey("jwk", this.room_owner, {
-                name: "ECDH",
-                namedCurve: "P-384"
-            }, false, ["deriveKey"]);
-            let roomSignKey = await window.crypto.subtle.importKey("jwk", this.signKey, {
-                name: "ECDH",
-                namedCurve: "P-384"
-            }, false, ["deriveKey"]);
-            let verificationKey = await window.crypto.subtle.deriveKey({
-                name: "ECDH",
-                public: ownerKey
-            }, roomSignKey, {
-                name: "HMAC",
-                hash: "SHA-256",
-                length: 256
-            }, false, ["verify"]);
-            return await window.crypto.subtle.verify("HMAC", verificationKey, this.base64ToArrayBuffer(sign), new TextEncoder().encode(auth_parts[0]));
-        }
-        catch (error) {
-            console.log("Error verifying (owner) signature", error.stack);
-            return false;
-        }
-    }
-    async verifySign(secretKey, sign, contents) {
-        try {
-            const _sign = this.base64ToArrayBuffer(decodeURIComponent(sign));
-            const encoder = new TextEncoder();
-            const encoded = encoder.encode(contents);
-            let verified = await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, secretKey, _sign, encoded);
-            return verified;
-        }
-        catch (e) {
-            return false;
-        }
-    }
-    async sign(secretKey, contents) {
-        try {
-            const encoder = new TextEncoder();
-            const encoded = encoder.encode(contents);
-            let sign;
-            try {
-                sign = await window.crypto.subtle.sign('HMAC', secretKey, encoded);
-                return encodeURIComponent(this.arrayBufferToBase64(sign));
-            }
-            catch (error) {
-                // console.log(error);
-                return { error: "Failed to sign content" };
-            }
-        }
-        catch (error) {
-            // console.log(error);
-            return { error: '[sign() ]' + error.message + '\n' + error.stack };
-        }
-    }
-    async jwtSign(payload, secret, options) {
-        if (DEBUG)
-            console.log("Trying to create sign: ", payload, typeof payload, secret, typeof secret);
-        if (payload === null || typeof payload !== 'object')
-            throw new Error('payload must be an object');
-        if (typeof secret !== 'string')
-            throw new Error('secret must be a string');
-        const importAlgorithm = { name: 'ECDSA', namedCurve: 'P-256', hash: { name: 'SHA-256' } };
-        if (DEBUG)
-            console.log("PAST THROWS");
-        payload.iat = Math.floor(Date.now() / 1000);
-        this.claimIat = payload.iat;
-        this.storage.put("claimIat", this.claimIat);
-        const payloadAsJSON = JSON.stringify(payload);
-        const partialToken = `${this.jwtStringify(this._utf8ToUint8Array(JSON.stringify({
-            alg: options.algorithm,
-            kid: options.keyid
-        })))}.${this.jwtStringify(this._utf8ToUint8Array(payloadAsJSON))}`;
-        let keyFormat = 'raw';
-        let keyData;
-        if (secret.startsWith('-----BEGIN')) {
-            keyFormat = 'pkcs8';
-            keyData = this.jwt_str2ab(atob(secret.replace(/-----BEGIN.*?-----/g, '').replace(/-----END.*?-----/g, '').replace(/\s/g, '')));
-        }
-        else
-            keyData = this._utf8ToUint8Array(secret);
-        const key = await crypto.subtle.importKey(keyFormat, keyData, importAlgorithm, false, ['sign']);
-        if (DEBUG)
-            console.log("GOT KEY: ", key);
-        const signature = await crypto.subtle.sign(importAlgorithm, key, this._utf8ToUint8Array(partialToken));
-        return `${partialToken}.${this.jwtStringify(new Uint8Array(signature))}`;
-    }
-    _utf8ToUint8Array(str) {
-        return this.jwtParse(btoa(unescape(encodeURIComponent(str))));
-    }
-    jwtParse(s) {
-        return new Uint8Array(Array.prototype.map.call(atob(s.replace(/-/g, '+').replace(/_/g, '/').replace(/\s/g, '')), c => c.charCodeAt(0)));
-    }
-    jwtStringify(a) {
-        return btoa(String.fromCharCode.apply(0, a)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
-    }
-    jwt_str2ab(str) {
-        const buf = new ArrayBuffer(str.length);
-        const bufView = new Uint8Array(buf);
-        for (let i = 0, strLen = str.length; i < strLen; i++) {
-            bufView[i] = str.charCodeAt(i);
-        }
-        return buf;
-    }
-    addNewlines(str) {
-        var result = '';
-        while (str.length > 64) {
-            result += str.substring(0, 64) + '\n';
-            str = str.substring(64);
-        }
-        result += str;
-        return result;
-    }
-    ab2str(buf) {
-        return String.fromCharCode.apply(null, new Uint8Array(buf));
-    }
-    /*
-    Export the given key and write it into the "exported-key" space.
-    */
-    async exportPrivateCryptoKey(key) {
-        const exported = await crypto.subtle.exportKey("pkcs8", key);
-        const exportedAsString = this.ab2str(exported);
-        const exportedAsBase64 = this.addNewlines(btoa(exportedAsString));
-        const pemExported = `-----BEGIN PRIVATE KEY-----\n${exportedAsBase64}\n-----END PRIVATE KEY-----`;
-        return pemExported;
-    }
-    async exportPublicCryptoKey(key) {
-        const exported = await crypto.subtle.exportKey("spki", key);
-        const exportedAsString = this.ab2str(exported);
-        const exportedAsBase64 = this.addNewlines(btoa(exportedAsString));
-        const pemExported = `-----BEGIN PUBLIC KEY-----\n${exportedAsBase64}\n-----END PUBLIC KEY-----`;
-        return pemExported;
-    }
-    async convertToPem(keys) {
-        let _keys = {};
-        for (let key in keys) {
-            try {
-                if (keys[key] === null || keys[key] === "") {
-                    continue;
-                }
-                const keyType = key.split('_').slice(-1)[0];
-                let val = typeof keys[key] === 'object' ? keys[key] : jsonParseWrapper(keys[key], 'L956');
-                if (keyType === 'encryptionKey') {
-                    const cryptoKey = await crypto.subtle.importKey("jwk", val, {
-                        name: "AES-GCM",
-                        length: 256
-                    }, true, ['encrypt', 'decrypt']);
-                    const exported = await crypto.subtle.exportKey("raw", cryptoKey);
-                    _keys[key] = btoa(this.ab2str(exported));
-                }
-                else if (keyType === 'signKey') {
-                    const cryptoKey = await crypto.subtle.importKey("jwk", val, {
-                        name: "ECDH",
-                        namedCurve: "P-384"
-                    }, true, ['deriveKey']);
-                    const _pemKey = await this.exportPrivateCryptoKey(cryptoKey);
-                    _keys[key] = _pemKey;
-                }
-                else {
-                    const cryptoKey = await crypto.subtle.importKey("jwk", val, { name: "ECDH", namedCurve: "P-384" }, true, []);
-                    const _pemKey = await this.exportPublicCryptoKey(cryptoKey);
-                    _keys[key] = _pemKey;
-                }
-            }
-            catch {
-                _keys[key] = "ERROR";
-            }
-        }
-        return _keys;
-    }
-    base64ToArrayBuffer(base64) {
-        var binary_string = atob(base64);
-        var len = binary_string.length;
-        var bytes = new Uint8Array(len);
-        for (var i = 0; i < len; i++) {
-            bytes[i] = binary_string.charCodeAt(i);
-        }
-        return bytes.buffer;
-    }
-    arrayBufferToBase64(buffer) {
-        // try {  // better to just throw the error
-        let binary = '';
-        const bytes = new Uint8Array(buffer);
-        const len = bytes.byteLength;
-        for (let i = 0; i < len; i++) {
-            binary += String.fromCharCode(bytes[i]);
-        }
-        return btoa(binary);
-        // }
-        // catch (e) {
-        //   console.log(e);
-        //   return { error: e };
-        // }
-    }
-    checkJsonExistence(val, arr) {
-        for (let i = 0; i < arr.length; i++) {
-            try {
-                if (this.areJsonKeysSame(val, jsonParseWrapper(arr[i], 'L1008')))
-                    return true;
-            }
-            catch (err) {
-                continue;
-            }
-        }
-        return false;
-    }
-    getLockedKey(val) {
-        for (let key of Object.keys(this.lockedKeys)) {
-            if (this.areJsonKeysSame(val, jsonParseWrapper(key, 'L1019')))
-                return this.lockedKeys[key];
-        }
-        return { error: "Could not find key" };
-    }
-    areJsonKeysSame(key1, key2) {
-        return (key1["x"] == key2["x"]) && (key1["y"] == key2["y"]);
-    }
-    registerDevice(request) {
-        if (DEBUG)
-            console.log("Registering device");
-        const { searchParams } = new URL(request.url);
-        this.deviceIds = [...new Set(this.deviceIds)];
-        let deviceId = searchParams.get("id");
-        if (!this.deviceIds.includes(deviceId)) {
-            this.deviceIds.push(deviceId);
-        }
-        if (DEBUG)
-            console.log(this.deviceIds);
-        this.storage.put("deviceIds", JSON.stringify(this.deviceIds));
-        return returnResult(request, JSON.stringify({ success: true }), 200);
-    }
-    async sendNotifications(dev = true) {
-        if (DEBUG)
-            console.log("Trying to send notifications", this.claimIat);
-        let jwtToken = this.notificationToken;
-        if ((this.claimIat - (Math.round(new Date().getTime() / 1000))) > 3000 || jwtToken === "" && this.env.ISS && this.env.APS_KEY) {
-            if (DEBUG)
-                console.log("Refreshing token");
-            const claim = { iss: this.env.ISS };
-            const pemKey = this.env.APS_KEY;
-            // console.log("IN IF CLAUSE", claim, pemKey);
-            try {
-                jwtToken = await this.jwtSign(claim, pemKey, { algorithm: "ES256", keyid: this.env.KID });
-                this.storage.put("notificationToken", jwtToken);
-            }
-            catch (err) {
-                console.log("Error signing with jwt: ", err.message);
-            }
-            this.notificationToken = jwtToken;
-        }
-        let notificationJSON = {
-            aps: {
-                alert: {
-                    title: this.room_id,
-                    subtitle: "You have a new message!"
-                },
-                sound: "default",
-            }
-        };
-        if (this.env.ISS && this.env.APS_KEY) {
-            notificationJSON.aps["mutable-content"] = true;
-            notificationJSON.aps["interruption-level"] = "active";
-            let notification = JSON.stringify(notificationJSON);
-            if (DEBUG)
-                console.log("TOKEN", jwtToken, this.deviceIds[0], notification);
-            let base = dev ? "https://api.sandbox.push.apple.com/3/device/" : "https://api.push.apple.com/3/device/";
-            // console.log("DEVICE LENGTH: ", this.deviceIds.length)
-            for (let i = 0; i < this.deviceIds.length; i++) {
-                if (DEBUG)
-                    console.log("Pinging: ", this.deviceIds[i]);
-                const device_token = this.deviceIds[i];
-                let url = base + device_token;
-                let request = {
-                    method: "POST",
-                    headers: {
-                        "authorization": "bearer " + jwtToken,
-                        "apns-topic": "app.snackabra",
-                        "apns-push-type": "alert"
-                    },
-                    body: notification
-                };
-                let req = await fetch(url, request);
-                if (DEBUG)
-                    console.log("Request is: ", url, JSON.stringify(request));
-                if (DEBUG)
-                    console.log('APPLE RESPONSE', req);
+                return returnResult(request, JSON.stringify({ error: '[budd()]: Authentication of transfer failed' }), 401, 50);
             }
         }
         else {
+            // it's another channel, taken out of ours
+            if (!this.storageLimit)
+                return returnError(request, `[budd()]: Mother channel (${this.room_id.slice(0, 12)}...) either does not exist, or has not been initialized, or lacks storage budget`, 400);
+            if ((!transferBudget) || (transferBudget === Infinity))
+                transferBudget = this.storageLimit; // strip it
+            if (transferBudget > this.storageLimit)
+                return returnError(request, '[budd()]: Not enough storage budget in mother channel for request', 507);
+            const size = transferBudget;
+            const newStorageLimit = this.storageLimit - size;
+            this.storageLimit = newStorageLimit;
+            await this.storage.put('storageLimit', newStorageLimit);
             if (DEBUG)
-                console.log('Set ISS and APS_KEY env vars to enable apple notifications');
+                console.log(`[budd()]: Removing ${size} bytes from ${this.room_id.slice(0, 12)}... and forwarding to ${targetChannel.slice(0, 12)}... (new mother storage limit: ${newStorageLimit} bytes)`);
+            // await this.env.LEDGER_NAMESPACE.put(targetChannel, JSON.stringify(size));
+            // if (DEBUG) { 
+            //   console.log('++++ putting budget in ledger ... reading back:');
+            //   console.log(await this.env.LEDGER_NAMESPACE.get(targetChannel));
+            // }
+            const data = await request.arrayBuffer();
+            const jsonString = new TextDecoder().decode(data);
+            const jsonData = jsonParseWrapper(jsonString, 'L1018');
+            if (jsonData.hasOwnProperty("SERVER_SECRET"))
+                return returnError(request, `[budd()]: SERVER_SECRET set? Huh?`, 403);
+            jsonData["SERVER_SECRET"] = _secret;
+            if (size < NEW_CHANNEL_MINIMUM_BUDGET)
+                return returnError(request, `Not enough storage request for a new channel (minimum is ${NEW_CHANNEL_MINIMUM_BUDGET} bytes)`, 400);
+            jsonData["size"] = size;
+            jsonData["motherChannel"] = this.room_id; // we leave a birth certificate behind
+            const newUrl = new URL(request.url);
+            newUrl.pathname = `/api/room/${targetChannel}/uploadRoom`;
+            const newRequest = new Request(newUrl, {
+                method: 'POST',
+                body: JSON.stringify(jsonData),
+                headers: {
+                    'Content-Type': 'application/json'
+                }
+            });
+            if (DEBUG) {
+                console.log("[budd()]: Converting request to upload request:");
+                if (DEBUG2)
+                    console.log(newRequest);
+            }
+            await this.env.LEDGER_NAMESPACE.put(targetChannel, JSON.stringify({ mother: this.room_id, size: size }));
+            if (DEBUG) {
+                console.log('++++ putting budget in ledger ... reading back:');
+                console.log(await this.env.LEDGER_NAMESPACE.get(targetChannel));
+            }
+            return callDurableObject(targetChannel, ['uploadRoom'], newRequest, this.env);
+            // return callDurableObject(targetChannel, [ `budd?targetChannel=${targetChannel}&transferBudget=${size}&serverSecret=${_secret}` ], request, this.env);
         }
+        return returnError(request, 'Should not get here', 500);
     }
-    async sendWebNotifications(message) {
+    async #handleAdminDataRequest(request) {
+        const adminData = {
+            room_id: this.room_id,
+            join_requests: this.join_requests,
+            capacity: this.room_capacity,
+        };
+        return returnResult(request, JSON.stringify(adminData), 200);
+    }
+    async #verifySign(secretKey, sign, contents) {
+        const _sign = base64ToArrayBuffer(decodeURIComponent(sign));
+        const encoder = new TextEncoder();
+        const encoded = encoder.encode(contents);
+        const verified = await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, secretKey, _sign, encoded);
+        return verified;
+    }
+    async #verifyCookie(request) {
+        const cookies = {};
+        request.headers.has('cookie') && request.headers.get('cookie').split(';').forEach(function (cookie) {
+            const parts = cookie.match(/(.*?)=(.*)$/);
+            if (parts)
+                cookies[parts[1].trim()] = (parts[2] || '').trim();
+        });
+        if (!cookies.hasOwnProperty('token_' + this.room_id)) {
+            return false;
+        }
+        const verificationKey = await crypto.subtle.importKey("jwk", jsonParseWrapper(await this.env.KEYS_NAMESPACE.get(this.room_id + '_authorizationKey'), 'L778'), {
+            name: "ECDSA",
+            namedCurve: "P-384"
+        }, false, ['verify']);
+        const auth_parts = cookies['token_' + this.room_id].split('.');
+        const payload = auth_parts[0];
+        const sign = auth_parts[1];
+        return (await this.#verifySign(verificationKey, sign, payload + '_' + this.room_id) && ((new Date()).getTime() - parseInt(payload)) < 86400000);
+    }
+    // this checks if OWNER has signed the request
+    async #verifyAuthSign(request) {
+        if (!this.#channelKeys)
+            return false;
+        if (!request.headers.has('authorization'))
+            return false;
+        const authHeader = request.headers.get('authorization');
+        if (!authHeader)
+            return false;
+        const auth_parts = authHeader.split('.');
+        if (new Date().getTime() - parseInt(auth_parts[0]) > 60000)
+            return false;
+        const sign = auth_parts[1];
+        const ownerKey = this.#channelKeys.ownerKey;
+        const roomSignKey = this.#channelKeys.signKey;
+        const verificationKey = await crypto.subtle.deriveKey({
+            name: "ECDH",
+            $public: ownerKey // looks like possible issues with cloudflare worker types?
+        }, roomSignKey, {
+            name: "HMAC",
+            hash: "SHA-256",
+            length: 256
+        }, false, ["verify"]);
+        return await crypto.subtle.verify("HMAC", verificationKey, base64ToArrayBuffer(sign), new TextEncoder().encode(auth_parts[0]));
+    }
+    // returns true if request is either from OWNER, or with a signature cookie (eg SSO)
+    async #verifyAuth(request) {
+        return (await this.#verifyCookie(request) || await this.#verifyAuthSign(request));
+    }
+    #registerDevice(request) {
+        return returnError(request, "registerDevice is disabled, use web notifications", 400);
+    }
+    // TODO: review this, it sends a return value that is not used
+    async #sendWebNotifications(message) {
+        const envNotifications = this.env.notifications;
+        if (!envNotifications) {
+            if (DEBUG)
+                console.log("Cannot send web notifications (expected behavior if you're running locally");
+            return;
+        }
         if (DEBUG)
             console.log("Sending web notification", message);
         message = JSON.parse(message);
-        if (message?.type === 'ack')
-            return;
-        var coeff = 1000 * 60 * 1;
-        var date = new Date();
-        var rounded = new Date(Math.round(date.getTime() / coeff) * coeff);
+        // if (message?.type === 'ack') return
+        const coeff = 1000 * 60 * 1;
+        const date = new Date();
+        const rounded = new Date(Math.round(date.getTime() / coeff) * coeff);
         try {
             const options = {
                 method: "POST",
@@ -1428,7 +990,7 @@ export class ChatRoomAPI {
                 }
             };
             // console.log("Sending web notification", options)
-            return await this.env.notifications.fetch("https://notifications.384.dev/notify", options);
+            return await envNotifications.fetch("https://notifications.384.dev/notify", options);
         }
         catch (err) {
             console.log(err);
@@ -1436,59 +998,50 @@ export class ChatRoomAPI {
             return err;
         }
     }
-    async downloadAllData(request) {
-        let storage = await this.storage.list();
-        let data = {
+    async #downloadAllData(request) {
+        const data = {
             roomId: this.room_id,
             ownerKey: this.room_owner,
-            encryptionKey: this.encryptionKey,
+            channelKeys: this.#channelKeys,
             guestKey: this.verified_guest,
-            signKey: this.signKey
+            locked: this.locked,
+            motd: this.motd,
         };
-        storage.forEach((value, key, map) => {
-            data[key] = value;
-        });
-        if (!this.verifyCookie(request)) {
-            delete data.room_capacity;
-            delete data.visitors;
-            delete data.ownerUnread;
-            delete data.join_requests;
-            delete data.accepted_requests;
-            delete data.storageLimit;
-            delete data.lockedKeys;
-            delete data.deviceIds;
-            delete data.claimIat;
-            delete data.notificationToken;
+        if (await this.#verifyAuth(request)) {
+            data.adminData = { join_requests: this.join_requests, capacity: this.room_capacity };
+            data.storageLimit = this.storageLimit;
+            data.accepted_requests = this.accepted_requests;
+            data.lockedKeys = this.lockedKeys;
+            data.motherChannel = this.motherChannel;
+            data.pubKeys = this.visitors;
+            data.roomCapacity = this.room_capacity;
         }
-        let dataBlob = new TextEncoder().encode(JSON.stringify(data));
-        const corsHeaders = {
-            "Access-Control-Allow-Methods": "POST, OPTIONS, GET",
-            "Access-Control-Allow-Headers": "Content-Type, authorization",
-            "Access-Control-Allow-Origin": request.headers.get("Origin")
-        };
-        return new Response(dataBlob, { status: 200, headers: corsHeaders });
+        const dataBlob = new TextEncoder().encode(JSON.stringify(data));
+        return returnResult(request, dataBlob, 200);
     }
     // used to create channels (from scratch) (or upload from backup)
     // TODO: can this overwrite a channel on the server?  is that ok?  (even if it's the owner)
-    async uploadData(request) {
+    async #uploadData(request) {
         if (DEBUG) {
             console.log("== uploadData() ==");
             if (DEBUG2)
                 console.log(request);
         }
-        let _secret = this.env.SERVER_SECRET;
-        let data = await request.arrayBuffer();
-        let jsonString = new TextDecoder().decode(data);
-        let jsonData = jsonParseWrapper(jsonString, 'L1416');
-        let roomInitialized = !(this.room_owner === "" || this.room_owner === null);
-        let requestAuthorized = jsonData.hasOwnProperty("SERVER_SECRET") && jsonData["SERVER_SECRET"] === _secret;
-        let allowed = (roomInitialized && this.room_owner === jsonData["roomOwner"]) || requestAuthorized;
+        const _secret = this.env.SERVER_SECRET;
+        const data = await request.arrayBuffer();
+        const jsonString = new TextDecoder().decode(data);
+        const jsonData = jsonParseWrapper(jsonString, 'L1416');
+        const roomInitialized = this.room_owner != null;
+        const requestAuthorized = jsonData.hasOwnProperty("SERVER_SECRET") && jsonData["SERVER_SECRET"] === _secret;
+        const allowed = (roomInitialized && this.room_owner === jsonData["roomOwner"]) || requestAuthorized;
         if (allowed) {
             if (DEBUG)
                 console.log("uploadData() allowed");
-            for (let key in jsonData) {
+            for (const key in jsonData) {
                 // 2023.05.03: added filter to what properties are propagated (interface ChannelData)
                 //             eg previous problem was it happily added SERVER_SECRET to DO storage
+                // TODO: we now have "owner" mode of upload (see new download), so should probably
+                //       add a number of other properties to this list (see the uploadData() call)
                 if (DEBUG2)
                     console.log("uploadData() key: ", key, "value: ", jsonData[key]);
                 if (["roomId", "channelId", "ownerKey", "encryptionKey", "signKey", "motherChannel"].includes(key))
@@ -1497,38 +1050,35 @@ export class ChatRoomAPI {
                     console.log("**** uploadData() key not allowed: ", key);
             }
             this.personalRoom = true;
-            this.storage.put("personalRoom", true);
+            this.storage.put("personalRoom", 'true');
             // if 'size' is provided in request, and request is authorized, set storageLimit
             if (jsonData.hasOwnProperty("size")) {
-                let size = jsonData["size"];
+                const size = jsonData["size"];
                 await this.storage.put("storageLimit", size);
             }
             // note that for a new room, "initialize" will fetch data from "this.storage" into object
-            this.initialize(this.room_id);
+            this.#initialize(this.room_id);
             return returnResult(request, JSON.stringify({ success: true }), 200);
         }
         else {
-            return returnResult(request, JSON.stringify({
-                success: false,
-                error: !roomInitialized ? "Server secret did not match" : "Room owner needs to upload the room"
-            }, 200));
+            return returnError(request, roomInitialized ? "Room owner needs to upload the room" : "Server secret did not match", 401);
         }
     }
-    async authorizeRoom(request) {
-        let _secret = this.env.SERVER_SECRET;
-        let jsonData = await request.json();
-        let requestAuthorized = jsonData.hasOwnProperty("SERVER_SECRET") && jsonData["SERVER_SECRET"] === _secret;
+    async #authorizeRoom(request) {
+        const _secret = this.env.SERVER_SECRET;
+        const jsonData = await request.json();
+        const requestAuthorized = jsonData.hasOwnProperty("SERVER_SECRET") && jsonData["SERVER_SECRET"] === _secret;
         if (requestAuthorized) {
-            for (let key in jsonData) {
+            for (const key in jsonData) {
                 await this.storage.put("room_owner", jsonData["ownerKey"]);
             }
             this.personalRoom = true;
-            this.storage.put("personalRoom", true);
+            this.storage.put("personalRoom", 'true');
             this.room_owner = jsonData["room_owner"];
             return returnResult(request, JSON.stringify({ success: true }), 200);
         }
         else {
-            return returnResult(request, JSON.stringify({ success: false, error: "Server secret did not match" }, 200));
+            return returnError(request, "Cannot authorize room: server secret did not match", 401);
         }
     }
 }
