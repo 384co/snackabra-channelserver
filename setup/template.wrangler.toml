@@ -25,6 +25,10 @@ kv_namespaces = [
   { binding = "LEDGER_NAMESPACE", id = "<id>" }
 ]
 
+services = [
+  { binding = "notifications", service = "notifications-dev", environment = "production" }
+]
+
 [build.upload]
 format = "modules"
 dir = "src"

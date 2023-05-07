@@ -58,10 +58,8 @@ const ALLOW_OWNER_KEY_ROTATION = false;
 
 import {
   arrayBufferToBase64, base64ToArrayBuffer,
-  assemblePayload, extractPayload,
   jsonParseWrapper,
   ChannelKeys, SBChannelId,
-  ChannelData,
   SBCrypto,
   ChannelAdminData
 } from './snackabra.js';
@@ -72,20 +70,19 @@ const sbCrypto = new SBCrypto()
 type EnvType = {
   // ChannelServerAPI
   channels: DurableObjectNamespace,
-
+  // used for worker-to-worker (see toml)
+  notifications: Fetcher
+  // primarily for raw uploads and raw budget allocations
   SERVER_SECRET: string,
-
   // KV Namespaces
   MESSAGES_NAMESPACE: KVNamespace,
   KEYS_NAMESPACE: KVNamespace,
   LEDGER_NAMESPACE: KVNamespace,
   IMAGES_NAMESPACE: KVNamespace,
   RECOVERY_NAMESPACE: KVNamespace,
-
   // looks like: '{"key_ops":["encrypt"],"ext":true,"kty":"RSA","n":"6WeMtsPoblahblahU3rmDUgsc","e":"AQAB","alg":"RSA-OAEP-256"}'
   LEDGER_KEY: string,
 }
-
 
 // Reminder of response codes we use:
 //
@@ -103,7 +100,6 @@ type EnvType = {
 // 507: Insufficient Storage (WebDAV/RFC4918)
 //
 type ResponseCode = 101 | 200 | 400 | 401 | 403 | 404 | 405 | 418 | 429 | 500 | 501 | 507;
-
 
 // this handles UNEXPECTED errors
 async function handleErrors(request: Request, func: () => Promise<Response>) {
@@ -371,8 +367,12 @@ export class ChannelServer implements DurableObject {
   storage: DurableObjectStorage;
   env: EnvType;
 
+  initializePromise: Promise<boolean> | null = null;
+
   sessions: Array<any> = [];
   #channelKeys?: ChannelKeys
+
+  room_id: SBChannelId = '';
   room_owner: string | null = null; // duplicate, placeholder / TODO cleanup
 
   // config?: ChannelConfig;
@@ -385,23 +385,21 @@ export class ChannelServer implements DurableObject {
   // increasing timestamps even if multiple messages arrive simultaneously (see below).
   lastTimestamp: number = 0;
 
-  room_id: SBChannelId = '';
   storageLimit: number = 0;
-  visitors: Array<string> = [];
   verified_guest: string = '';
+
+  visitors: Array<JsonWebKey> = [];
+  join_requests: Array<JsonWebKey> = [];
+  accepted_requests: Array<JsonWebKey> = [];
+  // tracks history of lock keys
+  lockedKeys: Array<JsonWebKey> = [];
 
   room_capacity: number = 20;
   ownerUnread: number = 0;
   locked: boolean = false;
-  lockedKeys: any = {};
-  join_requests: Array<string> = [];
-  accepted_requests: Array<string> = [];
   motd: string = '';
   ledgerKey: CryptoKey | null = null;
-  deviceIds: Array<string> = [];
   personalRoom: boolean = false;
-
-  initializePromise: Promise<boolean> | null = null;
 
   // these are in #channelKeys (TODO cleanup)
   // room_owner: JsonWebKey | null = null;
@@ -431,15 +429,15 @@ export class ChannelServer implements DurableObject {
       "/getStorageLimit": this.getStorageLimit.bind(this),
       "/lockRoom": this.lockRoom.bind(this),
       "/motd": this.setMOTD.bind(this),
-      "/ownerKeyRotation": this.ownerKeyRotation.bind(this),
+      "/ownerKeyRotation": this.ownerKeyRotation.bind(this), // deprecated
       "/ownerUnread": this.getOwnerUnreadMessages.bind(this),
       "/updateRoomCapacity": this.handleRoomCapacityChange.bind(this),
     }
     this.visitorCalls = {
       "/downloadData": this.downloadAllData.bind(this),
       "/oldMessages": this.handleOldMessages.bind(this),
-      "/postPubKey": this.postPubKey.bind(this),
-      "/registerDevice": this.registerDevice.bind(this),
+      "/postPubKey": this.postPubKey.bind(this), // deprecated
+      "/registerDevice": this.registerDevice.bind(this), // deprecated
       "/roomlocked": this.isRoomLocked.bind(this),
       "/storageRequest": this.handleNewStorage.bind(this),
     }
@@ -520,7 +518,7 @@ export class ChannelServer implements DurableObject {
           await this.handleSession(pair[1], ip);
           return new Response(null, { status: 101, webSocket: pair[0] });
         } else if (this.ownerCalls[apiCall]) {
-          if ((await this.verifyCookie(request) || await this.verifyAuthSign(request))) {
+          if (await this.verifyAuth(request)) {
             return await this.ownerCalls[apiCall]!(request);
           } else {
             return returnResult(request, JSON.stringify({ error: "Owner verification failed (restricted API call)" }), 401);
@@ -558,59 +556,55 @@ export class ChannelServer implements DurableObject {
 
   setupSession(session: SessionType, msg: any) {
     let webSocket = session.webSocket;
-    // The first message the client sends is the user info message with their pubKey. Save it
-    // into their session object and in the visitor list.
-    if (!this.#channelKeys) {
-      webSocket.close(4000, "This room does not have an owner, or the owner has not enabled it. You cannot interact with it yet.");
-      console.log("no owner - closing")
-    }
-
-    const data = jsonParseWrapper(msg.data.toString(), 'L733');
-    if (data.pem) {
-      webSocket.send(JSON.stringify({ error: "ERROR: PEM formats no longer used" }));
-      return;
-    }
-    if (!data.name) {
-      webSocket.send(JSON.stringify({ error: "ERROR: First message needs to contain pubKey" }));
-      return;
-    }
-    // const isPreviousVisitor = this.visitors.indexOf(data.name) > -1;
-    // const isAccepted = this.accepted_requests.indexOf(data.name) > -1;
-    let _name;
     try {
-      _name = jsonParseWrapper(data.name, 'L770');
-    } catch (err) {
-      webSocket.send(JSON.stringify({ error: "ERROR: could not parse pubKey" }));
-      return;
-    }
-    const isPreviousVisitor = this.checkJsonExistence(_name, this.visitors);
-    const isAccepted = this.checkJsonExistence(_name, this.accepted_requests);
-    if (!isPreviousVisitor && this.visitors.length >= this.room_capacity) {
-      webSocket.close(4000, 'ERROR: The room is not accepting any more visitors.');
-      return;
-    }
-    if (!isPreviousVisitor) {
-      this.visitors.push(data.name);
-      this.storage.put('visitors', JSON.stringify(this.visitors))
-    }
-    if (this.locked) {
-      if (!isAccepted && !isPreviousVisitor) {
-        this.join_requests.push(data.name);
-        this.storage.put('join_requests', JSON.stringify(this.join_requests));
-      } else {
-        // const encrypted_key = this.lockedKeys[data.name];
-        const encrypted_key = this.lockedKeys[this.getLockedKey(_name)];
-        this.#channelKeys!.lockedKey = encrypted_key;
+      // The first message the client sends is the user info message with their pubKey. Save it
+      // into their session object and in the visitor list.
+      if (!this.#channelKeys) {
+        webSocket.close(4000, "This room does not have an owner, or the owner has not enabled it. You cannot interact with it yet.");
+        console.log("no owner - closing")
       }
+      const data = jsonParseWrapper(msg.data.toString(), 'L733');
+      if (data.pem) {
+        webSocket.send(JSON.stringify({ error: "ERROR: PEM formats no longer used" }));
+        return;
+      }
+      if (!data.name) {
+        webSocket.send(JSON.stringify({ error: "ERROR: First message needs to contain pubKey" }));
+        return;
+      }
+      let _name: JsonWebKey = jsonParseWrapper(data.name, 'L578');
+      const isPreviousVisitor = sbCrypto.lookupKey(_name, this.visitors) >= 0;
+      const isAccepted = sbCrypto.lookupKey(_name, this.accepted_requests) >= 0;
+      if (!isPreviousVisitor && this.visitors.length >= this.room_capacity) {
+        webSocket.close(4000, 'ERROR: The room is not accepting any more visitors.');
+        return;
+      }
+      if (!isPreviousVisitor) {
+        this.visitors.push(jsonParseWrapper(data.name, 'L594'));
+        this.storage.put('visitors', JSON.stringify(this.visitors))
+      }
+      if (this.locked) {
+        if (!isAccepted && !isPreviousVisitor) {
+          this.join_requests.push(data.name);
+          this.storage.put('join_requests', JSON.stringify(this.join_requests));
+        } else {
+          // TODO: this mechanism needs testing
+          const encrypted_key = this.lockedKeys[sbCrypto.lookupKey(_name, this.lockedKeys)];
+          this.#channelKeys!.lockedKey = encrypted_key;
+        }
 
+      }
+      session.name = data.name;
+      webSocket.send(JSON.stringify({ ready: true, keys: this.#channelKeys, motd: this.motd, roomLocked: this.locked }));
+
+      session.room_id = "" + data.room_id;
+
+      // Note that we've now received the user info message for this session
+      session.receivedUserInfo = true;
+    } catch (err: any) {
+      webSocket.send(JSON.stringify({ error: "ERROR: problem setting up session: " + err.message + '\n' + err.stack }));
+      return;
     }
-    session.name = data.name;
-    webSocket.send(JSON.stringify({ ready: true, keys: this.#channelKeys, motd: this.motd, roomLocked: this.locked }));
-
-    session.room_id = "" + data.room_id;
-
-    // Note that we've now received the user info message for this session
-    session.receivedUserInfo = true;
   }
 
   async handleSession(webSocket: WebSocket, _ip: string | null) {
@@ -697,7 +691,7 @@ export class ChannelServer implements DurableObject {
   }
 
   // broadcast() broadcasts a message to all clients.
-  async broadcast(message: string) {
+  async broadcast(message: any) {
     if (typeof message !== "string")
       message = JSON.stringify(message);
     if (DEBUG) console.log("calling sendWebNotifications()", message);
@@ -782,16 +776,19 @@ export class ChannelServer implements DurableObject {
 
   async acceptVisitor(request: Request) {
     let data = await request.json();
-    const ind = this.join_requests.indexOf((data as any).pubKey as string);
-    if (ind > -1) {
+    const acceptPubKey: JsonWebKey = jsonParseWrapper((data as any).pubKey, 'L783');
+    // const ind = this.join_requests.indexOf((data as any).pubKey as string);
+    const ind = sbCrypto.lookupKey(acceptPubKey, this.join_requests);
+    if (ind >= 0) {
       this.accepted_requests = [...this.accepted_requests, ...this.join_requests.splice(ind, 1)];
       this.lockedKeys[(data as any).pubKey] = (data as any).lockedKey;
       this.storage.put('accepted_requests', JSON.stringify(this.accepted_requests));
       this.storage.put('lockedKeys', this.lockedKeys);
       this.storage.put('join_requests', JSON.stringify(this.join_requests))
       return returnResult(request, JSON.stringify({}), 200);
+    } else {
+      return returnError(request, "Could not accept visitor (visitor not found)", 400)
     }
-    return returnResult(request, JSON.stringify({ error: "Could not accept visitor" }), 500)
   }
 
   async lockRoom(request: Request) {
@@ -821,6 +818,8 @@ export class ChannelServer implements DurableObject {
     return returnResult(request, JSON.stringify({ motd: this.motd }), 200);
   }
 
+  // TODO: we do not allow owner key rotations, but we need to add
+  // regular key rotation(s), so keeping this as template code
   async ownerKeyRotation(request: Request) {
     if (ALLOW_OWNER_KEY_ROTATION) {
       let _tries = 3;
@@ -857,6 +856,7 @@ export class ChannelServer implements DurableObject {
     }
   }
 
+  // clumsy event handling to track change; TODO cleanup
   async checkRotation(_timeout: number) {
     await new Promise(resolve => setTimeout(resolve, _timeout));
     /* return new Promise((resolve) => {
@@ -1076,6 +1076,7 @@ export class ChannelServer implements DurableObject {
     return (await this.verifySign(verificationKey, sign, payload + '_' + this.room_id) && ((new Date()).getTime() - parseInt(payload)) < 86400000);
   }
 
+  // this checks if OWNER has signed the request
   async verifyAuthSign(request: Request): Promise<boolean> {
     if (!this.#channelKeys)
       return false;
@@ -1105,143 +1106,19 @@ export class ChannelServer implements DurableObject {
     return await crypto.subtle.verify("HMAC", verificationKey, base64ToArrayBuffer(sign), new TextEncoder().encode(auth_parts[0]));
   }
 
-  async sign(secretKey: CryptoKey, contents: string) {
-    const encoder = new TextEncoder();
-    const encoded = encoder.encode(contents);
-    let sign;
-    try {
-      sign = await crypto.subtle.sign(
-        'HMAC',
-        secretKey,
-        encoded
-      );
-      return encodeURIComponent(arrayBufferToBase64(sign));
-    } catch (error) {
-      // console.log(error);
-      return { error: "Failed to sign content" };
-    }
-  }
-
-  async jwtSign(payload, secret, options) {
-    if (DEBUG) console.log("Trying to create sign: ", payload, typeof payload, secret, typeof secret)
-    if (payload === null || typeof payload !== 'object')
-      throw new Error('payload must be an object')
-    if (typeof secret !== 'string')
-      throw new Error('secret must be a string')
-    const importAlgorithm = { name: 'ECDSA', namedCurve: 'P-256', hash: { name: 'SHA-256' } }
-
-    if (DEBUG) console.log("PAST THROWS")
-    payload.iat = Math.floor(Date.now() / 1000)
-    this.claimIat = payload.iat;
-    this.storage.put("claimIat", this.claimIat)
-    const payloadAsJSON = JSON.stringify(payload)
-    const partialToken = `${this.jwtStringify(this._utf8ToUint8Array(JSON.stringify({
-      alg: options.algorithm,
-      kid: options.keyid
-    })))}.${this.jwtStringify(this._utf8ToUint8Array(payloadAsJSON))}`
-    let keyFormat = 'raw'
-    let keyData
-    if (secret.startsWith('-----BEGIN')) {
-      keyFormat = 'pkcs8'
-      keyData = this.jwt_str2ab(atob(secret.replace(/-----BEGIN.*?-----/g, '').replace(/-----END.*?-----/g, '').replace(/\s/g, '')))
-    } else
-      keyData = this._utf8ToUint8Array(secret)
-    const key = await crypto.subtle.importKey(keyFormat, keyData, importAlgorithm, false, ['sign'])
-    if (DEBUG) console.log("GOT KEY: ", key);
-    const signature = await crypto.subtle.sign(importAlgorithm, key, this._utf8ToUint8Array(partialToken))
-    return `${partialToken}.${this.jwtStringify(new Uint8Array(signature))}`
-  }
-
-  _utf8ToUint8Array(str) {
-    return this.jwtParse(btoa(unescape(encodeURIComponent(str))))
-  }
-
-  jwtParse(s) {
-    return new Uint8Array(Array.prototype.map.call(atob(s.replace(/-/g, '+').replace(/_/g, '/').replace(/\s/g, '')), c => c.charCodeAt(0)))
-  }
-
-  jwtStringify(a) {
-    return btoa(String.fromCharCode.apply(0, a)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_')
-  }
-
-  jwt_str2ab(str) {
-    const buf = new ArrayBuffer(str.length);
-    const bufView = new Uint8Array(buf);
-    for (let i = 0, strLen = str.length; i < strLen; i++) {
-      bufView[i] = str.charCodeAt(i);
-    }
-    return buf;
-  }
-
-  addNewlines(str) {
-    var result = '';
-    while (str.length > 64) {
-      result += str.substring(0, 64) + '\n';
-      str = str.substring(64);
-    }
-    result += str
-    return result;
-  }
-
-  /*
-  Export the given key and write it into the "exported-key" space.
-  */
-  async exportPrivateCryptoKey(key) {
-    const exported = await crypto.subtle.exportKey(
-      "pkcs8",
-      key
-    );
-    const exportedAsString = sbCrypto.ab2str(exported);
-    const exportedAsBase64 = this.addNewlines(btoa(exportedAsString))
-    const pemExported = `-----BEGIN PRIVATE KEY-----\n${exportedAsBase64}\n-----END PRIVATE KEY-----`;
-
-    return pemExported
-  }
-
-  async exportPublicCryptoKey(key) {
-    const exported = await crypto.subtle.exportKey(
-      "spki",
-      key
-    );
-    const exportedAsString = sbCrypto.ab2str(exported);
-    const exportedAsBase64 = this.addNewlines(btoa(exportedAsString));
-    const pemExported = `-----BEGIN PUBLIC KEY-----\n${exportedAsBase64}\n-----END PUBLIC KEY-----`;
-
-    return pemExported;
-  }
-
-  checkJsonExistence(val, arr) {
-    for (let i = 0; i < arr.length; i++) {
-      try {
-        if (this.areJsonKeysSame(val, jsonParseWrapper(arr[i], 'L1008')))
-          return true;
-      } catch (err) {
-        continue;
-      }
-    }
-    return false;
-  }
-
-  getLockedKey(val) {
-    for (let key of Object.keys(this.lockedKeys)) {
-      if (this.areJsonKeysSame(val, jsonParseWrapper(key, 'L1019')))
-        return this.lockedKeys[key];
-    }
-    return { error: "Could not find key" };
-  }
-
-  areJsonKeysSame(key1, key2) {
-    return (key1["x"] == key2["x"]) && (key1["y"] == key2["y"]);
+  // returns true if request is either from OWNER, or with a signature cookie (eg SSO)
+  async verifyAuth(request: Request): Promise<boolean> {
+    return (await this.verifyCookie(request) || await this.verifyAuthSign(request))
   }
 
   registerDevice(request: Request) {
     return returnError(request, "registerDevice is disabled, use web notifications", 400)
   }
 
-  async sendWebNotifications(message) {
+  async sendWebNotifications(message: string) {
     if (DEBUG) console.log("Sending web notification", message)
     message = JSON.parse(message)
-    if (message?.type === 'ack') return
+    // if (message?.type === 'ack') return
     var coeff = 1000 * 60 * 1;
     var date = new Date();
     var rounded = new Date(Math.round(date.getTime() / coeff) * coeff)
@@ -1272,36 +1149,27 @@ export class ChannelServer implements DurableObject {
       console.log("Error sending web notification")
       return err
     }
-
   }
 
   async downloadAllData(request: Request) {
-    let storage = await this.storage.list();
-    let data = {
+    let data: any = {
       roomId: this.room_id,
       ownerKey: this.room_owner,
-      encryptionKey: this.encryptionKey,
+      channelKeys: this.#channelKeys,
       guestKey: this.verified_guest,
-      signKey: this.signKey
+      locked: this.locked,
+      motd: this.motd,
     };
-    // TODO: dangerous, only download approved parts
-    storage.forEach((value, key, map) => {
-      data[key] = value;
-    });
-    if (!this.verifyCookie(request)) {
-      delete data.room_capacity;
-      delete data.visitors;
-      delete data.ownerUnread;
-      delete data.join_requests;
-      delete data.accepted_requests;
-      delete data.storageLimit;
-      delete data.lockedKeys;
-      delete data.deviceIds;
-      delete data.claimIat;
-      delete data.notificationToken;
+    if (await this.verifyAuth(request)) {
+      data.adminData = { join_requests: this.join_requests, capacity: this.room_capacity };
+      data.storageLimit = this.storageLimit;
+      data.accepted_requests = this.accepted_requests;
+      data.lockedKeys = this.lockedKeys;
+      data.motherChannel = this.motherChannel;
+      data.pubKeys = this.visitors;
+      data.roomCapacity = this.room_capacity;
     }
     let dataBlob = new TextEncoder().encode(JSON.stringify(data));
-    // return new Response(dataBlob, { status: 200, headers: corsHeaders });
     return returnResult(request, dataBlob, 200);
   }
 
