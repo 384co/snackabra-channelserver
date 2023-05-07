@@ -93,13 +93,14 @@ type EnvType = {
 // 403: Forbidden
 // 404: Not Found
 // 405: Method Not Allowed
+// 413: Payload Too Large
 // 418: I'm a teapot
 // 429: Too Many Requests
 // 500: Internal Server Error
 // 501: Not Implemented
 // 507: Insufficient Storage (WebDAV/RFC4918)
 //
-type ResponseCode = 101 | 200 | 400 | 401 | 403 | 404 | 405 | 418 | 429 | 500 | 501 | 507;
+type ResponseCode = 101 | 200 | 400 | 401 | 403 | 404 | 405 | 413 | 418 | 429 | 500 | 501 | 507;
 
 
 function returnResult(_request: Request, contents: any, status: ResponseCode, delay = 0) {
@@ -145,7 +146,7 @@ async function handleErrors(request: Request, func: () => Promise<Response>) {
     }
   }
 }
-``
+
 
 /**
  * API calls are in one of two forms:
@@ -220,13 +221,10 @@ export default {
       const url = new URL(request.url);
       const path = url.pathname.slice(1).split('/');
       switch (path[0]) {
-        case "api":
-          // This is a request for `/api/...`, call the API handler.
+        case "api": // /api/... is only case currently
           return handleApiRequest(path.slice(1), request, env);
-
         default:
-          return returnResult(request, JSON.stringify({ error: "Not found (must give API endpoint)" }), 404)
-        //return new Response("Not found", { status: 404 });
+          return returnError(request, "Not found (must give API endpoint)", 404)
       }
     });
   }
@@ -238,6 +236,7 @@ async function callDurableObject(name: SBChannelId, path: Array<string>, request
     console.log("callDurableObject() name:", name, "path:", path)
     if (DEBUG2) { console.log(request); console.log(env) }
   }
+  // // SSO use case: fetch from another server to get pubkeys
   // const pubKey = await fetch("https://m063.dpn.workers.dev/api/v1/pubKeys?roomId=" + name)
   // if (pubKey?.error) return returnResult(request, JSON.stringify({ error: "Not found" }), 404);
   const roomId = env.channels.idFromName(name);
@@ -255,26 +254,17 @@ async function handleApiRequest(path: Array<string>, request: Request, env: EnvT
     switch (path[0]) {
       case "room":
       case "channel":
-        {
           return callDurableObject(path[1], path.slice(2), request, env);
-        }
       case "notifications":
-        {
           return returnError(request, "Device (Apple) notifications are disabled (use web notifications)", 400);
-        }
       case "getLastMessageTimes":
         {
-          try {
             const _rooms: any = await request.json();
             const lastMessageTimes: Array<any> = [];
             for (let i = 0; i < _rooms.length; i++) {
               lastMessageTimes[_rooms[i]] = await lastTimeStamp(_rooms[i], env);
             }
             return returnResult(request, JSON.stringify(lastMessageTimes), 200);
-          } catch (error: any) {
-            console.log(error);
-            return returnResult(request, JSON.stringify({ error: '[getLastMessageTimes] ' + error.message + '\n' + error.stack }), 500);
-          }
         }
       default:
         return returnResult(request, JSON.stringify({ error: "Not found (this is an API endpoint, the URI was malformed)" }), 404)
@@ -286,23 +276,16 @@ async function handleApiRequest(path: Array<string>, request: Request, env: EnvT
 }
 
 async function lastTimeStamp(room_id: SBChannelId, env: EnvType) {
-  try {
     let list_response = await env.MESSAGES_NAMESPACE.list({ "prefix": room_id });
     let message_keys: any = list_response.keys.map((res) => {
       return res.name
     });
-    if (message_keys.length === 0) {
-      return '0'
-    }
+    if (message_keys.length === 0) return '0'
     while (!list_response.list_complete) {
       list_response = await env.MESSAGES_NAMESPACE.list({ "cursor": list_response.cursor })
       message_keys = [...message_keys, list_response.keys];
     }
     return message_keys[message_keys.length - 1].slice(room_id.length);
-  } catch (error) {
-    console.log(error);
-    return '0';
-  }
 }
 
 interface Dictionary<T> {
@@ -374,7 +357,6 @@ export class ChannelServer implements DurableObject {
   // encryptionKey: string | null = null;
   // signKey: string | null = null;
 
-  // 2023.05.xx: new fields
   motherChannel: string = '';
   messagesCursor: string | null = null; // used for 'startAfter' option
 
@@ -512,10 +494,7 @@ export class ChannelServer implements DurableObject {
     // https://blog.cloudflare.com/durable-objects-easy-fast-correct-choose-three/
     const getOptions: DurableObjectGetOptions = { allowConcurrency: true };
     const messageList = this.storage.get(keys, getOptions);
-    if (DEBUG) {
-      console.log("getRecentMessages() messageList:")
-      console.log(await messageList)
-    }
+    if (DEBUG) { console.log("getRecentMessages() messageList:"); console.log(await messageList) }
     return messageList;
   }
 
@@ -561,9 +540,7 @@ export class ChannelServer implements DurableObject {
       }
       session.name = data.name;
       webSocket.send(JSON.stringify({ ready: true, keys: this.#channelKeys, motd: this.motd, roomLocked: this.locked }));
-
       session.room_id = "" + data.room_id;
-
       // Note that we've now received the user info message for this session
       session.receivedUserInfo = true;
     } catch (err: any) {
@@ -576,7 +553,6 @@ export class ChannelServer implements DurableObject {
     webSocket.accept();
     // We don't send any messages to the client until it has sent us 
     // the initial user info (message which would be the client's pubKey)
-
     // Create our session and add it to the sessions list.
     const session: SessionType = {
       name: '',
@@ -629,11 +605,14 @@ export class ChannelServer implements DurableObject {
 
         const _x: Dictionary<string> = {}
         _x[key] = jsonParseWrapper(msg.data.toString(), 'L812');
-        await this.#broadcast(JSON.stringify(_x))
-        await this.storage.put(key, msg.data);
 
-        // all messages are also stored in GLOBAL KV
+        // Here is the main workhorse ... actualy send the message to every listener
+        await this.#broadcast(JSON.stringify(_x))
+
+        // and store it for posterity both local and global KV
+        await this.storage.put(key, msg.data);
         await this.env.MESSAGES_NAMESPACE.put(key, msg.data);
+
       } catch (error: any) {
         // Report any exceptions directly back to the client
         const err_msg = '[handleSession()] ' + error.message + '\n' + error.stack + '\n';
@@ -684,14 +663,10 @@ export class ChannelServer implements DurableObject {
   }
 
   async #handleOldMessages(request: Request) {
-    try {
       const { searchParams } = new URL(request.url);
       const currentMessagesLength = Number(searchParams.get('currentMessagesLength')) || 100;
       const cursor = searchParams.get('cursor') || '';
       return returnResult(request, JSON.stringify(this.#getRecentMessages(currentMessagesLength, cursor)), 200);
-    } catch (error: any) {
-      return returnError(request, "Could not fetch older messages: " + error.message, 500)
-    }
   }
 
   async #getKey(type: string): Promise<string | null> {
@@ -758,11 +733,9 @@ export class ChannelServer implements DurableObject {
 
   async #lockRoom(request: Request) {
     this.locked = true;
-    for (let i = 0; i < this.visitors.length; i++) {
-      if (this.accepted_requests.indexOf(this.visitors[i]) < 0 && this.join_requests.indexOf(this.visitors[i]) < 0) {
+    for (let i = 0; i < this.visitors.length; i++)
+      if (this.accepted_requests.indexOf(this.visitors[i]) < 0 && this.join_requests.indexOf(this.visitors[i]) < 0)
         this.join_requests.push(this.visitors[i]);
-      }
-    }
     this.storage.put('join_requests', JSON.stringify(this.join_requests));
     this.storage.put('locked', this.locked)
     return returnResult(request, JSON.stringify({ locked: this.locked }), 200);
@@ -829,19 +802,10 @@ export class ChannelServer implements DurableObject {
         resolve(true);
       }, _timeout));
     return(true)
-    /* return new Promise((resolve) => {
-      setTimeout(async () => {
-        if (await this.getKey('ownerKey') !== this.room_owner) {
-          resolve(true);
-        }
-        resolve(false);
-      }, _timeout)
-    })*/
   }
 
   // NOTE: current design limits this to 2^52 bytes, future limit will be 2^64 bytes
   #roundSize(size: number, roundUp = true) {
-    size = Number(size)
     if (size === Infinity) return Infinity; // special case
     if (size <= STORAGE_SIZE_MIN) size = STORAGE_SIZE_MIN;
     if (size > (2 ** 52)) throw new Error(`Storage size too large (max 2^52 and we got ${size})`);
@@ -860,8 +824,8 @@ export class ChannelServer implements DurableObject {
     const { searchParams } = new URL(request.url);
     const size = this.#roundSize(Number(searchParams.get('size')));
     const storageLimit = this.storageLimit;
-    if (size > storageLimit) return returnResult(request, JSON.stringify({ error: 'Not sufficient storage budget left in channel' }), 500);
-    if (size > STORAGE_SIZE_MAX) return returnResult(request, JSON.stringify({ error: `Storage size too large (max ${STORAGE_SIZE_MAX} bytes)` }), 500);
+    if (size > storageLimit) return returnError(request, 'Not sufficient storage budget left in channel', 507);
+    if (size > STORAGE_SIZE_MAX) return returnResult(request, `Storage size too large (max ${STORAGE_SIZE_MAX} bytes)`, 413);
     this.storageLimit = storageLimit - size;
     this.storage.put('storageLimit', this.storageLimit);
     const token_buffer = crypto.getRandomValues(new Uint8Array(48)).buffer;
@@ -902,13 +866,11 @@ export class ChannelServer implements DurableObject {
     const targetChannel = searchParams.get('targetChannel');
     let transferBudget = this.#roundSize(Number(searchParams.get('transferBudget')));
     const serverSecret = searchParams.get('serverSecret');
-
-    if (!targetChannel) return returnResult(request, JSON.stringify({ error: '[budd()]: No target channel specified' }), 500, 50);
-
+    if (!targetChannel) return returnError(request, '[budd()]: No target channel specified', 400);
     if (this.room_id === targetChannel) {
       // we are the benefactor
       const size = transferBudget;
-      if (!this.#transferBudgetLegal(size)) return returnResult(request, JSON.stringify({ error: `[budd()]: Transfer budget not legal (${size})` }), 500, 50);
+      if (!this.#transferBudgetLegal(size)) return returnError(request, `[budd()]: Transfer budget not legal (${size})`, 400);
       if ((serverSecret) && (serverSecret === _secret)) {
         // we are the target channel, so we're being asked to accept budgeta
         const roomInitialized = !(this.room_owner === "" || this.room_owner === null);
@@ -954,9 +916,9 @@ export class ChannelServer implements DurableObject {
       }
     } else {
       // it's another channel, taken out of ours
-      if (!this.storageLimit) return returnResult(request, JSON.stringify({ error: `[budd()]: Mother channel (${this.room_id.slice(0, 12)}...) either does not exist, or has not been initialized, or lacks storage budget` }), 500, 50);
+      if (!this.storageLimit) return returnError(request, `[budd()]: Mother channel (${this.room_id.slice(0, 12)}...) either does not exist, or has not been initialized, or lacks storage budget`, 400);
       if ((!transferBudget) || (transferBudget === Infinity)) transferBudget = this.storageLimit; // strip it
-      if (transferBudget > this.storageLimit) return returnResult(request, JSON.stringify({ error: '[budd()]: Not enough storage budget in mother channel for request' }), 500, 50);
+      if (transferBudget > this.storageLimit) return returnError(request, '[budd()]: Not enough storage budget in mother channel for request', 507);
       const size = transferBudget
       const newStorageLimit = this.storageLimit - size;
       this.storageLimit = newStorageLimit;
@@ -972,10 +934,10 @@ export class ChannelServer implements DurableObject {
       const data = await request.arrayBuffer();
       const jsonString = new TextDecoder().decode(data);
       const jsonData = jsonParseWrapper(jsonString, 'L1018');
-      if (jsonData.hasOwnProperty("SERVER_SECRET")) return returnResult(request, JSON.stringify({ error: `[budd()]: SERVER_SECRET set? Huh?` }), 500, 50);
+      if (jsonData.hasOwnProperty("SERVER_SECRET")) return returnError(request, `[budd()]: SERVER_SECRET set? Huh?`, 403);
       jsonData["SERVER_SECRET"] = _secret;
       if (size < NEW_CHANNEL_MINIMUM_BUDGET)
-        return returnResult(request, JSON.stringify({ error: `Not enough storage request for a new channel (minimum is ${NEW_CHANNEL_MINIMUM_BUDGET} bytes)` }), 500);
+        return returnError(request, `Not enough storage request for a new channel (minimum is ${NEW_CHANNEL_MINIMUM_BUDGET} bytes)`, 400);
       jsonData["size"] = size;
       jsonData["motherChannel"] = this.room_id; // we leave a birth certificate behind
       const newUrl = new URL(request.url);
@@ -1084,6 +1046,7 @@ export class ChannelServer implements DurableObject {
     return returnError(request, "registerDevice is disabled, use web notifications", 400)
   }
 
+  // TODO: review this, it sends a return value that is not used
   async #sendWebNotifications(message: string) {
     if (DEBUG) console.log("Sending web notification", message)
     message = JSON.parse(message)
@@ -1158,6 +1121,8 @@ export class ChannelServer implements DurableObject {
       for (const key in jsonData) {
         // 2023.05.03: added filter to what properties are propagated (interface ChannelData)
         //             eg previous problem was it happily added SERVER_SECRET to DO storage
+        // TODO: we now have "owner" mode of upload (see new download), so should probably
+        //       add a number of other properties to this list (see the uploadData() call)
         if (DEBUG2) console.log("uploadData() key: ", key, "value: ", jsonData[key])
         if (["roomId", "channelId", "ownerKey", "encryptionKey", "signKey", "motherChannel"].includes(key))
           await this.storage.put(key, jsonData[key]);
@@ -1175,10 +1140,7 @@ export class ChannelServer implements DurableObject {
       this.#initialize(this.room_id)
       return returnResult(request, JSON.stringify({ success: true }), 200);
     } else {
-      return returnResult(request, JSON.stringify({
-        success: false,
-        error: !roomInitialized ? "Server secret did not match" : "Room owner needs to upload the room"
-      }), 500);
+      return returnError(request, roomInitialized ? "Room owner needs to upload the room" : "Server secret did not match", 401);
     }
   }
 
@@ -1195,7 +1157,7 @@ export class ChannelServer implements DurableObject {
       this.room_owner = jsonData["room_owner"];
       return returnResult(request, JSON.stringify({ success: true }), 200);
     } else {
-      return returnResult(request, JSON.stringify({ success: false, error: "Server secret did not match" }), 500);
+      return returnError(request, "Cannot authorize room: server secret did not match", 401);
     }
   }
 }
