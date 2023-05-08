@@ -1,3 +1,5 @@
+/// <reference types="@cloudflare/workers-types/experimental" />
+
 /*
    Copyright (C) 2019-2021 Magnusson Institute, All Rights Reserved
 
@@ -56,21 +58,16 @@ const MAX_BUDGET_TRANSFER = 1024 * 1024 * 1024 * 1024 * 1024; // 1 PB
 // see notes in jslib on owner key rotation
 const ALLOW_OWNER_KEY_ROTATION = false;
 
-import {
-  arrayBufferToBase64, base64ToArrayBuffer,
-  jsonParseWrapper,
-  ChannelKeys, SBChannelId,
-  SBCrypto,
-  ChannelAdminData
-} from './snackabra.js';
+import type { ChannelKeys, SBChannelId, ChannelAdminData, ChannelKeyStrings } from './snackabra.d.ts';
+import { arrayBufferToBase64, base64ToArrayBuffer, jsonParseWrapper, SBCrypto } from './snackabra.js';
 
 const sbCrypto = new SBCrypto()
 
-import type { DurableObjectNamespace, Fetcher, KVNamespace, DurableObject,
-  DurableObjectStorage, JsonWebKey, DurableObjectState, DurableObjectListOptions, 
-  DurableObjectGetOptions, CryptoKey
-} from "@cloudflare/workers-types";
-import { Response, WebSocketPair, WebSocket, Request, crypto } from "@cloudflare/workers-types";
+// import type { DurableObjectNamespace, Fetcher, KVNamespace, DurableObject,
+//   DurableObjectStorage, JsonWebKey, DurableObjectState, DurableObjectListOptions, 
+//   DurableObjectGetOptions, CryptoKey
+// } from "@cloudflare/workers-types";
+// import { Response, WebSocketPair, WebSocket, Request, crypto } from "@cloudflare/workers-types";
 
 // this section has some type definitions that helps us with CF types
 type EnvType = {
@@ -108,25 +105,24 @@ type EnvType = {
 //
 type ResponseCode = 101 | 200 | 400 | 401 | 403 | 404 | 405 | 413 | 418 | 429 | 500 | 501 | 507;
 
-
-function returnResult(_request: Request, contents: any, status: ResponseCode, delay = 0) {
+function returnResult(request: Request, contents: any, status: ResponseCode, delay = 0) {
   const corsHeaders = {
     "Access-Control-Allow-Methods": "POST, OPTIONS, GET",
     "Access-Control-Allow-Headers": "Content-Type, authorization",
     "Access-Control-Allow-Credentials": "true",
-    "Access-Control-Allow-Origin": "*" /* request.headers.get("Origin") */,
+    "Access-Control-Allow-Origin": request.headers.get("Origin") ?? "*",
     "Content-Type": "application/json;",
   }
   return new Promise<Response>((resolve) => {
     setTimeout(() => {
-      if (DEBUG) console.log("returnResult() contents:", contents, "status:", status)
+      if (DEBUG) console.log("++++ returnResult() contents:", contents, "status:", status)
       resolve(new Response(contents, { status: status, headers: corsHeaders }));
     }, delay);
   });
 }
 
 function returnError(_request: Request, errorString: string, status: ResponseCode, delay = 0) {
-  console.log("ERROR: (status: " + status + ")\n" + errorString);
+  if (DEBUG) console.log("**** ERROR: (status: " + status + ")\n" + errorString);
   if (!delay && ((status == 401) || (status == 403))) delay = 50; // delay if auth-related
   return returnResult(_request, `{ "error": "${errorString}" }`, status);
 }
@@ -138,11 +134,13 @@ async function handleErrors(request: Request, func: () => Promise<Response>) {
   } catch (err: any) {
     if (err instanceof Error) {
       if (request.headers.get("Upgrade") == "websocket") {
-        const pair = new WebSocketPair();
-        pair[1].accept();
-        pair[1].send(JSON.stringify({ error: '[handleErrors()] ' + err.message + '\n' + err.stack }));
-        pair[1].close(1011, "Uncaught exception during session setup");
-        console.log("webSocket close (error)")
+        const [_client, server] = Object.values(new WebSocketPair());
+        if ((server as any).accept) {
+          (server as any).accept(); // CF typing override (TODO: report this)
+          server.send(JSON.stringify({ error: '[handleErrors()] ' + err.message + '\n' + err.stack }));
+          server.close(1011, "Uncaught exception during session setup");
+          console.log("webSocket close (error)")
+        }
         return returnResult(request, null, 101);
       } else {
         return returnResult(request, err.stack, 500)
@@ -222,7 +220,10 @@ async function handleErrors(request: Request, func: () => Promise<Response>) {
  */
 export default {
   async fetch(request: Request, env: EnvType) {
-    if (DEBUG) console.log(`fetch called: ${request.url}`)
+    if (DEBUG) {
+      console.log(`==== Fetch called: ${request.url}`);
+      console.log(request.headers);
+    }
     return await handleErrors(request, async () => {
       const url = new URL(request.url);
       const path = url.pathname.slice(1).split('/');
@@ -239,7 +240,7 @@ export default {
 // 'name' is room/channel name, 'path' is the rest of the path
 async function callDurableObject(name: SBChannelId, path: Array<string>, request: Request, env: EnvType) {
   if (DEBUG) {
-    console.log("callDurableObject() name:", name, "path:", path)
+    console.log("==== callDurableObject() name:", name, "path:", path)
     if (DEBUG2) { console.log(request); console.log(env) }
   }
   // // SSO use case: fetch from another server to get pubkeys
@@ -249,28 +250,33 @@ async function callDurableObject(name: SBChannelId, path: Array<string>, request
   const roomObject = env.channels.get(roomId);
   const newUrl = new URL(request.url);
   newUrl.pathname = "/" + name + "/" + path.join("/");
+  const newRequest = new Request(newUrl.toString(), request);
   if (DEBUG2) { console.log("callDurableObject() newUrl:"); console.log(newUrl); }
-  return roomObject.fetch(newUrl, request);
+  return roomObject.fetch(newRequest);
 }
 
 // 'path' is the request path, starting AFTER '/api'
 async function handleApiRequest(path: Array<string>, request: Request, env: EnvType) {
-  if (DEBUG) { console.log(`handleApiRequest() path:`); console.log(path); }
+  if (DEBUG) {
+    console.log(`==== handleApiRequest() path:`);
+    console.log(path);
+    console.log(request.headers);
+  }
   try {
     switch (path[0]) {
       case "room":
       case "channel":
-          return callDurableObject(path[1], path.slice(2), request, env);
+        return callDurableObject(path[1], path.slice(2), request, env);
       case "notifications":
-          return returnError(request, "Device (Apple) notifications are disabled (use web notifications)", 400);
+        return returnError(request, "Device (Apple) notifications are disabled (use web notifications)", 400);
       case "getLastMessageTimes":
         {
-            const _rooms: any = await request.json();
-            const lastMessageTimes: Array<any> = [];
-            for (let i = 0; i < _rooms.length; i++) {
-              lastMessageTimes[_rooms[i]] = await lastTimeStamp(_rooms[i], env);
-            }
-            return returnResult(request, JSON.stringify(lastMessageTimes), 200);
+          const _rooms: any = await request.json();
+          const lastMessageTimes: Array<any> = [];
+          for (let i = 0; i < _rooms.length; i++) {
+            lastMessageTimes[_rooms[i]] = await lastTimeStamp(_rooms[i], env);
+          }
+          return returnResult(request, JSON.stringify(lastMessageTimes), 200);
         }
       default:
         return returnResult(request, JSON.stringify({ error: "Not found (this is an API endpoint, the URI was malformed)" }), 404)
@@ -281,16 +287,16 @@ async function handleApiRequest(path: Array<string>, request: Request, env: EnvT
 }
 
 async function lastTimeStamp(room_id: SBChannelId, env: EnvType) {
-    let list_response = await env.MESSAGES_NAMESPACE.list({ "prefix": room_id });
-    let message_keys: any = list_response.keys.map((res) => {
-      return res.name
-    });
-    if (message_keys.length === 0) return '0'
-    while (!list_response.list_complete) {
-      list_response = await env.MESSAGES_NAMESPACE.list({ "cursor": list_response.cursor })
-      message_keys = [...message_keys, list_response.keys];
-    }
-    return message_keys[message_keys.length - 1].slice(room_id.length);
+  let list_response = await env.MESSAGES_NAMESPACE.list({ "prefix": room_id });
+  let message_keys: any = list_response.keys.map((res) => {
+    return res.name
+  });
+  if (message_keys.length === 0) return '0'
+  while (!list_response.list_complete) {
+    list_response = await env.MESSAGES_NAMESPACE.list({ "cursor": list_response.cursor })
+    message_keys = [...message_keys, list_response.keys];
+  }
+  return message_keys[message_keys.length - 1].slice(room_id.length);
 }
 
 interface Dictionary<T> {
@@ -322,10 +328,11 @@ export class ChannelServer implements DurableObject {
   storage: DurableObjectStorage;
   env: EnvType;
 
-  initializePromise: Promise<boolean> | null = null;
+  initializePromise: Promise<void> | null = null;
 
   sessions: Array<any> = [];
   #channelKeys?: ChannelKeys
+  #channelKeyStrings?: ChannelKeyStrings
 
   room_id: SBChannelId = '';
   room_owner: string | null = null; // duplicate, placeholder / TODO cleanup
@@ -402,45 +409,132 @@ export class ChannelServer implements DurableObject {
   }
 
   // need the initialize method to restore state of room when the worker is updated
-  #initialize(room_id: SBChannelId): Promise<boolean> {
-    return new Promise((resolve, reject) => {
-      const ledgerKeyString = this.env.LEDGER_KEY;
-      this.room_id = room_id;
-      if (ledgerKeyString) {
-        // ledger is RSA-OAEP so we do not use sbCrypto
-        crypto.subtle.importKey("jwk",
-          jsonParseWrapper(ledgerKeyString, 'L217'),
-          { name: "RSA-OAEP", hash: 'SHA-256' },
-          true, ["encrypt"]).then((ledgerKey) => {
-            this.ledgerKey = ledgerKey;
-            if (DEBUG) {
-              console.log("Done creating room:")
-              console.log("room_id: ", this.room_id)
-              if (DEBUG2) console.log(this)
-            }
-            resolve(true);
-          });
-      } else {
-        reject("Failed to initialize ChannelServer (no ledgerKey?)")
+  async #initialize(room_id: SBChannelId) {
+    if (DEBUG) console.log(`==== ChannelServer.initialize() called for room: ${room_id} ====`)
+    this.room_id = room_id;
+
+    const ledgerKeyString = this.env.LEDGER_KEY;
+    if (!ledgerKeyString)
+      throw new Error("ERROR: no ledger key found in environment (fatal)");
+    // ledger is RSA-OAEP so we do not use sbCrypto
+    const ledgerKey = await crypto.subtle.importKey("jwk", jsonParseWrapper(ledgerKeyString, 'L217'), { name: "RSA-OAEP", hash: 'SHA-256' }, true, ["encrypt"])
+    this.ledgerKey = ledgerKey; // a bit quicker
+
+    // this is first, since #getKey() needs it
+    this.personalRoom = (await this.#getKey('personalRoom')) == 'false' ? false : true;
+
+    const keyStrings: ChannelKeyStrings = {
+      ownerKey: await this.#getKey('ownerKey') || '',
+      encryptionKey: await this.#getKey('encryptionKey') || '',
+      signKey: await this.#getKey('signKey') || ''
+    }
+    if (DEBUG) console.log("keyStrings: ", keyStrings)
+
+    // verify owner key viz room ID
+    const ownerKeyJWK: JsonWebKey = jsonParseWrapper(keyStrings.ownerKey, 'L426')
+    if (!(await sbCrypto.verifyChannelId(ownerKeyJWK, room_id))) {
+      if (DEBUG) {
+        console.log("ERROR: owner key does not match room ID (fatal)");
+        console.log("ownerKey: ", keyStrings.ownerKey);
+        console.log("generated room_id: ", await sbCrypto.generateChannelId(ownerKeyJWK));
+        console.log("room_id: ", room_id);
       }
-    });
+      throw new Error("ERROR: owner key does not match room ID (fatal)");
+    }
+
+    this.#channelKeyStrings = keyStrings;
+    this.#channelKeys = await sbCrypto.channelKeyStringsToCryptoKeys(keyStrings)
+
+    this.lastTimestamp = Number(await this.#getKey('lastTimestamp')) || 0;
+    this.room_id = room_id;
+    this.room_owner = await this.#getKey('ownerKey');
+    this.verified_guest = await this.#getKey('guestKey') || '';
+    const roomCapacity = await this.#getKey('room_capacity')
+    this.room_capacity = roomCapacity === '0' ? 0 : Number(roomCapacity) || 20;
+    this.visitors = jsonParseWrapper(await this.#getKey('visitors') || JSON.stringify([]), 'L220');
+    this.ownerUnread = Number(await this.#getKey('ownerUnread')) || 0;
+    this.locked = (await this.#getKey('locked')) === 'true' ? true : false;
+    this.join_requests = jsonParseWrapper(await this.#getKey('join_requests') || JSON.stringify([]), 'L223');
+    // this.storageLimit = await storage.get('storageLimit') || 4 * 1024 * 1024 * 1024; // PSM update 4 GiB default
+    // 2023.05.03: new pattern, storageLimit should ALWAYS be present
+    this.storageLimit = Number(await this.#getKey('storageLimit')) || 0;
+    if (!this.storageLimit) {
+      const ledgerData = await this.env.LEDGER_NAMESPACE.get(room_id);
+      if (ledgerData) {
+        const { size, mother } = jsonParseWrapper(ledgerData, 'L311');
+        this.storageLimit = size
+        this.motherChannel = mother
+        if (DEBUG) console.log(`[initialize] Found storageLimit in ledger: ${this.storageLimit}`)
+      } else {
+        if (DEBUG) console.log("storageLimit is undefined in initialize, setting to default")
+        this.storageLimit = NEW_CHANNEL_BUDGET;
+      }
+      await this.storage.put('storageLimit', this.storageLimit);
+    }
+
+    this.accepted_requests = jsonParseWrapper(await this.#getKey('accepted_requests') || JSON.stringify([]), 'L224');
+    this.lockedKeys = jsonParseWrapper(await this.#getKey('lockedKeys'), 'L467') || [];
+    // for (let i = 0; i < this.accepted_requests.length; i++)
+    //   this.lockedKeys[this.accepted_requests[i]] = await storage.get(this.accepted_requests[i]);
+
+    this.motd = await this.#getKey('motd') || '';
+
+    // 2023.05.03 some new items
+    if (!this.motherChannel) {
+      this.motherChannel = await this.#getKey('motherChannel') || 'BOOTSTRAP';
+    }
+    await this.storage.put('motherChannel', this.motherChannel);
+    if (DEBUG) console.log(`motherChannel: ${this.motherChannel}`)
+
+    if (DEBUG) {
+      console.log("Done creating room:")
+      console.log("room_id: ", this.room_id)
+      if (DEBUG2) console.log(this)
+    }
   }
 
   async fetch(request: Request) {
-    if (!this.initializePromise) {
-      if (DEBUG) {
-        console.log("forcing an initialization of new room:\n");
-        console.log(request.url)
+    if (DEBUG) {
+      console.log(`==== [Durable Object] fetch() called: ${request.url}`)
+      console.log(request.headers)
+    }
+    const url = new URL(request.url);
+    const path = url.pathname.slice(1).split('/');
+    if (DEBUG) console.log("path: ", path)
+
+    // handle cases of either new channel, or reloaded object
+    if (!this.room_id) {
+      const roomId = await this.storage.get('room_id')
+        .catch((error) => returnError(request, `ERROR: unable to fetch room_id ${error}`, 500));
+      if (roomId) {
+        // channel exists but object needs reloading
+        if (roomId !== path[0]) {
+          if (DEBUG) {
+            console.log("**** room_id mismatch:");
+            console.log("roomId: ", roomId);
+            console.log("path[0]: ", path[0]);
+          }
+          return returnError(request, "ERROR: room_id mismatch (?)", 500);
+        }
+        this.room_id = roomId;
+        await this.#initialize(roomId);
+      } else if ((path) && (path[1] === 'uploadRoom')) {
+        // only permitted option for first-touch is upload
+        const ret = await this.#createChannel(request);
+        if (ret) return ret; // if there was an error, return it
+      } else {
+        // no channel, no object, no upload, no dice
+        return returnError(request, "Not found (no channel) - only permitted first-touch is an authorized uploadRoom", 404);
       }
-      this.initializePromise = this.#initialize((new URL(request.url)).pathname.split('/')[1]);
     }
-    // make sure "we" are ready to go
-    await this.initializePromise;
-    if (this.verified_guest === '') {
+
+    if (this.verified_guest === '') // TODO: this needed?
       this.verified_guest = await this.#getKey('guestKey') || '';
-    }
+
+    if (this.room_id !== path[0])
+      return returnError(request, "ERROR: room_id mismatch (?) [L522]", 500);
+
     return await handleErrors(request, async () => {
-      const url = new URL(request.url);
 
       // // SSO code - this would optionally verify public key from a public record room->key
       // if (this.room_owner === '') {
@@ -450,17 +544,8 @@ export class ChannelServer implements DurableObject {
       //   this.encryptionKey = JSON.stringify(keyFetch_json.encryptionKey);
       // }
 
-      this.room_id = url.pathname.split('/')[1];
-      // url.pathname = "/" + url.pathname.split('/').slice(2).join("/");
-      const url_pathname = "/" + url.pathname.split('/').slice(2).join("/")
-      const new_url = new URL(url.origin + url_pathname)
-      if (DEBUG2) {
-        console.log("fetch() top new_url: ", new_url)
-        console.log("fetch() top new_url.pathname: ", new_url.pathname)
-      }
-
       // API section, all *synchronous* API calls are routed trough here
-      const apiCall = new_url.pathname
+      const apiCall = '/' + path[1]
       try {
         if (apiCall === "/websocket") {
           if (request.headers.get("Upgrade") != "websocket")
@@ -544,7 +629,14 @@ export class ChannelServer implements DurableObject {
 
       }
       session.name = data.name;
-      webSocket.send(JSON.stringify({ ready: true, keys: this.#channelKeys, motd: this.motd, roomLocked: this.locked }));
+      webSocket.send(JSON.stringify({ ready: true,
+        keys: {
+          encryptionKey: this.#channelKeyStrings!.encryptionKey,
+          ownerKey: this.#channelKeyStrings!.ownerKey,
+          signKey: this.#channelKeyStrings!.signKey,
+          // TODO: guest key?
+        },
+        motd: this.motd, roomLocked: this.locked }));
       session.room_id = "" + data.room_id;
       // Note that we've now received the user info message for this session
       session.receivedUserInfo = true;
@@ -555,7 +647,12 @@ export class ChannelServer implements DurableObject {
   }
 
   async #handleSession(webSocket: WebSocket, _ip: string | null) {
-    webSocket.accept();
+    // per CF documentation, first accept() it; this conflicts with CF types
+    if (!(webSocket as any).accept)
+      // conservative coding viz typing override
+      throw new Error("ERROR: webSocket does not have accept() method");
+    (webSocket as any).accept(); // typing override
+
     // We don't send any messages to the client until it has sent us 
     // the initial user info (message which would be the client's pubKey)
     // Create our session and add it to the sessions list.
@@ -571,7 +668,7 @@ export class ChannelServer implements DurableObject {
     // track active connections
     this.sessions.push(session);
 
-    webSocket.addEventListener("message", async msg => {
+    webSocket.addEventListener("message", msg => {
       try {
         if (session.quit) {
           webSocket.close(1011, "WebSocket broken (got a quit).");
@@ -611,12 +708,12 @@ export class ChannelServer implements DurableObject {
         const _x: Dictionary<string> = {}
         _x[key] = jsonParseWrapper(msg.data.toString(), 'L812');
 
+        // We don't block on any of these: (ASYNC)
         // Here is the main workhorse ... actualy send the message to every listener
-        await this.#broadcast(JSON.stringify(_x))
-
+        this.#broadcast(JSON.stringify(_x))
         // and store it for posterity both local and global KV
-        await this.storage.put(key, msg.data);
-        await this.env.MESSAGES_NAMESPACE.put(key, msg.data);
+        this.storage.put(key, msg.data);
+        this.env.MESSAGES_NAMESPACE.put(key, msg.data);
 
       } catch (error: any) {
         // Report any exceptions directly back to the client
@@ -668,19 +765,17 @@ export class ChannelServer implements DurableObject {
   }
 
   async #handleOldMessages(request: Request) {
-      const { searchParams } = new URL(request.url);
-      const currentMessagesLength = Number(searchParams.get('currentMessagesLength')) || 100;
-      const cursor = searchParams.get('cursor') || '';
-      return returnResult(request, JSON.stringify(this.#getRecentMessages(currentMessagesLength, cursor)), 200);
+    const { searchParams } = new URL(request.url);
+    const currentMessagesLength = Number(searchParams.get('currentMessagesLength')) || 100;
+    const cursor = searchParams.get('cursor') || '';
+    return returnResult(request, JSON.stringify(this.#getRecentMessages(currentMessagesLength, cursor)), 200);
   }
 
   async #getKey(type: string): Promise<string | null> {
     if (this.personalRoom) {
       // keys managed by owner
       if (type === 'ledgerKey') return this.env.LEDGER_KEY;
-      const ret = await this.storage.get(type);
-      if (ret) return (ret as string)
-      else return null;
+      return await this.storage.get(type) || null;
     }
     // otherwise it's keys managed by SSO / server
     if (type === 'ownerKey') {
@@ -806,7 +901,7 @@ export class ChannelServer implements DurableObject {
       () => {
         resolve(true);
       }, _timeout));
-    return(true)
+    return (true)
   }
 
   // NOTE: current design limits this to 2^52 bytes, future limit will be 2^64 bytes
@@ -947,7 +1042,7 @@ export class ChannelServer implements DurableObject {
       jsonData["motherChannel"] = this.room_id; // we leave a birth certificate behind
       const newUrl = new URL(request.url);
       newUrl.pathname = `/api/room/${targetChannel}/uploadRoom`;
-      const newRequest = new Request(newUrl, {
+      const newRequest = new Request(newUrl.toString(), {
         method: 'POST',
         body: JSON.stringify(jsonData),
         headers: {
@@ -1014,22 +1109,34 @@ export class ChannelServer implements DurableObject {
 
   // this checks if OWNER has signed the request
   async #verifyAuthSign(request: Request): Promise<boolean> {
-    if (!this.#channelKeys)
+    if (DEBUG) console.log("==== verifyAuthSign():")
+    if (!this.#channelKeys) {
+      if (DEBUG) console.log("verifyAuthSign(): no channel keys")
       return false;
-    if (!request.headers.has('authorization'))
-      return false;
+    }
     const authHeader = request.headers.get('authorization');
-    if (!authHeader) return false
-    const auth_parts = authHeader.split('.');
-    if (new Date().getTime() - parseInt(auth_parts[0]) > 60000)
+    if (!authHeader) {
+      if (DEBUG) {
+        console.log("verifyAuthSign(): no authorization header")
+        console.log("request.headers:")
+        console.log(request.headers)
+        console.log("full request:")
+        console.log(request)
+      }
       return false;
+    }
+    const auth_parts = authHeader.split('.');
+    if (new Date().getTime() - parseInt(auth_parts[0]) > 60000) {
+      if (DEBUG) console.log("verifyAuthSign(): auth token expired")
+      return false;
+    }
     const sign = auth_parts[1];
     const ownerKey = this.#channelKeys!.ownerKey
     const roomSignKey = this.#channelKeys!.signKey
     const verificationKey = await crypto.subtle.deriveKey(
       {
         name: "ECDH",
-        $public: ownerKey  // looks like possible issues with cloudflare worker types?
+        public: ownerKey  // looks like possible issues with cloudflare worker types?
       },
       roomSignKey,
       {
@@ -1039,6 +1146,18 @@ export class ChannelServer implements DurableObject {
       },
       false,
       ["verify"]);
+    if (DEBUG) {
+      console.log("verifyAuthSign():\nsign (auth_parts[1]): ")
+      console.log(sign)
+      console.log("ownerKey: ")
+      console.log(ownerKey)
+      console.log("roomSignKey: ")
+      console.log(roomSignKey)
+      console.log("verificationKey: ")
+      console.log(verificationKey)
+      console.log("auth_parts[0]: ")
+      console.log(auth_parts[0])
+    }
     return await crypto.subtle.verify("HMAC", verificationKey, base64ToArrayBuffer(sign), new TextEncoder().encode(auth_parts[0]));
   }
 
@@ -1093,6 +1212,7 @@ export class ChannelServer implements DurableObject {
     }
   }
 
+
   async #downloadAllData(request: Request) {
     const data: any = {
       roomId: this.room_id,
@@ -1115,42 +1235,127 @@ export class ChannelServer implements DurableObject {
     return returnResult(request, dataBlob, 200);
   }
 
+  async #createChannel(originalRequest: Request): Promise<Response | null> {
+    const request = originalRequest.clone();
+    const jsonString = new TextDecoder().decode(await request.arrayBuffer());
+    const jsonData = jsonParseWrapper(jsonString, 'L1128');
+
+    const url = new URL(request.url);
+    const path = url.pathname.slice(1).split('/');
+    if (DEBUG) console.log("==== createChannel(): ", path)
+
+    if (!(jsonData.hasOwnProperty("SERVER_SECRET") || jsonData["SERVER_SECRET"] === this.env.SERVER_SECRET))
+      return returnError(request, "Not authorized to create channel", 401);
+
+    if (DEBUG) {
+      console.log("createChannel(): jsonData: ")
+      console.log(jsonData)
+    }
+
+    if (!(jsonData.hasOwnProperty("SERVER_SECRET") || jsonData["SERVER_SECRET"] === this.env.SERVER_SECRET))
+      return returnError(request, "Not authorized to create channel", 401);
+    const newOwnerKey = jsonData["ownerKey"];
+    if (!newOwnerKey)
+      return returnError(request, "No owner key provided", 400);
+    this.room_owner = newOwnerKey;
+    await this.storage.put("room_owner", newOwnerKey); // signals channel has been validly created
+    const newOwnerKeyJson = jsonParseWrapper(newOwnerKey, 'L1218');
+    if (!(await sbCrypto.verifyChannelId(newOwnerKeyJson, path[0]))) {
+      if (DEBUG) {
+        console.log("createChannel(): newOwnerKey: ", newOwnerKey)
+        console.log("createChannel(): generated ID: ")
+        console.log(await sbCrypto.generateChannelId(newOwnerKeyJson))
+        console.log("createChannel(): path[0]: ")
+        console.log(path[0])
+      }
+      return returnError(request, "Owner key does not match channel id (validation of channel viz keys failed)", 400);
+    }
+    for (const key of ["ownerKey", "encryptionKey", "signKey", "motherChannel", "visitors"]) {
+      const newData = jsonData[key];
+      if (newData) {
+        if (DEBUG2) console.log("++ createChannel(): putting key, value: ", key, newData)
+        await this.storage.put(key, newData);
+      }
+    }
+    await this.storage.put("personalRoom", 'true');
+    // if 'size' is provided in request, and request is authorized, set storageLimit
+    if (jsonData.hasOwnProperty("size")) {
+      const size = jsonData["size"];
+      await this.storage.put("storageLimit", size);
+    }
+    if (DEBUG) console.log("created channel, owner key: ", newOwnerKey);
+    // note that for a new room, "initialize" will fetch data from "this.storage" into object
+    await this.#initialize(path[0])
+      .catch(err => { return returnError(request, `Error initializing room [L1212]: ${err}`, 500) });
+    return null;
+  }
+
   // used to create channels (from scratch) (or upload from backup)
   // TODO: can this overwrite a channel on the server?  is that ok?  (even if it's the owner)
+  // note that it only processes messages, other items are process previously by initalize
   async #uploadData(request: Request) {
-    if (DEBUG) { console.log("== uploadData() =="); if (DEBUG2) console.log(request); }
+    if (DEBUG) {
+      console.log("==== uploadData() ====");
+      console.log(request.headers)
+      if (DEBUG2) console.log(request);
+    }
+
+    if (!this.#channelKeys)
+      return returnError(request, "UploadData but not initialized / created", 400);
+
     const _secret = this.env.SERVER_SECRET;
     const data = await request.arrayBuffer();
     const jsonString = new TextDecoder().decode(data);
     const jsonData = jsonParseWrapper(jsonString, 'L1416');
-    const roomInitialized = this.room_owner != null;
-    const requestAuthorized = jsonData.hasOwnProperty("SERVER_SECRET") && jsonData["SERVER_SECRET"] === _secret;
-    const allowed = (roomInitialized && this.room_owner === jsonData["roomOwner"]) || requestAuthorized
-    if (allowed) {
-      if (DEBUG) console.log("uploadData() allowed")
+    const requestAuthorized = jsonData.hasOwnProperty("SERVER_SECRET") || jsonData["SERVER_SECRET"] === _secret;
+
+    if ((this.room_owner === jsonData["roomOwner"]) || requestAuthorized) {
+      if (DEBUG) console.log("==== uploadData() allowed - creating a new channel ====")
+      let entriesBuffer: Record<string, string> = {};
+      let i = 0;
       for (const key in jsonData) {
-        // 2023.05.03: added filter to what properties are propagated (interface ChannelData)
-        //             eg previous problem was it happily added SERVER_SECRET to DO storage
-        // TODO: we now have "owner" mode of upload (see new download), so should probably
-        //       add a number of other properties to this list (see the uploadData() call)
-        if (DEBUG2) console.log("uploadData() key: ", key, "value: ", jsonData[key])
-        if (["roomId", "channelId", "ownerKey", "encryptionKey", "signKey", "motherChannel"].includes(key))
-          await this.storage.put(key, jsonData[key]);
-        else
-          if (DEBUG) console.log("**** uploadData() key not allowed: ", key)
+        //
+        // we only allow imports here of keys that correspond to messages.
+        // in the json they'll look something like:
+        //
+        // "hvJQMhmhaIQy...ttsu5G6P0110000101110100...110010011": "{\"encrypted_contents\":{\"content\":
+        // \"rZU2T5AYYFwQwHqW0AHW... very long ... zt58AF5MmEv_vLv1jGkU09\",\"iv\":\"IXsC20rryaWx9vU6\"}}",
+        //
+        if (key.length != 106) {
+          if (DEBUG) console.log("uploadData() key skipped on 'upload': ", key)
+        } else if (key.slice(0, 64) === this.room_id) {
+          // the next 42 characters must be combinations of 0 and 1
+          const _key = key.slice(64, 106);
+          if (_key.match(/^[01]+$/)) {
+            // we have a valid key, so we'll store it
+            const newData = jsonData[key];
+            if (newData) {
+              // we buffer writes to local object
+              entriesBuffer[key] = newData;
+              // but we can't do that with global
+              this.env.MESSAGES_NAMESPACE.put(key, newData);
+              i += 1;
+              if (i > 100) {
+                this.storage.put(entriesBuffer);
+                entriesBuffer = {};
+                i = 0;
+              }
+            }
+          } else {
+            if (DEBUG) console.log("uploadData() key not allowed (timestamp not valid): ", key)
+          }
+        } else {
+          if (DEBUG) console.log("uploadData() key not allowed (channel id not valid): ", key)
+        }
       }
-      this.personalRoom = true;
-      this.storage.put("personalRoom", 'true');
-      // if 'size' is provided in request, and request is authorized, set storageLimit
-      if (jsonData.hasOwnProperty("size")) {
-        const size = jsonData["size"];
-        await this.storage.put("storageLimit", size);
+      // we need to store the last batch
+      if (i > 0) {
+        this.storage.put(entriesBuffer);
       }
-      // note that for a new room, "initialize" will fetch data from "this.storage" into object
-      this.#initialize(this.room_id)
       return returnResult(request, JSON.stringify({ success: true }), 200);
     } else {
-      return returnError(request, roomInitialized ? "Room owner needs to upload the room" : "Server secret did not match", 401);
+      if (DEBUG) console.log("uploadData() not allowed (room might be partially created)")
+      return returnError(request, "Not authorized (neither owner keys nor admin credentials)", 401);
     }
   }
 

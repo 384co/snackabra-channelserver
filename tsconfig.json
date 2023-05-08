@@ -20,8 +20,12 @@
 		"forceConsistentCasingInFileNames": true,
 		"sourceMap": true,
 		"pretty": false,
+		"skipLibCheck": true,
 	},
 	"files": [
+		"src/index.ts"
+	],
+	"include": [
 		"src/index.ts"
 	],
 	"exclude": [

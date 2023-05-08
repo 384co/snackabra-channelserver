@@ -25,7 +25,10 @@
         "concurrently": "^6.0.0",
         "miniflare": "^2.14.0",
         "nodemon": "^2.0.14",
+        "ts-loader": "^9.4.2",
         "typescript": "^5.0.0",
-        "wrangler": "^2.19.0"
+        "webpack": "^5.82.0",
+        "webpack-cli": "^5.1.0",
+        "wrangler": "^0.0.0-5fd080c8"
     }
 }
