@@ -9,7 +9,7 @@ name = "c"
 
 type = "javascript"
 workers_dev = false
-compatibility_date = "2022-02-01"
+compatibility_date = "2023-04-19"
 
 # for miniflare you don't need any IDs
 kv_namespaces = [
