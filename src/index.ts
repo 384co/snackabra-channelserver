@@ -1,4 +1,4 @@
-/// <reference types="@cloudflare/workers-types/experimental" />
+/// <reference types="@cloudflare/workers-types" />
 
 /*
    Copyright (C) 2019-2021 Magnusson Institute, All Rights Reserved
