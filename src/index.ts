@@ -106,6 +106,7 @@ type EnvType = {
 type ResponseCode = 101 | 200 | 400 | 401 | 403 | 404 | 405 | 413 | 418 | 429 | 500 | 501 | 507;
 
 function returnResult(request: Request, contents: any, status: ResponseCode, delay = 0) {
+
   const corsHeaders = {
     "Access-Control-Allow-Methods": "POST, OPTIONS, GET",
     "Access-Control-Allow-Headers": "Content-Type, authorization",
@@ -113,6 +114,7 @@ function returnResult(request: Request, contents: any, status: ResponseCode, del
     "Access-Control-Allow-Origin": request.headers.get("Origin") ?? "*",
     "Content-Type": "application/json;",
   }
+  if (DEBUG) console.log('++++++++++++HEADERS+++++++++++++\n\n', corsHeaders)
   return new Promise<Response>((resolve) => {
     setTimeout(() => {
       if (DEBUG) console.log("++++ returnResult() contents:", contents, "status:", status)
@@ -227,6 +229,9 @@ export default {
     return await handleErrors(request, async () => {
       const url = new URL(request.url);
       const path = url.pathname.slice(1).split('/');
+      if(request.method == "OPTIONS") {
+        return returnResult(request, null, 200);
+      }
       switch (path[0]) {
         case "api": // /api/... is only case currently
           return handleApiRequest(path.slice(1), request, env);
@@ -629,14 +634,16 @@ export class ChannelServer implements DurableObject {
 
       }
       session.name = data.name;
-      webSocket.send(JSON.stringify({ ready: true,
+      webSocket.send(JSON.stringify({
+        ready: true,
         keys: {
           encryptionKey: this.#channelKeyStrings!.encryptionKey,
           ownerKey: this.#channelKeyStrings!.ownerKey,
           signKey: this.#channelKeyStrings!.signKey,
           // TODO: guest key?
         },
-        motd: this.motd, roomLocked: this.locked }));
+        motd: this.motd, roomLocked: this.locked
+      }));
       session.room_id = "" + data.room_id;
       // Note that we've now received the user info message for this session
       session.receivedUserInfo = true;
