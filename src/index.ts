@@ -114,7 +114,7 @@ function returnResult(request: Request, contents: any, status: ResponseCode, del
     "Access-Control-Allow-Origin": request.headers.get("Origin") ?? "*",
     "Content-Type": "application/json;",
   }
-  if (DEBUG) console.log('++++++++++++HEADERS+++++++++++++\n\n', corsHeaders)
+  if (DEBUG2) console.log('++++++++++++HEADERS+++++++++++++\n\n', corsHeaders)
   return new Promise<Response>((resolve) => {
     setTimeout(() => {
       if (DEBUG) console.log("++++ returnResult() contents:", contents, "status:", status)
@@ -223,7 +223,7 @@ async function handleErrors(request: Request, func: () => Promise<Response>) {
 export default {
   async fetch(request: Request, env: EnvType) {
     if (DEBUG) {
-      console.log(`==== Fetch called: ${request.url}`);
+      console.log(`==== [${request.method}] Fetch called: ${request.url}`);
       if (DEBUG2) console.log(request.headers);
     }
     return await handleErrors(request, async () => {
@@ -376,6 +376,28 @@ export class ChannelServer implements DurableObject {
 
   motherChannel: string = '';
   messagesCursor: string | null = null; // used for 'startAfter' option
+
+  // helper function to produce a string explainer of the current state
+  #describe(): string {
+    let s = 'CHANNEL STATE:\n';
+    s += `room_id: ${this.room_id}\n`;
+    s += `room_owner: ${this.room_owner}\n`;
+    s += `verified_guest: ${this.verified_guest}\n`;
+    s += `room_capacity: ${this.room_capacity}\n`;
+    // s += `ownerUnread: ${this.ownerUnread}\n`;
+    s += `locked: ${this.locked}\n`;
+    // s += `motd: ${this.motd}\n`;
+    s += `storageLimit: ${this.storageLimit}\n`;
+    s += `personalRoom: ${this.personalRoom}\n`;
+    s += `motherChannel: ${this.motherChannel}\n`;
+    // s += `messagesCursor: ${this.messagesCursor}\n`;
+    // s += `lastTimestamp: ${this.lastTimestamp}\n`;
+    // s += `visitors: ${this.visitors}\n`;
+    // s += `join_requests: ${this.join_requests}\n`;
+    // s += `accepted_requests: ${this.accepted_requests}\n`;
+    // s += `lockedKeys: ${this.lockedKeys}\n`;
+    return s;
+  }
 
   constructor(state: DurableObjectState, env: EnvType) {
     // NOTE:
@@ -1024,7 +1046,13 @@ export class ChannelServer implements DurableObject {
       }
     } else {
       // it's another channel, taken out of ours
-      if (!this.storageLimit) return returnError(request, `[budd()]: Mother channel (${this.room_id.slice(0, 12)}...) either does not exist, or has not been initialized, or lacks storage budget`, 400);
+      if (!this.storageLimit) {
+        if (DEBUG) {
+          console.log("storageLimit missing in mother channel?");
+          console.log(this.#describe());
+        }
+        return returnError(request, `[budd()]: Mother channel (${this.room_id.slice(0, 12)}...) either does not exist, or has not been initialized, or lacks storage budget`, 400);
+      }
       if ((!transferBudget) || (transferBudget === Infinity)) transferBudget = this.storageLimit; // strip it
       if (transferBudget > this.storageLimit) return returnError(request, '[budd()]: Not enough storage budget in mother channel for request', 507);
       const size = transferBudget
@@ -1033,6 +1061,7 @@ export class ChannelServer implements DurableObject {
       await this.storage.put('storageLimit', newStorageLimit);
 
       if (DEBUG) console.log(`[budd()]: Removing ${size} bytes from ${this.room_id.slice(0, 12)}... and forwarding to ${targetChannel.slice(0, 12)}... (new mother storage limit: ${newStorageLimit} bytes)`);
+
       // await this.env.LEDGER_NAMESPACE.put(targetChannel, JSON.stringify(size));
       // if (DEBUG) { 
       //   console.log('++++ putting budget in ledger ... reading back:');
@@ -1041,13 +1070,16 @@ export class ChannelServer implements DurableObject {
 
       const data = await request.arrayBuffer();
       const jsonString = new TextDecoder().decode(data);
-      const jsonData = jsonParseWrapper(jsonString, 'L1018');
+      let jsonData = jsonString ? jsonParseWrapper(jsonString, 'L1018') : {};
       if (jsonData.hasOwnProperty("SERVER_SECRET")) return returnError(request, `[budd()]: SERVER_SECRET set? Huh?`, 403);
-      jsonData["SERVER_SECRET"] = _secret;
+
+      jsonData["SERVER_SECRET"] = _secret; // we are authorizing this transfer
       if (size < NEW_CHANNEL_MINIMUM_BUDGET)
         return returnError(request, `Not enough storage request for a new channel (minimum is ${NEW_CHANNEL_MINIMUM_BUDGET} bytes)`, 400);
       jsonData["size"] = size;
       jsonData["motherChannel"] = this.room_id; // we leave a birth certificate behind
+      // jsonData["ownerKey"] = this.room_owner;
+      
       const newUrl = new URL(request.url);
       newUrl.pathname = `/api/room/${targetChannel}/uploadRoom`;
       const newRequest = new Request(newUrl.toString(), {
@@ -1058,9 +1090,10 @@ export class ChannelServer implements DurableObject {
         }
       });
       if (DEBUG) {
-        console.log("[budd()]: Converting request to upload request:");
+        console.log("[budd()]: Converting request to upload request");
         if (DEBUG2) console.log(newRequest);
       }
+      // we block on ledger since this will be verified
       await this.env.LEDGER_NAMESPACE.put(targetChannel, JSON.stringify({ mother: this.room_id, size: size }));
       if (DEBUG) {
         console.log('++++ putting budget in ledger ... reading back:');
@@ -1245,18 +1278,15 @@ export class ChannelServer implements DurableObject {
     const request = originalRequest.clone();
     const jsonString = new TextDecoder().decode(await request.arrayBuffer());
     const jsonData = jsonParseWrapper(jsonString, 'L1128');
-
     const url = new URL(request.url);
     const path = url.pathname.slice(1).split('/');
     if (DEBUG) console.log("==== createChannel(): ", path)
-
-    if (!(jsonData.hasOwnProperty("SERVER_SECRET") || jsonData["SERVER_SECRET"] === this.env.SERVER_SECRET))
-      return returnError(request, "Not authorized to create channel", 401);
-
     if (DEBUG) {
       console.log("createChannel(): jsonData: ")
       console.log(jsonData)
     }
+    if (!(jsonData.hasOwnProperty("SERVER_SECRET") || jsonData["SERVER_SECRET"] === this.env.SERVER_SECRET))
+      return returnError(request, "Not authorized to create channel", 401);
 
     if (!(jsonData.hasOwnProperty("SERVER_SECRET") || jsonData["SERVER_SECRET"] === this.env.SERVER_SECRET))
       return returnError(request, "Not authorized to create channel", 401);
@@ -1293,6 +1323,7 @@ export class ChannelServer implements DurableObject {
     // note that for a new room, "initialize" will fetch data from "this.storage" into object
     await this.#initialize(path[0])
       .catch(err => { return returnError(request, `Error initializing room [L1212]: ${err}`, 500) });
+    if (DEBUG) console.log(this.#describe());
     return null;
   }
 
