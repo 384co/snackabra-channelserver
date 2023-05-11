@@ -224,7 +224,7 @@ export default {
   async fetch(request: Request, env: EnvType) {
     if (DEBUG) {
       console.log(`==== Fetch called: ${request.url}`);
-      console.log(request.headers);
+      if (DEBUG2) console.log(request.headers);
     }
     return await handleErrors(request, async () => {
       const url = new URL(request.url);
@@ -265,7 +265,7 @@ async function handleApiRequest(path: Array<string>, request: Request, env: EnvT
   if (DEBUG) {
     console.log(`==== handleApiRequest() path:`);
     console.log(path);
-    console.log(request.headers);
+    if (DEBUG2) console.log(request.headers);
   }
   try {
     switch (path[0]) {
@@ -401,6 +401,7 @@ export class ChannelServer implements DurableObject {
     }
     this.visitorCalls = {
       "/downloadData": this.#downloadAllData.bind(this),
+      "/getChannelKeys": this.#getChannelKeys.bind(this),
       "/oldMessages": this.#handleOldMessages.bind(this),
       "/postPubKey": this.#postPubKey.bind(this), // deprecated
       "/registerDevice": this.#registerDevice.bind(this), // deprecated
@@ -501,7 +502,7 @@ export class ChannelServer implements DurableObject {
   async fetch(request: Request) {
     if (DEBUG) {
       console.log(`==== [Durable Object] fetch() called: ${request.url}`)
-      console.log(request.headers)
+      if (DEBUG2) console.log(request.headers)
     }
     const url = new URL(request.url);
     const path = url.pathname.slice(1).split('/');
@@ -1127,8 +1128,6 @@ export class ChannelServer implements DurableObject {
         console.log("verifyAuthSign(): no authorization header")
         console.log("request.headers:")
         console.log(request.headers)
-        console.log("full request:")
-        console.log(request)
       }
       return false;
     }
@@ -1153,7 +1152,7 @@ export class ChannelServer implements DurableObject {
       },
       false,
       ["verify"]);
-    if (DEBUG) {
+    if (DEBUG2) {
       console.log("verifyAuthSign():\nsign (auth_parts[1]): ")
       console.log(sign)
       console.log("ownerKey: ")
@@ -1297,13 +1296,26 @@ export class ChannelServer implements DurableObject {
     return null;
   }
 
+  async #getChannelKeys(request: Request) {
+    const data: any = {};
+    if (this.#channelKeyStrings) {
+      data.ownerKey = this.#channelKeyStrings.ownerKey;
+      if (this.#channelKeyStrings.guestKey)
+        data.guestKey = this.#channelKeyStrings.guestKey;
+      data.encryptionKey = this.#channelKeyStrings!.encryptionKey;
+      data.signKey = this.#channelKeyStrings.signKey;
+      return returnResult(request, JSON.stringify(data), 200);
+    } else {
+      return returnError(request, "Channel keys not initialized", 500);
+    }
+  }
+
   // used to create channels (from scratch) (or upload from backup)
   // TODO: can this overwrite a channel on the server?  is that ok?  (even if it's the owner)
   // note that it only processes messages, other items are process previously by initalize
   async #uploadData(request: Request) {
     if (DEBUG) {
       console.log("==== uploadData() ====");
-      console.log(request.headers)
       if (DEBUG2) console.log(request);
     }
 
