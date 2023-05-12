@@ -491,7 +491,9 @@ export class ChannelServer implements DurableObject {
       if (ledgerData) {
         // if there's a ledger entry then it's a budded room
         const { size, mother } = jsonParseWrapper(ledgerData, 'L311');
-        this.storageLimit = size
+        // this.storageLimit = size
+        this.storageLimit = 0 // this will actually be topped up in 'upload'
+        if (DEBUG2) console.log(`note that size in ledger was ${size}, in case that differs from json`)
         this.motherChannel = mother
         if (DEBUG) console.log(`[initialize] Found storageLimit in ledger: ${this.storageLimit}`)
       } else {
@@ -1320,8 +1322,9 @@ export class ChannelServer implements DurableObject {
     await this.storage.put("personalRoom", 'true');
 
     // if 'size' is provided in request, and request is authorized, set storageLimit
-    let newSize = jsonData.hasOwnProperty("size") ? Number(jsonData["size"]) : Infinity;
-    await this.storage.put("storageLimit", newSize);
+    // let newSize = jsonData.hasOwnProperty("size") ? Number(jsonData["size"]) : Infinity;
+    // await this.storage.put("storageLimit", newSize);
+    await this.storage.put("storageLimit", Infinity);
 
     if (DEBUG) console.log("created channel, owner key: ", newOwnerKey);
     // note that for a new room, "initialize" will fetch data from "this.storage" into object
