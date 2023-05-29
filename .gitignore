@@ -18,3 +18,4 @@ yarn.lock
 .vscode/
 
 package-lock.json
+.wrangler/

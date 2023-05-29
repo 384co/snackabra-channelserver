@@ -1,1 +1,1 @@
-../../snackabra-jslib/snackabra.d.ts
+../../snackabra-jslib/dist/snackabra.d.ts

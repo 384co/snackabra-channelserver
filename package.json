@@ -1,23 +1,23 @@
 {
-  "name": "e063",
-  "version": "1.0.0",
-  "description": "384co local - clean setup of webpack, TS, for channel server for CF",
+  "name": "snackabra-channelserver",
+  "author": "Magnusson Institute",
+  "email" : "snackabra@gmail.com",
+  "description": "Snackabra Channel Server",
+  "version": "0.6.0",
   "main": "index.js",
   "scripts": {
-    "deploy": "wrangler publish",
-    "miniflare": "miniflare --watch --no-persist --no-shutdown",
-    "local": "wrangler dev --experimental-local",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "wrangler dev --port 3845",
+    "deploy": "wrangler publish"
   },
   "keywords": [],
-  "author": "",
   "license": "GPL-3.0-or-later",
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20230419.0",
-    "@miniflare/tre": "^3.0.0-next.13",
+    "miniflare": "^3.0.1",
     "ts-loader": "^9.4.2",
     "typescript": "^5.0.4",
+    "webpack": "^5.84.1",
     "worker-loader": "^3.0.8",
-    "wrangler": "^0.0.0-5fd080c8"
+    "wrangler": "^3.0.0"
   }
 }

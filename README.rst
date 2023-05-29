@@ -195,7 +195,7 @@ It should fire up on ```http://127.0.0.1:4001```
 LICENSE
 -------
 
-Copyright (c) 2016-2021 Magnusson Institute, All Rights Reserved.
+Copyright (c) 2016-2023 Magnusson Institute, All Rights Reserved.
 
 "Snackabra" is a registered trademark
 
