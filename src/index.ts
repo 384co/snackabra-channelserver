@@ -584,9 +584,14 @@ export class ChannelServer implements DurableObject {
     // see this blog post for details on why we're setting allowConcurrency:
     // https://blog.cloudflare.com/durable-objects-easy-fast-correct-choose-three/
     const getOptions: DurableObjectGetOptions = { allowConcurrency: true };
-    const messageList = this.storage.get(keys, getOptions);
-    if (DEBUG) { console.log("getRecentMessages() messageList:"); console.log(await messageList) }
-    return messageList;
+    const messageList = await this.storage.get(keys, getOptions);
+    // we copy the Map we have in messageList, to a fresh map where each entry is converted with JSON.parse
+    // because the parallel get above returns un-parsed objects (obviously)
+    const messageMap = new Map<string, unknown>();
+    for (const [key, value] of messageList.entries())
+      messageMap.set(key, JSON.parse(value as string));
+    // if (DEBUG) { console.log("getRecentMessages() messageList:"); console.log(messageMap) }
+    return messageMap;
   }
 
   #setupSession(session: SessionType, msg: any) {
@@ -769,7 +774,11 @@ export class ChannelServer implements DurableObject {
     const { searchParams } = new URL(request.url);
     const currentMessagesLength = Number(searchParams.get('currentMessagesLength')) || 100;
     const cursor = searchParams.get('cursor') || '';
-    return returnResult(request, JSON.stringify(this.#getRecentMessages(currentMessagesLength, cursor)), 200);
+    const messageMap = await this.#getRecentMessages(currentMessagesLength, cursor);
+    let messageArray: { [key: string]: any } = {};
+    for (let [key, value] of messageMap)
+      messageArray[key] = value;
+    return returnResult(request, JSON.stringify(messageArray), 200);
   }
 
   async #getKey(type: string): Promise<string | null> {
