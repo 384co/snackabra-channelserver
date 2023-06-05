@@ -47,7 +47,7 @@ const NEW_CHANNEL_BUDGET = 3 * 1024 * 1024 * 1024; // 3 GB
 const MAX_BUDGET_TRANSFER = 1024 * 1024 * 1024 * 1024 * 1024; // 1 PB
 // see notes in jslib on owner key rotation
 const ALLOW_OWNER_KEY_ROTATION = false;
-import { arrayBufferToBase64, base64ToArrayBuffer, jsonParseWrapper, SBCrypto } from './snackabra.js';
+import { arrayBufferToBase64, base64ToArrayBuffer, jsonParseWrapper, SBCrypto } from 'snackabra';
 const sbCrypto = new SBCrypto();
 function returnResult(request, contents, status, delay = 0) {
     const corsHeaders = {
