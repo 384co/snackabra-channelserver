@@ -77,6 +77,8 @@ at time of writing:
 The 'login' will open a web page to confirm that your CLI is allowed
 to administrate your CF account.
 
+(Note that we are using wrangler 3.0 at this time)
+
 In the above 'wrangler.toml' file, you will need to add your 'Account
 ID' from the dashboard. Next, you will need a few "KV Namespaces". You
 can do that with the CLI:

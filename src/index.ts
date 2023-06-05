@@ -383,7 +383,6 @@ export class ChannelServer implements DurableObject {
       "/getJoinRequests": this.#getJoinRequests.bind(this),
       "/getMother": this.#getMother.bind(this),
       "/getPubKeys": this.#getPubKeys.bind(this),
-      "/getRoomCapacity": this.#getRoomCapacity.bind(this),
       "/getStorageLimit": this.#getStorageLimit.bind(this),
       "/lockRoom": this.#lockRoom.bind(this),
       "/motd": this.#setMOTD.bind(this),
@@ -394,6 +393,7 @@ export class ChannelServer implements DurableObject {
     this.visitorCalls = {
       "/downloadData": this.#downloadAllData.bind(this),
       "/getChannelKeys": this.#getChannelKeys.bind(this),
+      "/getRoomCapacity": this.#getRoomCapacity.bind(this), // TODO: this should be owner
       "/oldMessages": this.#handleOldMessages.bind(this),
       "/postPubKey": this.#postPubKey.bind(this), // deprecated
       "/registerDevice": this.#registerDevice.bind(this), // deprecated
