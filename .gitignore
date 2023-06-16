@@ -20,3 +20,4 @@ yarn.lock
 package-lock.json
 .wrangler/
 *.wrangler.toml
+.yarn/

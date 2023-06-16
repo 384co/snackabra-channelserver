@@ -959,6 +959,9 @@ export class ChannelServer implements DurableObject {
      Transfer storage budget from one channel to another. Use the target
      channel's budget, and just get the channel ID from the request
      and look up and increment it's budget.
+
+     TODO: if the request amount is NEGATIVE, then that should be the
+     amount of storage left behind in the mother channel
   */
   async #handleBuddRequest(request: Request): Promise<Response> {
     if (DEBUG2) console.log(request)
@@ -966,63 +969,61 @@ export class ChannelServer implements DurableObject {
     const { searchParams } = new URL(request.url);
     const targetChannel = searchParams.get('targetChannel');
     let transferBudget = this.#roundSize(Number(searchParams.get('transferBudget')));
-    // const serverSecret = searchParams.get('serverSecret');
-    if (!targetChannel) return returnError(request, '[budd()]: No target channel specified', 400);
-    if (this.room_id !== targetChannel) {
-      // it's another channel, taken out of ours, the target is the beneficary
-      if (!this.storageLimit) {
-        if (DEBUG) {
-          console.log("storageLimit missing in mother channel?");
-          console.log(this.#describe());
-        }
-        return returnError(request, `[budd()]: Mother channel (${this.room_id.slice(0, 12)}...) either does not exist, or has not been initialized, or lacks storage budget`, 400);
-      }
 
-      if ((!transferBudget) || (transferBudget === Infinity)) transferBudget = this.storageLimit; // strip it
-      if (transferBudget > this.storageLimit) return returnError(request, '[budd()]: Not enough storage budget in mother channel for request', 507);
-      const size = transferBudget
-      const newStorageLimit = this.storageLimit - size;
-      this.storageLimit = newStorageLimit;
-      await this.storage.put('storageLimit', newStorageLimit);
-
-      if (DEBUG) console.log(`[budd()]: Removing ${size} bytes from ${this.room_id.slice(0, 12)}... and forwarding to ${targetChannel.slice(0, 12)}... (new mother storage limit: ${newStorageLimit} bytes)`);
-
-      const data = await request.arrayBuffer();
-      const jsonString = new TextDecoder().decode(data);
-      let jsonData = jsonString ? jsonParseWrapper(jsonString, 'L1018') : {};
-      if (jsonData.hasOwnProperty("SERVER_SECRET")) return returnError(request, `[budd()]: SERVER_SECRET set? Huh?`, 403);
-
-      jsonData["SERVER_SECRET"] = _secret; // we are authorizing this creation/transfer
-      if (size < NEW_CHANNEL_MINIMUM_BUDGET)
-        return returnError(request, `Not enough storage request for a new channel (minimum is ${NEW_CHANNEL_MINIMUM_BUDGET} bytes)`, 400);
-      jsonData["size"] = size;
-      jsonData["motherChannel"] = this.room_id; // we leave a birth certificate behind
-
-      const newUrl = new URL(request.url);
-      newUrl.pathname = `/api/room/${targetChannel}/uploadRoom`;
-      const newRequest = new Request(newUrl.toString(), {
-        method: 'POST',
-        body: JSON.stringify(jsonData),
-        headers: {
-          'Content-Type': 'application/json'
-        }
-      });
+    if (!targetChannel)
+      return returnError(request, '[budd()]: No target channel specified', 400);
+    if (this.room_id === targetChannel)
+        return returnResult(request, JSON.stringify({ success: true }), 200); // no-op
+    if (!this.storageLimit) {
       if (DEBUG) {
-        console.log("[budd()]: Converting request to upload request");
-        if (DEBUG2) console.log(newRequest);
+        console.log("storageLimit missing in mother channel?");
+        console.log(this.#describe());
       }
-      // we block on ledger since this will be verified
-      await this.env.LEDGER_NAMESPACE.put(targetChannel, JSON.stringify({ mother: this.room_id, size: size }));
-      if (DEBUG) {
-        console.log('++++ putting budget in ledger ... reading back:');
-        console.log(await this.env.LEDGER_NAMESPACE.get(targetChannel));
-      }
-      return callDurableObject(targetChannel, ['uploadRoom'], newRequest, this.env)
-
-      // return callDurableObject(targetChannel, [ `budd?targetChannel=${targetChannel}&transferBudget=${size}&serverSecret=${_secret}` ], request, this.env);
-    } else {
-      return returnError(request, '[budd()]: ERROR - this should not happen [L1060]', 500);
+      return returnError(request, `[budd()]: Mother channel (${this.room_id.slice(0, 12)}...) either does not exist, or has not been initialized, or lacks storage budget`, 400);
     }
+
+    if ((!transferBudget) || (transferBudget === Infinity)) transferBudget = this.storageLimit; // strip it
+    if (transferBudget > this.storageLimit) return returnError(request, '[budd()]: Not enough storage budget in mother channel for request', 507);
+    const size = transferBudget
+    const newStorageLimit = this.storageLimit - size;
+    this.storageLimit = newStorageLimit;
+    await this.storage.put('storageLimit', newStorageLimit);
+
+    if (DEBUG) console.log(`[budd()]: Removing ${size} bytes from ${this.room_id.slice(0, 12)}... and forwarding to ${targetChannel.slice(0, 12)}... (new mother storage limit: ${newStorageLimit} bytes)`);
+
+    const data = await request.arrayBuffer();
+    const jsonString = new TextDecoder().decode(data);
+    let jsonData = jsonString ? jsonParseWrapper(jsonString, 'L1018') : {};
+    if (jsonData.hasOwnProperty("SERVER_SECRET")) return returnError(request, `[budd()]: SERVER_SECRET set? Huh?`, 403);
+
+    jsonData["SERVER_SECRET"] = _secret; // we are authorizing this creation/transfer
+    if (size < NEW_CHANNEL_MINIMUM_BUDGET)
+      return returnError(request, `Not enough storage request for a new channel (minimum is ${NEW_CHANNEL_MINIMUM_BUDGET} bytes)`, 400);
+    jsonData["size"] = size;
+    jsonData["motherChannel"] = this.room_id; // we leave a birth certificate behind
+
+    const newUrl = new URL(request.url);
+    newUrl.pathname = `/api/room/${targetChannel}/uploadRoom`;
+    const newRequest = new Request(newUrl.toString(), {
+      method: 'POST',
+      body: JSON.stringify(jsonData),
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    });
+    if (DEBUG) {
+      console.log("[budd()]: Converting request to upload request");
+      if (DEBUG2) console.log(newRequest);
+    }
+    // we block on ledger since this will be verified
+    await this.env.LEDGER_NAMESPACE.put(targetChannel, JSON.stringify({ mother: this.room_id, size: size }));
+    if (DEBUG) {
+      console.log('++++ putting budget in ledger ... reading back:');
+      console.log(await this.env.LEDGER_NAMESPACE.get(targetChannel));
+    }
+    return callDurableObject(targetChannel, ['uploadRoom'], newRequest, this.env)
+
+    // return callDurableObject(targetChannel, [ `budd?targetChannel=${targetChannel}&transferBudget=${size}&serverSecret=${_secret}` ], request, this.env);
   }
 
   async #handleAdminDataRequest(request: Request) {
