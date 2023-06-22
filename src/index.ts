@@ -187,6 +187,7 @@ async function handleErrors(request: Request, func: () => Promise<Response>) {
  *     /api/getLastMessageTimes/ : queries multiple channels for last message timestamp
  *
  *     Channel API (synchronous)          : [O] means [Owner] only
+ *                                              note that locked rooms are not accessible until accepted   
  *     /api/room/<ID>/websocket           : connect to channel socket (wss protocol)
  *     /api/room/<ID>/oldMessages
  *     /api/room/<ID>/updateRoomCapacity  : [O]
@@ -552,6 +553,7 @@ export class ChannelServer implements DurableObject {
         if (apiCall === "/websocket") {
           if (request.headers.get("Upgrade") != "websocket")
             return returnError(request, "Expected websocket", 400);
+          // note: if locked, verification is done in #handleSession()
           const ip = request.headers.get("CF-Connecting-IP");
           const pair = new WebSocketPair();
           await this.#handleSession(pair[1], ip);
@@ -563,6 +565,11 @@ export class ChannelServer implements DurableObject {
             return returnError(request, "Owner verification failed (restricted API call)", 401);
           }
         } else if (this.visitorCalls[apiCall]) {
+          // TODO: locked rooms should not be accessible until accepted
+          // const data = jsonParseWrapper(msg.data.toString(), 'L733');
+          // const _name: JsonWebKey = jsonParseWrapper(data.name, 'L578');
+          // const isPreviousVisitor = sbCrypto.lookupKey(_name, this.visitors) >= 0;
+          // const isAccepted = sbCrypto.lookupKey(_name, this.accepted_requests) >= 0;
           return await this.visitorCalls[apiCall]!(request);
         } else if (this.adminCalls[apiCall]) {
           // these calls will self-authenticate
