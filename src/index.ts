@@ -397,7 +397,7 @@ export class ChannelServer implements DurableObject {
       "/oldMessages": this.#handleOldMessages.bind(this),
       "/postPubKey": this.#postPubKey.bind(this), // deprecated
       "/registerDevice": this.#registerDevice.bind(this), // deprecated
-      "/roomlocked": this.#isRoomLocked.bind(this),
+      "/roomLocked": this.#isRoomLocked.bind(this),
       "/storageRequest": this.#handleNewStorage.bind(this),
     }
     this.adminCalls = {
@@ -483,7 +483,8 @@ export class ChannelServer implements DurableObject {
 
     // TODO: test refactored lock
     // for (let i = 0; i < this.accepted_requests.length; i++)
-    //   this.lockedKeys[this.accepted_requests[i]] = await storage.get(this.accepted_requests[i]);
+    //   // this.lockedKeys[this.accepted_requests[i]] = await storage.get(this.accepted_requests[i]);
+    //   this.lockedKeys[this.accepted_requests[i].x!] = await this.storage.get(this.accepted_requests[i]);
 
     this.motd = await this.#getKey('motd') || '';
 
@@ -602,6 +603,7 @@ export class ChannelServer implements DurableObject {
       if (!this.#channelKeys) {
         webSocket.close(4000, "This room does not have an owner, or the owner has not enabled it. You cannot interact with it yet.");
         if (DEBUG) console.log("no owner - closing")
+        return;
       }
       const data = jsonParseWrapper(msg.data.toString(), 'L733');
       if (data.pem) {
@@ -627,6 +629,9 @@ export class ChannelServer implements DurableObject {
         if (!isAccepted && !isPreviousVisitor) {
           this.join_requests.push(data.name);
           this.storage.put('join_requests', JSON.stringify(this.join_requests));
+          // TODO ok did we not reject before? when/where should we signal/enforce?
+          webSocket.close(4000, "ERROR: this is a locked room and you haven't yet been accepted by owner.");
+          return;
         } else {
           // TODO: this mechanism needs testing
           const encrypted_key = this.lockedKeys[sbCrypto.lookupKey(_name, this.lockedKeys)];
@@ -684,7 +689,15 @@ export class ChannelServer implements DurableObject {
           this.#setupSession(session, msg);
           return;
         }
-        if (jsonParseWrapper(msg.data.toString(), 'L788').ready) {
+
+        const msgData = jsonParseWrapper(msg.data.toString(), 'L692');
+
+        console.log("------------ getting msg from client ------------")
+        console.log(msg)
+        console.log(msgData)
+        console.log("-------------------------------------------------")
+
+        if (msgData.ready) {
           // the client sends a "ready" message when it can start receiving
           if (!session.blockedMessages) return;
           // Deliver all the messages we queued up since the user connected.
@@ -713,11 +726,13 @@ export class ChannelServer implements DurableObject {
 
         // TODO: last use of Dictioary :-)
         const _x: Dictionary<string> = {}
-        _x[key] = jsonParseWrapper(msg.data.toString(), 'L812');
+        _x[key] = msgData;
 
         // We don't block on any of these: (ASYNC)
-        // Here is the main workhorse ... actualy send the message to every listener
+
+        // Here is the main workhorse ... actually send the message to every listener
         this.#broadcast(JSON.stringify(_x))
+
         // and store it for posterity both local and global KV
         this.storage.put(key, msg.data);
         this.env.MESSAGES_NAMESPACE.put(key, msg.data);
@@ -746,8 +761,11 @@ export class ChannelServer implements DurableObject {
   async #broadcast(message: any) {
     if (typeof message !== "string")
       message = JSON.stringify(message);
-    if (DEBUG) console.log("calling sendWebNotifications()", message);
+
+    // TODO: we don't send notifications for everything? for example locked-out messages?
+    if (DEBUG2) console.log("calling sendWebNotifications()", message);
     await this.#sendWebNotifications(message);
+
     // Iterate over all the sessions sending them messages.
     this.sessions = this.sessions.filter(session => {
       if (session.name) {
