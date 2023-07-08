@@ -59,7 +59,7 @@ const MAX_BUDGET_TRANSFER = 1024 * 1024 * 1024 * 1024 * 1024; // 1 PB
 const ALLOW_OWNER_KEY_ROTATION = false;
 
 import type { ChannelKeys, SBChannelId, ChannelAdminData, ChannelKeyStrings } from 'snackabra';
-import { arrayBufferToBase64, base64ToArrayBuffer, jsonParseWrapper, SBCrypto, _sb_assert } from 'snackabra';
+import { arrayBufferToBase64, base64ToArrayBuffer, jsonParseWrapper, SBCrypto } from 'snackabra';
 const sbCrypto = new SBCrypto()
 
 // this section has some type definitions that helps us with CF types
@@ -78,6 +78,14 @@ type EnvType = {
   RECOVERY_NAMESPACE: KVNamespace,
   // looks like: '{"key_ops":["encrypt"],"ext":true,"kty":"RSA","n":"6WeMtsPoblahblahU3rmDUgsc","e":"AQAB","alg":"RSA-OAEP-256"}'
   LEDGER_KEY: string,
+}
+
+// internal - handle assertions
+function _sb_assert(val: unknown, msg: string) {
+  if (!(val)) {
+    const m = `<< SB assertion error: ${msg} >>`;
+    throw new Error(m);
+  }
 }
 
 // Reminder of response codes we use:
@@ -409,91 +417,98 @@ export class ChannelServer implements DurableObject {
 
   // need the initialize method to restore state of room when the worker is updated
   async #initialize(room_id: SBChannelId) {
-    if (DEBUG) console.log(`==== ChannelServer.initialize() called for room: ${room_id} ====`)
-    this.room_id = room_id;
-    await this.storage.put('room_id', room_id); // in case we're new
+    try {
+      if (DEBUG) console.log(`==== ChannelServer.initialize() called for room: ${room_id} ====`)
+      this.room_id = room_id;
+      await this.storage.put('room_id', room_id); // in case we're new
 
-    const ledgerKeyString = this.env.LEDGER_KEY;
-    if (!ledgerKeyString)
-      throw new Error("ERROR: no ledger key found in environment (fatal)");
-    // ledger is RSA-OAEP so we do not use sbCrypto
-    const ledgerKey = await crypto.subtle.importKey("jwk", jsonParseWrapper(ledgerKeyString, 'L217'), { name: "RSA-OAEP", hash: 'SHA-256' }, true, ["encrypt"])
-    this.ledgerKey = ledgerKey; // a bit quicker
+      const ledgerKeyString = this.env.LEDGER_KEY;
+      if (!ledgerKeyString)
+        throw new Error("ERROR: no ledger key found in environment (fatal)");
+      // ledger is RSA-OAEP so we do not use sbCrypto
+      const ledgerKey = await crypto.subtle.importKey("jwk", jsonParseWrapper(ledgerKeyString, 'L217'), { name: "RSA-OAEP", hash: 'SHA-256' }, true, ["encrypt"])
+      this.ledgerKey = ledgerKey; // a bit quicker
 
-    // this is first, since #getKey() needs it
-    this.personalRoom = (await this.#getKey('personalRoom')) == 'false' ? false : true;
+      // this is first, since #getKey() needs it
+      this.personalRoom = (await this.#getKey('personalRoom')) == 'false' ? false : true;
 
-    const keyStrings: ChannelKeyStrings = {
-      ownerKey: await this.#getKey('ownerKey') || '',
-      encryptionKey: await this.#getKey('encryptionKey') || '',
-      signKey: await this.#getKey('signKey') || ''
-    }
-    if (DEBUG) console.log("keyStrings: ", keyStrings)
-
-    // verify owner key viz room ID
-    const ownerKeyJWK: JsonWebKey = jsonParseWrapper(keyStrings.ownerKey, 'L426')
-    if (!(await sbCrypto.verifyChannelId(ownerKeyJWK, room_id))) {
+      const keyStrings: ChannelKeyStrings = {
+        ownerKey: await this.#getKey('ownerKey') || '',
+        encryptionKey: await this.#getKey('encryptionKey') || '',
+        signKey: await this.#getKey('signKey') || ''
+      }
       if (DEBUG) {
-        console.log("ERROR: owner key does not match room ID (fatal)");
-        console.log("ownerKey: ", keyStrings.ownerKey);
-        console.log("generated room_id: ", await sbCrypto.generateChannelId(ownerKeyJWK));
-        console.log("room_id: ", room_id);
+        console.log("keyStrings: ", keyStrings);
       }
-      throw new Error("ERROR: owner key does not match room ID (fatal)");
-    }
 
-    this.#channelKeyStrings = keyStrings;
-    this.#channelKeys = await sbCrypto.channelKeyStringsToCryptoKeys(keyStrings)
+      // verify owner key viz room ID
+      const ownerKeyJWK: JsonWebKey = jsonParseWrapper(keyStrings.ownerKey, 'L426')
+      if (!(await sbCrypto.verifyChannelId(ownerKeyJWK, room_id))) {
+        if (DEBUG) {
+          console.log("ERROR: owner key does not match room ID (fatal)");
+          console.log("ownerKey: ", keyStrings.ownerKey);
+          console.log("generated room_id: ", await sbCrypto.sb384Hash(ownerKeyJWK));
+          console.log("room_id: ", room_id);
+        }
+        throw new Error("ERROR: owner key does not match room ID (fatal)");
+      }
 
-    this.lastTimestamp = Number(await this.#getKey('lastTimestamp')) || 0;
-    this.room_owner = await this.#getKey('ownerKey');
-    this.verified_guest = await this.#getKey('guestKey') || '';
-    const roomCapacity = await this.#getKey('room_capacity')
-    this.room_capacity = roomCapacity === '0' ? 0 : Number(roomCapacity) || 20;
-    this.visitors = jsonParseWrapper(await this.#getKey('visitors') || JSON.stringify([]), 'L220');
-    this.ownerUnread = Number(await this.#getKey('ownerUnread')) || 0;
-    this.locked = (await this.#getKey('locked')) === 'true' ? true : false;
-    this.join_requests = jsonParseWrapper(await this.#getKey('join_requests') || JSON.stringify([]), 'L223');
+      this.#channelKeyStrings = keyStrings;
+      this.#channelKeys = await sbCrypto.channelKeyStringsToCryptoKeys(keyStrings)
 
-    const storageLimit = Number(await this.#getKey('storageLimit'))
-    if (storageLimit === Infinity) {
-      // if there is no storageLimit, then this is a new room
-      const ledgerData = await this.env.LEDGER_NAMESPACE.get(room_id);
-      if (ledgerData) {
-        // if there's a ledger entry then it's a budded room
-        const { size, mother } = jsonParseWrapper(ledgerData, 'L311');
-        // this.storageLimit = size
-        this.storageLimit = 0 // this will actually be topped up in 'upload'
-        if (DEBUG2) console.log(`note that size in ledger was ${size}, in case that differs from json`)
-        this.motherChannel = mother
-        if (DEBUG) console.log(`[initialize] Found storageLimit in ledger: ${this.storageLimit}`)
+      this.lastTimestamp = Number(await this.#getKey('lastTimestamp')) || 0;
+      this.room_owner = await this.#getKey('ownerKey');
+      this.verified_guest = await this.#getKey('guestKey') || '';
+      const roomCapacity = await this.#getKey('room_capacity')
+      this.room_capacity = roomCapacity === '0' ? 0 : Number(roomCapacity) || 20;
+      this.visitors = jsonParseWrapper(await this.#getKey('visitors') || JSON.stringify([]), 'L220');
+      this.ownerUnread = Number(await this.#getKey('ownerUnread')) || 0;
+      this.locked = (await this.#getKey('locked')) === 'true' ? true : false;
+      this.join_requests = jsonParseWrapper(await this.#getKey('join_requests') || JSON.stringify([]), 'L223');
+
+      const storageLimit = Number(await this.#getKey('storageLimit'))
+      if (storageLimit === Infinity) {
+        // if there is no storageLimit, then this is a new room
+        const ledgerData = await this.env.LEDGER_NAMESPACE.get(room_id);
+        if (ledgerData) {
+          // if there's a ledger entry then it's a budded room
+          const { size, mother } = jsonParseWrapper(ledgerData, 'L311');
+          // this.storageLimit = size
+          this.storageLimit = 0 // this will actually be topped up in 'upload'
+          if (DEBUG2) console.log(`note that size in ledger was ${size}, in case that differs from json`)
+          this.motherChannel = mother
+          if (DEBUG) console.log(`[initialize] Found storageLimit in ledger: ${this.storageLimit}`)
+        } else {
+          this.storageLimit = NEW_CHANNEL_BUDGET;
+          this.motherChannel = 'BOOTSTRAP';
+          if (DEBUG) console.log(`++++ new channel, no SIZE provided, setting to default (${this.storageLimit / (1024 * 1024)} MiB)`)
+        }
+        await this.storage.put('motherChannel', this.motherChannel);
+        await this.storage.put('storageLimit', this.storageLimit);
       } else {
-        this.storageLimit = NEW_CHANNEL_BUDGET;
-        this.motherChannel = 'BOOTSTRAP';
-        if (DEBUG) console.log(`++++ new channel, no SIZE provided, setting to default (${this.storageLimit / (1024 * 1024)} MiB)`)
+        this.storageLimit = storageLimit;
+        this.motherChannel = await this.#getKey('motherChannel') || 'grandfathered';
       }
-      await this.storage.put('motherChannel', this.motherChannel);
-      await this.storage.put('storageLimit', this.storageLimit);
-    } else {
-      this.storageLimit = storageLimit;
-      this.motherChannel = await this.#getKey('motherChannel') || 'grandfathered';
+
+      this.accepted_requests = jsonParseWrapper(await this.#getKey('accepted_requests') || JSON.stringify([]), 'L224');
+      this.lockedKeys = jsonParseWrapper(await this.#getKey('lockedKeys'), 'L467') || [];
+
+      // TODO: test refactored lock
+      // for (let i = 0; i < this.accepted_requests.length; i++)
+      //   // this.lockedKeys[this.accepted_requests[i]] = await storage.get(this.accepted_requests[i]);
+      //   this.lockedKeys[this.accepted_requests[i].x!] = await this.storage.get(this.accepted_requests[i]);
+
+      this.motd = await this.#getKey('motd') || '';
+
+      if (DEBUG) {
+        console.log("Done creating room:")
+        console.log("room_id: ", this.room_id)
+        if (DEBUG2) console.log(this)
+      }
+    } catch (error: any) {
+      throw new Error(`Failed to initialize channel (${error})`)
     }
 
-    this.accepted_requests = jsonParseWrapper(await this.#getKey('accepted_requests') || JSON.stringify([]), 'L224');
-    this.lockedKeys = jsonParseWrapper(await this.#getKey('lockedKeys'), 'L467') || [];
-
-    // TODO: test refactored lock
-    // for (let i = 0; i < this.accepted_requests.length; i++)
-    //   // this.lockedKeys[this.accepted_requests[i]] = await storage.get(this.accepted_requests[i]);
-    //   this.lockedKeys[this.accepted_requests[i].x!] = await this.storage.get(this.accepted_requests[i]);
-
-    this.motd = await this.#getKey('motd') || '';
-
-    if (DEBUG) {
-      console.log("Done creating room:")
-      console.log("room_id: ", this.room_id)
-      if (DEBUG2) console.log(this)
-    }
   }
 
   async fetch(request: Request) {
@@ -520,7 +535,9 @@ export class ChannelServer implements DurableObject {
           return returnError(request, "ERROR: room_id mismatch (?)", 500);
         }
         this.room_id = roomId;
-        await this.#initialize(roomId);
+        await this
+          .#initialize(roomId)
+          .catch((err) => { return returnError(request, `Channel failed to initialize (${err})`, 500); });
       } else if ((path) && (path[1] === 'uploadRoom')) {
         const ret = await this.#createChannel(request.clone());
         if (ret) return ret; // if there was an error, return it, otherwise fall through
@@ -1197,6 +1214,7 @@ export class ChannelServer implements DurableObject {
   }
 
   async #downloadAllData(request: Request) {
+    const storage = await this.storage.list();
     const data: any = {
       roomId: this.room_id,
       ownerKey: this.room_owner,
@@ -1205,7 +1223,11 @@ export class ChannelServer implements DurableObject {
       locked: this.locked,
       motd: this.motd,
     };
+    storage.forEach((value, key) => {
+      data[key] = value;
+    });
     if (await this.#verifyAuth(request)) {
+      // additional info for OWNER
       data.adminData = { join_requests: this.join_requests, capacity: this.room_capacity };
       data.storageLimit = this.storageLimit;
       data.accepted_requests = this.accepted_requests;
@@ -1240,7 +1262,7 @@ export class ChannelServer implements DurableObject {
       if (DEBUG) {
         console.log("createChannel(): newOwnerKey: ", newOwnerKey)
         console.log("createChannel(): generated ID: ")
-        console.log(await sbCrypto.generateChannelId(newOwnerKeyJson))
+        console.log(await sbCrypto.sb384Hash(newOwnerKeyJson))
         console.log("createChannel(): path[0]: ")
         console.log(path[0])
       }
@@ -1259,7 +1281,8 @@ export class ChannelServer implements DurableObject {
     await this.storage.put("storageLimit", Infinity);
 
     // note that for a new room, "initialize" will fetch data from "this.storage" into object
-    await this.#initialize(path[0])
+    await this
+      .#initialize(path[0])
       .catch(err => { return returnError(request, `Error initializing room [L1212]: ${err}`, 500) });
     if (DEBUG) console.log("CREATED channel:", this.#describe());
     return null; // null means no errors
