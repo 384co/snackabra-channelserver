@@ -14,5 +14,9 @@ wrangler.toml
 /my_private_key
 node_modules
 yarn.lock
+.vscode/
+package-lock.json
+.wrangler/
+*.wrangler.toml
+.yarn/
 .mf/
-
