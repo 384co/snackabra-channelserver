@@ -12,12 +12,11 @@ wrangler.toml
 .DS_Store
 /my_public_key
 /my_private_key
-/.mf/
 node_modules
 yarn.lock
 .vscode/
-
 package-lock.json
 .wrangler/
 *.wrangler.toml
 .yarn/
+.mf/
