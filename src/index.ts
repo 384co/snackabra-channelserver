@@ -1250,7 +1250,7 @@ export class ChannelServer implements DurableObject {
       console.log("==== createChannel(): jsonData: ")
       console.log(jsonData)
     }
-    if (!(jsonData.hasOwnProperty("SERVER_SECRET") || jsonData["SERVER_SECRET"] === this.env.SERVER_SECRET))
+    if (!(jsonData.hasOwnProperty("SERVER_SECRET") && jsonData["SERVER_SECRET"] === this.env.SERVER_SECRET))
       return returnError(request, "Not authorized to create channel", 401);
     const newOwnerKey = jsonData["ownerKey"];
     if (!newOwnerKey)
@@ -1315,7 +1315,7 @@ export class ChannelServer implements DurableObject {
       console.log("---- uploadData(): jsonData: ")
       console.log(jsonData)
     }
-    const requestAuthorized = jsonData.hasOwnProperty("SERVER_SECRET") || jsonData["SERVER_SECRET"] === _secret;
+    const requestAuthorized = jsonData.hasOwnProperty("SERVER_SECRET") && jsonData["SERVER_SECRET"] === _secret;
 
     const { searchParams } = new URL(request.url);
     const targetChannel = searchParams.get('targetChannel');
