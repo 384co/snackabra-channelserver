@@ -1205,7 +1205,7 @@ export class ChannelServer implements DurableObject {
         }
       }
       // console.log("Sending web notification", options)
-      return await envNotifications.fetch("https://notifications.384.dev/notify", options)
+      return await fetch("https://notify.384.dev/notify", options)
     } catch (err) {
       console.log(err)
       console.log("Error sending web notification")
