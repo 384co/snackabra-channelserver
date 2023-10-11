@@ -1181,9 +1181,10 @@ export class ChannelServer implements DurableObject {
     if (DEBUG) console.log("Sending web notification", message)
     message = JSON.parse(message)
     // if (message?.type === 'ack') return
-    const coeff = 1000 * 60 * 1;
+
     const date = new Date();
-    const rounded = new Date(Math.round(date.getTime() / coeff) * coeff)
+    date.setSeconds(0);
+    date.setMilliseconds(0);
     try {
       const options = {
         method: "POST",
@@ -1194,7 +1195,7 @@ export class ChannelServer implements DurableObject {
             // replace notification in the queue, this limits message spam. 
             // We are limited in how we want to deliever notifications because of the encryption of messages
             // We limit the number of notifications to 1 per minute
-            tag: `${this.room_id}${rounded}`,
+            tag: `${this.room_id}${date.getTime()}`,
             title: "You have a new message!",
             vibration: [100, 50, 100, 50, 350],
             // requireInteraction: true,
