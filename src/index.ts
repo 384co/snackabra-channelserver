@@ -22,7 +22,7 @@
 
 */
 
-const DEBUG = true;
+const DEBUG = false;
 const DEBUG2 = false;
 
 if (DEBUG) console.log("++++ channel server code loaded ++++ DEBUG is enabled ++++")
