@@ -88,7 +88,7 @@ function _sb_assert(val: unknown, msg: string) {
   }
 }
 
-// Reminder of response codes we use:
+// Reminder of response codes 
 //
 // 101: Switching Protocols (downgrade error)
 // 200: OK
