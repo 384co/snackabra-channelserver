@@ -5,13 +5,13 @@
 		"allowJs": true,
 		"experimentalDecorators": true,
 		"jsx": "react",
-		"strict": true,
 		"target": "es2022",
 		"useDefineForClassFields": true,
 		// MODULE specifiers
 		"esModuleInterop": true,
 		"isolatedModules": true,
-		"moduleResolution": "nodenext",
+		"module": "NodeNext",
+		"moduleResolution": "NodeNext",
 		// "module": "esnext",
 		// "moduleDetection": "force",
 		// "allowSyntheticDefaultImports": true,
@@ -21,6 +21,25 @@
 		"sourceMap": true,
 		"pretty": false,
 		"skipLibCheck": true,
+
+		"strict": true,
+		"exactOptionalPropertyTypes": true,
+		"useUnknownInCatchVariables": true,
+		"noImplicitReturns": true,
+		"noImplicitThis": true,
+		"noUnusedLocals": true,
+		"noUnusedParameters": true,
+		"noFallthroughCasesInSwitch": true,
+		"noImplicitOverride": true,
+		"noPropertyAccessFromIndexSignature": true,
+		"noUncheckedIndexedAccess": true,
+		// these are implied by "strict", including them for clarity
+		// "noImplicitAny": true, // included in strict
+		// "alwaysStrict": true, // included in strict
+		// "strictNullChecks": true, // included in strict
+		// "strictFunctionTypes": true, // included in strict
+		// "strictBindCallApply": true, // included in strict
+		// "strictPropertyInitialization": true, // included in strict
 	},
 	"files": [
 		"src/index.ts"

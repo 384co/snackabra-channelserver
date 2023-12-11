@@ -22,6 +22,6 @@
     "wrangler": "^3.0.0"
   },
   "dependencies": {
-    "snackabra": "^1.1.17"
+    "snackabra": "^2.0.0-alpha.4"
   }
 }
