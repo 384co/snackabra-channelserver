@@ -22,15 +22,15 @@
 
 */
 
-const DEBUG = false;
-const DEBUG2 = false;
+const DEBUG = true;
+const DEBUG2 = true;
 
 if (DEBUG) console.log("++++ channel server code loaded ++++ DEBUG is enabled ++++")
 if (DEBUG2) console.log("++++ DEBUG2 (verbose) enabled ++++")
 
 // TODO: future refactor will be calculating internally in units
 //       of 4KB bytes. This allows for (2^64) bytes storage per channel.
-//       Also, future change will allocate any object budgeted by a 
+//       Also, future change will allocate any object budgeted by a
 //       channel an "address", eg so that everything, ever allocated
 //       by one channel could be conceived of as a single heap, 
 //       within which the start of any shard can be addressed by a 
@@ -1025,12 +1025,14 @@ export class ChannelServer implements DurableObject {
     const _secret = this.env.SERVER_SECRET;
     const { searchParams } = new URL(request.url);
     const targetChannel = searchParams.get('targetChannel');
+    console.log(searchParams.get('transferBudget'))
+    if(DEBUG) console.log(`[budd()]: transferBudget from query paramater: ${searchParams.get('transferBudget')} bytes`)
     let transferBudget = this.#roundSize(Number(searchParams.get('transferBudget')));
-
+    if (DEBUG) console.log(`[budd()]: transferBudget after roundSize: ${transferBudget} bytes`)
     if (!targetChannel)
       return returnError(request, '[budd()]: No target channel specified', 400);
     if (this.room_id === targetChannel)
-        return returnResult(request, JSON.stringify({ success: true }), 200); // no-op
+      return returnResult(request, JSON.stringify({ success: true }), 200); // no-op
     if (!this.storageLimit) {
       if (DEBUG) {
         console.log("storageLimit missing in mother channel?");
@@ -1038,11 +1040,15 @@ export class ChannelServer implements DurableObject {
       }
       return returnError(request, `[budd()]: Mother channel (${this.room_id.slice(0, 12)}...) either does not exist, or has not been initialized, or lacks storage budget`, 400);
     }
-
-    if ((!transferBudget) || (transferBudget === Infinity)) transferBudget = this.storageLimit; // strip it
+    if (DEBUG) console.log(`[budd()]: transferBudget: ${transferBudget} bytes`)
+    if ((!transferBudget) || (transferBudget === Infinity)) {
+      transferBudget = this.storageLimit; // strip it
+    }
     if (transferBudget > this.storageLimit) return returnError(request, '[budd()]: Not enough storage budget in mother channel for request', 507);
     const size = transferBudget
+    if (DEBUG) console.log(`[budd()]: size: ${size} bytes`)
     const newStorageLimit = this.storageLimit - size;
+    if (DEBUG) console.log(`[budd()]: newStorageLimit: ${newStorageLimit} bytes`)
     this.storageLimit = newStorageLimit;
     await this.storage.put('storageLimit', newStorageLimit);
 
@@ -1268,7 +1274,7 @@ export class ChannelServer implements DurableObject {
       console.log(jsonData)
       console.log("===============================")
     }
-    
+
     // either admin (max size) or using storage token
     if (!(jsonData.hasOwnProperty("SERVER_SECRET") && jsonData["SERVER_SECRET"] === this.env.SERVER_SECRET)) {
       if (jsonData.hasOwnProperty("storageToken")) {
@@ -1399,13 +1405,13 @@ export class ChannelServer implements DurableObject {
       _sb_assert(currentStorage === this.storageLimit, "storage out of whack");
       this.storageLimit += size;
       await this.storage.put("storageLimit", this.storageLimit);
-      if (DEBUG) console.log(`uploadData(): increased budget by ${this.storageLimit} bytes`)
+      if (DEBUG) console.log(`uploadData(): new budget is ${this.storageLimit} bytes`)
     }
 
     // double check minimum budget
     if (this.storageLimit < NEW_CHANNEL_MINIMUM_BUDGET)
       return returnError(request, `Channel is left below minimum (minimum is ${NEW_CHANNEL_MINIMUM_BUDGET} bytes)`, 507);
-    
+
     if ((this.room_owner === jsonData["roomOwner"]) || requestAuthorized || storageTokenFunded) {
       if (DEBUG) console.log("==== uploadData() allowed - creating a new channel ====")
 
