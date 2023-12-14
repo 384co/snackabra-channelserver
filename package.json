@@ -6,13 +6,13 @@
   "version": "2.0.0 (pre)",
   "bugs": "https://github.com/snackabra/snackabra-channelserver/issues",
   "homepage": "https://snackabra.io",
-  "keywords": [],
   "license": "GPL-3.0-only",
   "scripts": {
     "start": "wrangler dev --port 3845",
     "deploy": "wrangler deploy",
     "deploy:prod": "wrangler deploy --env production"
   },
+  "keywords": [],
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20230419.0",
     "miniflare": "^3.0.1",
@@ -23,6 +23,6 @@
     "wrangler": "^3.0.0"
   },
   "dependencies": {
-    "snackabra": "^2.0.0"
+    "snackabra": "^2.0.0-alpha.4"
   }
 }

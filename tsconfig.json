@@ -5,13 +5,21 @@
 		"allowJs": true,
 		"experimentalDecorators": true,
 		"jsx": "react",
+<<<<<<< HEAD
 		"strict": true,
+=======
+>>>>>>> 075724230d424fe3c2052d0a5c66ab1a72d96267
 		"target": "es2022",
 		"useDefineForClassFields": true,
 		// MODULE specifiers
 		"esModuleInterop": true,
 		"isolatedModules": true,
+<<<<<<< HEAD
 		"moduleResolution": "nodenext",
+=======
+		"module": "NodeNext",
+		"moduleResolution": "NodeNext",
+>>>>>>> 075724230d424fe3c2052d0a5c66ab1a72d96267
 		// "module": "esnext",
 		// "moduleDetection": "force",
 		// "allowSyntheticDefaultImports": true,
@@ -21,6 +29,28 @@
 		"sourceMap": true,
 		"pretty": false,
 		"skipLibCheck": true,
+<<<<<<< HEAD
+=======
+
+		"strict": true,
+		"exactOptionalPropertyTypes": true,
+		"useUnknownInCatchVariables": true,
+		"noImplicitReturns": true,
+		"noImplicitThis": true,
+		"noUnusedLocals": true,
+		"noUnusedParameters": true,
+		"noFallthroughCasesInSwitch": true,
+		"noImplicitOverride": true,
+		"noPropertyAccessFromIndexSignature": true,
+		"noUncheckedIndexedAccess": true,
+		// these are implied by "strict", including them for clarity
+		// "noImplicitAny": true, // included in strict
+		// "alwaysStrict": true, // included in strict
+		// "strictNullChecks": true, // included in strict
+		// "strictFunctionTypes": true, // included in strict
+		// "strictBindCallApply": true, // included in strict
+		// "strictPropertyInitialization": true, // included in strict
+>>>>>>> 075724230d424fe3c2052d0a5c66ab1a72d96267
 	},
 	"files": [
 		"src/index.ts"

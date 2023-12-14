@@ -59,7 +59,7 @@ const MAX_BUDGET_TRANSFER = 1024 * 1024 * 1024 * 1024 * 1024; // 1 PB
 // see notes in jslib on owner key rotation
 const ALLOW_OWNER_KEY_ROTATION = false;
 
-import type { ChannelKeys, SBChannelId, ChannelAdminData, ChannelKeyStrings } from 'snackabra';
+import type { ChannelKeys, SBChannelId, ChannelAdminData, ChannelKeyStrings, SBUserId } from 'snackabra';
 import { arrayBufferToBase64, base64ToArrayBuffer, jsonParseWrapper, SBCrypto, version } from 'snackabra';
 const sbCrypto = new SBCrypto()
 
@@ -127,7 +127,7 @@ const sbCrypto = new SBCrypto()
  *     /api/room/<ID>/getAdminData        : [O]
  *     /api/room/<ID>/registerDevice      : (disabled)
  *     /api/room/<ID>/downloadData
- *     /api/room/<ID>/uploadRoom          : (admin only)
+ *     /api/room/<ID>/uploadRoom          : (admin only or with budget channel provided)
  *     /api/room/<ID>/authorizeRoom       : (admin only)
  *     /api/room/<ID>/postPubKey
  * 
@@ -135,7 +135,15 @@ const sbCrypto = new SBCrypto()
 export default {
   async fetch(request: Request, env: EnvType) {
     if (DEBUG) {
-      console.log(`==== [${request.method}] Fetch called: ${request.url}`);
+      // so that we can clearly see the whole chunk of logs
+      const msg = `==== [${request.method}] Fetch called: ${request.url}`;
+      console.log(
+        `\n` +
+        `\n${'='.repeat(msg.length)}` +
+        `\n${msg}` +
+        `\n${'='.repeat(msg.length)}` +
+        `\n`
+        );
       if (DEBUG2) console.log(request.headers);
     }
     return await handleErrors(request, async () => {
@@ -285,10 +293,12 @@ export class ChannelServer implements DurableObject {
   lastTimestamp: number = 0; // monotonically increasing timestamp
   storageLimit: number = 0;
   verified_guest: string = '';
-  visitors: Array<JsonWebKey> = [];
+  // visitors: Array<JsonWebKey> = [];
+  visitors: Array<SBUserId> = [];
   join_requests: Array<JsonWebKey> = [];
   accepted_requests: Array<JsonWebKey> = [];
-  lockedKeys: Array<JsonWebKey> = []; // tracks history of lock keys
+  // lockedKeys: Array<JsonWebKey> = []; // tracks history of lock keys
+  encryptedLockedKeys: Map<string, string> = new Map(); // maps from visitor pubKey to encrypted locked key
   room_capacity: number = 20;
   ownerUnread: number = 0;
   locked: boolean = false;
@@ -377,6 +387,7 @@ export class ChannelServer implements DurableObject {
         ownerKey: await this.#getKey('ownerKey') || '',
         encryptionKey: await this.#getKey('encryptionKey') || '',
         signKey: await this.#getKey('signKey') || ''
+        // lock key is on a per-visitor basis
       }
       if (DEBUG) {
         console.log("keyStrings: ", keyStrings);
@@ -407,22 +418,37 @@ export class ChannelServer implements DurableObject {
       this.locked = (await this.#getKey('locked')) === 'true' ? true : false;
       this.join_requests = jsonParseWrapper(await this.#getKey('join_requests') || JSON.stringify([]), 'L223');
 
+      const storageTokenSizeString = await this.storage.get('storageTokenSize')
+      const storageTokenSize = storageTokenSizeString ? Number(storageTokenSizeString) : undefined
+
       const storageLimit = Number(await this.#getKey('storageLimit'))
+
       if (storageLimit === Infinity) {
         // if there is no storageLimit, then this is a new room
         const ledgerData = await this.env.LEDGER_NAMESPACE.get(room_id);
         if (ledgerData) {
           // if there's a ledger entry then it's a budded room
           const { size, mother } = jsonParseWrapper(ledgerData, 'L311');
-          // this.storageLimit = size
-          this.storageLimit = 0 // this will actually be topped up in 'upload'
+
+          // this.storageLimit = size // hmm
+          if (storageTokenSize) {
+            this.storageLimit = storageTokenSize
+          } else {
+            this.storageLimit = 0 // this will actually be topped up in 'upload'
+          }
           if (DEBUG2) console.log(`note that size in ledger was ${size}, in case that differs from json`)
           this.motherChannel = mother
           if (DEBUG) console.log(`[initialize] Found storageLimit in ledger: ${this.storageLimit}`)
         } else {
-          this.storageLimit = NEW_CHANNEL_BUDGET;
-          this.motherChannel = 'BOOTSTRAP';
-          if (DEBUG) console.log(`++++ new channel, no SIZE provided, setting to default (${this.storageLimit / (1024 * 1024)} MiB)`)
+          if (storageTokenSize) {
+            this.storageLimit = storageTokenSize
+            this.motherChannel = await this.storage.get('motherChannel') || 'unknown';
+            if (DEBUG) console.log(`++++ new channel, initializing with storage token (${this.storageLimit / (1024 * 1024)} MiB)`)
+          } else {
+            this.storageLimit = NEW_CHANNEL_BUDGET;
+            this.motherChannel = 'BOOTSTRAP';
+            if (DEBUG) console.log(`++++ new channel, no SIZE provided, setting to default (${this.storageLimit / (1024 * 1024)} MiB)`)
+          }
         }
         await this.storage.put('motherChannel', this.motherChannel);
         await this.storage.put('storageLimit', this.storageLimit);
@@ -432,7 +458,8 @@ export class ChannelServer implements DurableObject {
       }
 
       this.accepted_requests = jsonParseWrapper(await this.#getKey('accepted_requests') || JSON.stringify([]), 'L224');
-      this.lockedKeys = jsonParseWrapper(await this.#getKey('lockedKeys'), 'L467') || [];
+      // this.encryptedLockedKeys = jsonParseWrapper(await this.#getKey('encryptedLockedKeys'), 'L467') || [];
+      this.encryptedLockedKeys = this.deserializeMap(await this.#getKey('encryptedLockedKeys') || '[]');
 
       // TODO: test refactored lock
       // for (let i = 0; i < this.accepted_requests.length; i++)
@@ -463,8 +490,8 @@ export class ChannelServer implements DurableObject {
 
     // handle cases of either new channel, or reloaded object
     if (!this.room_id) {
-      const roomId = await this.storage.get('room_id')
-        .catch((error) => returnError(request, `ERROR: unable to fetch room_id ${error}`, 500));
+      const roomId = await ((this.storage.get('room_id') as Promise<string>)
+        .catch((error) => returnError(request, `ERROR: unable to fetch room_id ${error}`, 500)))
       if (roomId) {
         // channel exists but object needs reloading
         if (roomId !== path[0]) {
@@ -599,9 +626,16 @@ export class ChannelServer implements DurableObject {
           webSocket.close(4000, "ERROR: this is a locked room and you haven't yet been accepted by owner.");
           return;
         } else {
-          // TODO: this mechanism needs testing
-          const encrypted_key = this.lockedKeys[sbCrypto.lookupKey(_name, this.lockedKeys)];
-          this.#channelKeys!.lockedKey = encrypted_key;
+          // this is not done globally, but per visitor (with getchannelkeys)
+          if (DEBUG)
+            console.log("visitor is accepted to a locked room, will be provided with get channel keys")
+ 
+          //   // TODO: this mechanism needs testing
+          //   // const encrypted_key = this.lockedKeys[sbCrypto.lookupKey(_name, this.lockedKeys)];
+          //   const encryptedLockedKey = this.encryptedLockedKeys.get(data.name) || null;
+          //   if (encryptedLockedKey)
+          //     this.#channelKeys!.encryptedLockedKey = encryptedLockedKey;
+          // }
         }
       }
       session.name = data.name;
@@ -658,10 +692,14 @@ export class ChannelServer implements DurableObject {
 
         const msgData = jsonParseWrapper(msg.data.toString(), 'L692');
 
-        console.log("------------ getting msg from client ------------")
-        console.log(msg)
-        console.log(msgData)
-        console.log("-------------------------------------------------")
+        if (DEBUG) {
+          console.log("------------ getting websocket (event) msg from client ------------")
+          if (DEBUG2) {
+            console.log(msg)
+            console.log(msgData)
+            console.log("-------------------------------------------------")
+          }
+        }
 
         if (msgData.ready) {
           // the client sends a "ready" message when it can start receiving
@@ -776,7 +814,9 @@ export class ChannelServer implements DurableObject {
       const _keys_id = (await this.env.KEYS_NAMESPACE.list({ prefix: this.room_id + '_ownerKey' })).keys.map(key => key.name);
       if (_keys_id.length == 0) return null;
       const keys = _keys_id.map(async key => await this.env.KEYS_NAMESPACE.get(key));
-      return await keys[keys.length - 1];
+      const keyResult = await keys[keys.length - 1];
+      _sb_assert(keyResult, "ERROR: no owner key found (fatal)");
+      return keyResult!;
     } else if (type === 'ledgerKey') {
       return await this.env.KEYS_NAMESPACE.get(type);
     }
@@ -815,9 +855,10 @@ export class ChannelServer implements DurableObject {
     const ind = sbCrypto.lookupKey(acceptPubKey, this.join_requests);
     if (ind >= 0) {
       this.accepted_requests = [...this.accepted_requests, ...this.join_requests.splice(ind, 1)];
-      this.lockedKeys[(data as any).pubKey] = (data as any).lockedKey;
+      if (DEBUG) console.log("Encrypted locked keys:", this.encryptedLockedKeys)
+      this.encryptedLockedKeys.set((data as any).pubKey as string, (data as any).encryptedLockedKey);
       this.storage.put('accepted_requests', JSON.stringify(this.accepted_requests));
-      this.storage.put('lockedKeys', this.lockedKeys);
+      this.storage.put('encryptedLockedKeys', this.encryptedLockedKeys);
       this.storage.put('join_requests', JSON.stringify(this.join_requests))
       return returnResult(request, JSON.stringify({}), 200);
     } else {
@@ -827,9 +868,13 @@ export class ChannelServer implements DurableObject {
 
   async #lockRoom(request: Request) {
     this.locked = true;
-    for (let i = 0; i < this.visitors.length; i++)
-      if (this.accepted_requests.indexOf(this.visitors[i]) < 0 && this.join_requests.indexOf(this.visitors[i]) < 0)
-        this.join_requests.push(this.visitors[i]);
+    for (let i = 0; i < this.visitors.length; i++) {
+      const thisVisitor = this.visitors[i];
+      if (thisVisitor) {
+        if (this.accepted_requests.indexOf(thisVisitor) < 0 && this.join_requests.indexOf(thisVisitor) < 0)
+          this.join_requests.push(thisVisitor);
+      }
+    }
     this.storage.put('join_requests', JSON.stringify(this.join_requests));
     this.storage.put('locked', this.locked)
     return returnResult(request, JSON.stringify({ locked: this.locked }), 200);
@@ -849,6 +894,9 @@ export class ChannelServer implements DurableObject {
     this.storage.put('motd', this.motd);
     return returnResult(request, JSON.stringify({ motd: this.motd }), 200);
   }
+
+  serializeMap = (map: Map<string, string>): string => JSON.stringify(Array.from(map.entries()))
+  deserializeMap = (jsonStr: string): Map<string, string> => new Map(JSON.parse(jsonStr));
 
   // TODO: we do not allow owner key rotations, but we need to add
   // regular key rotation(s), so keeping this as template code
@@ -879,9 +927,11 @@ export class ChannelServer implements DurableObject {
       // Now pushing all accepted requests back to join requests
       this.join_requests = [...this.join_requests, ...this.accepted_requests];
       this.accepted_requests = [];
-      this.lockedKeys = [];
+      // this.lockedKeys = [];
+      this.encryptedLockedKeys = new Map();
       this.storage.put('join_requests', JSON.stringify(this.join_requests))
-      this.storage.put('lockedKeys', JSON.stringify(this.lockedKeys))
+      // this.storage.put('lockedKeys', JSON.stringify(this.lockedKeys))
+      this.storage.put('encryptedLockedKeys', this.serializeMap(this.encryptedLockedKeys))
       this.storage.put('accepted_requests', JSON.stringify(this.accepted_requests));
       return returnResult(request, JSON.stringify({ success: true }), 200);
     } else {
@@ -970,15 +1020,15 @@ export class ChannelServer implements DurableObject {
     if (this.room_id === targetChannel)
         return returnResult(request, JSON.stringify({ success: true }), 200); // no-op
     if (!this.storageLimit) {
-      if (DEBUG) {
-        console.log("storageLimit missing in mother channel?");
-        console.log(this.#describe());
-      }
+      if (DEBUG) console.log("storageLimit missing in mother channel?", this.#describe());
       return returnError(request, `[budd()]: Mother channel (${this.room_id.slice(0, 12)}...) either does not exist, or has not been initialized, or lacks storage budget`, 400);
     }
 
+    if (transferBudget > MAX_BUDGET_TRANSFER)
+      return returnError(request, `[budd()]: Transfer budget too large (max ${MAX_BUDGET_TRANSFER} bytes)`, 400);
     if ((!transferBudget) || (transferBudget === Infinity)) transferBudget = this.storageLimit; // strip it
-    if (transferBudget > this.storageLimit) return returnError(request, '[budd()]: Not enough storage budget in mother channel for request', 507);
+    if (transferBudget > this.storageLimit)
+      return returnError(request, '[budd()]: Not enough storage budget in mother channel for request', 507);
     const size = transferBudget
     const newStorageLimit = this.storageLimit - size;
     this.storageLimit = newStorageLimit;
@@ -993,7 +1043,7 @@ export class ChannelServer implements DurableObject {
 
     jsonData["SERVER_SECRET"] = _secret; // we are authorizing this creation/transfer
     if (size < NEW_CHANNEL_MINIMUM_BUDGET)
-      return returnError(request, `Not enough storage request for a new channel (minimum is ${NEW_CHANNEL_MINIMUM_BUDGET} bytes)`, 400);
+      return returnError(request, `Not enough storage request for a new channel (minimum is ${NEW_CHANNEL_MINIMUM_BUDGET} bytes)`, 507);
     jsonData["size"] = size;
     jsonData["motherChannel"] = this.room_id; // we leave a birth certificate behind
 
@@ -1043,16 +1093,15 @@ export class ChannelServer implements DurableObject {
     return verified;
   }
 
-  async #verifyCookie(request: Request) {
+  async #verifyCookie(request: Request): Promise<boolean> {
     const cookies: any = {};
     request.headers.has('cookie') && request.headers.get('cookie')!.split(';').forEach(function (cookie) {
       const parts = cookie.match(/(.*?)=(.*)$/)
-      if (parts)
+      if (parts && parts.length > 2 && parts[1])
         cookies[parts[1].trim()] = (parts[2] || '').trim();
     });
-    if (!cookies.hasOwnProperty('token_' + this.room_id)) {
+    if (!cookies.hasOwnProperty('token_' + this.room_id))
       return false;
-    }
     const verificationKey = await crypto.subtle.importKey("jwk", jsonParseWrapper(await this.env.KEYS_NAMESPACE.get(this.room_id + '_authorizationKey'), 'L778'), {
       name: "ECDSA",
       namedCurve: "P-384"
@@ -1080,6 +1129,10 @@ export class ChannelServer implements DurableObject {
       return false;
     }
     const auth_parts = authHeader.split('.');
+    if (auth_parts.length !== 2 || !auth_parts[0] || !auth_parts[1]) {
+      if (DEBUG) console.log("verifyAuthSign(): auth_parts.length !== 2 or missing parts")
+      return false;
+    }
     if (new Date().getTime() - parseInt(auth_parts[0]) > 60000) {
       if (DEBUG) console.log("verifyAuthSign(): auth token expired")
       return false;
@@ -1134,9 +1187,10 @@ export class ChannelServer implements DurableObject {
     if (DEBUG) console.log("Sending web notification", message)
     message = JSON.parse(message)
     // if (message?.type === 'ack') return
-    const coeff = 1000 * 60 * 1;
+
     const date = new Date();
-    const rounded = new Date(Math.round(date.getTime() / coeff) * coeff)
+    date.setSeconds(0);
+    date.setMilliseconds(0);
     try {
       const options = {
         method: "POST",
@@ -1147,7 +1201,7 @@ export class ChannelServer implements DurableObject {
             // replace notification in the queue, this limits message spam. 
             // We are limited in how we want to deliever notifications because of the encryption of messages
             // We limit the number of notifications to 1 per minute
-            tag: `${this.room_id}${rounded}`,
+            tag: `${this.room_id}${date.getTime()}`,
             title: "You have a new message!",
             vibration: [100, 50, 100, 50, 350],
             // requireInteraction: true,
@@ -1184,7 +1238,8 @@ export class ChannelServer implements DurableObject {
       data.adminData = { join_requests: this.join_requests, capacity: this.room_capacity };
       data.storageLimit = this.storageLimit;
       data.accepted_requests = this.accepted_requests;
-      data.lockedKeys = this.lockedKeys;
+      // data.lockedKeys = this.lockedKeys;
+      data.encryptedLockedKeys = this.encryptedLockedKeys;
       data.motherChannel = this.motherChannel;
       data.pubKeys = this.visitors;
       data.roomCapacity = this.room_capacity;
@@ -1195,28 +1250,58 @@ export class ChannelServer implements DurableObject {
 
   async #createChannel(request: Request): Promise<Response | null> {
     // request cloning is done by callee
+    const url = new URL(request.url);
+
+    const path = url.pathname.slice(1).split('/');
+    if (!path || path.length === 0) return returnError(request, "Invalid path, missing new channel ID", 400);
+    const newChannelId = path[0];
+    // todo: we can verify that the newChannelId is a valid channel id some more
+    if (!newChannelId) return returnError(request, "Empty channel ID", 400);
+    if (DEBUG) console.log(`==== createChannel(${newChannelId}) ====`)
+
     const jsonString = new TextDecoder().decode(await request.arrayBuffer());
     const jsonData = jsonParseWrapper(jsonString, 'L1128');
-    const url = new URL(request.url);
-    const path = url.pathname.slice(1).split('/');
+
     if (DEBUG) {
-      console.log("==== createChannel(): jsonData: ")
+      console.log("==== createChannel(): jsonData:")
       console.log(jsonData)
+      console.log("===============================")
     }
-    if (!(jsonData.hasOwnProperty("SERVER_SECRET") || jsonData["SERVER_SECRET"] === this.env.SERVER_SECRET))
-      return returnError(request, "Not authorized to create channel", 401);
+    
+    // either admin (max size) or using storage token
+    if (!(jsonData.hasOwnProperty("SERVER_SECRET") && jsonData["SERVER_SECRET"] === this.env.SERVER_SECRET)) {
+      if (jsonData.hasOwnProperty("storageToken")) {
+        const _storage_token = JSON.parse(jsonData["storageToken"]);
+        if (DEBUG) console.log("_storage_token:", _storage_token)
+        const _storage_token_hash = await this.env.LEDGER_NAMESPACE.get(_storage_token.token_hash);
+        const _ledger_resp = _storage_token_hash ? JSON.parse(_storage_token_hash) : null;
+        if (!_ledger_resp) returnError(request, "Having issues processing storage token", 507);
+        if (_ledger_resp.used) returnError(request, "Storage token already used", 507);
+        // here's what we're initializing with
+        const storageTokenSize = _ledger_resp.size
+        if (storageTokenSize < NEW_CHANNEL_MINIMUM_BUDGET) returnError(request, `Not enough for a new channel (minimum is ${NEW_CHANNEL_MINIMUM_BUDGET} bytes)`, 507);
+        _ledger_resp.used = true; // spend it
+        await this.env.LEDGER_NAMESPACE.put(_ledger_resp.token_hash, JSON.stringify(_ledger_resp))
+        await this.storage.put("storageTokenSize", storageTokenSize);
+        await this.storage.put("storageTokenMother", _ledger_resp.motherChannel);
+        if (DEBUG) console.log("createChannel() from token: starting size: ", storageTokenSize)
+      } else {
+        return returnError(request, "Not authorized and/or no budget provided to create channel", 401);
+      }
+    }
+
     const newOwnerKey = jsonData["ownerKey"];
     if (!newOwnerKey)
       return returnError(request, "No owner key provided", 400);
     this.room_owner = newOwnerKey;
     await this.storage.put("room_owner", newOwnerKey); // signals channel has been validly created
     const newOwnerKeyJson = jsonParseWrapper(newOwnerKey, 'L1218');
-    if (!(await sbCrypto.verifyChannelId(newOwnerKeyJson, path[0]))) {
+    if (!(await sbCrypto.verifyChannelId(newOwnerKeyJson, newChannelId))) {
       if (DEBUG) {
         console.log("createChannel(): newOwnerKey: ", newOwnerKey)
         console.log("createChannel(): generated ID: ")
         console.log(await sbCrypto.sb384Hash(newOwnerKeyJson))
-        console.log("createChannel(): path[0]: ")
+        console.log("createChannel(): newChannelId: ")
         console.log(path[0])
       }
       return returnError(request, "Owner key does not match channel id (validation of channel viz keys failed)", 400);
@@ -1235,9 +1320,9 @@ export class ChannelServer implements DurableObject {
 
     // note that for a new room, "initialize" will fetch data from "this.storage" into object
     await this
-      .#initialize(path[0])
+      .#initialize(newChannelId)
       .catch(err => { return returnError(request, `Error initializing room [L1212]: ${err}`, 500) });
-    if (DEBUG) console.log("CREATED channel:", this.#describe());
+    if (DEBUG) console.log("++++ CREATED channel:", this.#describe());
     return null; // null means no errors
   }
 
@@ -1249,6 +1334,20 @@ export class ChannelServer implements DurableObject {
         data.guestKey = this.#channelKeyStrings.guestKey;
       data.encryptionKey = this.#channelKeyStrings!.encryptionKey;
       data.signKey = this.#channelKeyStrings.signKey;
+      if (this.locked) {
+        if (DEBUG) {
+          console.log("getChannelKeys(): locked... body:")
+          console.log(request.body)
+        }
+        // encryptedLockedKeys .. TODO .. working on this
+        // const encryptedLockedKey = this.encryptedLockedKeys.get(this.) || null;
+        // if (encryptedLockedKey) {
+        //   data.encryptedLockedKey = encryptedLockedKey;
+        // }
+      }
+      // if (this.#channelKeyStrings.encryptedLockKey) {
+      //   data.lockedKey = this.#channelKeyStrings.encryptedLockKey;
+      // }
       return returnResult(request, JSON.stringify(data), 200);
     } else {
       return returnError(request, "Channel keys not initialized", 500);
@@ -1258,6 +1357,8 @@ export class ChannelServer implements DurableObject {
   // used to create channels (from scratch), or upload from backup, or merge
   async #uploadData(request: Request) {
     if (DEBUG) console.log("==== uploadData() ====");
+    if (DEBUG) console.log(`current storage limit: ${this.storageLimit} bytes`)
+
     if (!this.#channelKeys)
       return returnError(request, "UploadData but not initialized / created", 400);
     const _secret = this.env.SERVER_SECRET;
@@ -1265,10 +1366,40 @@ export class ChannelServer implements DurableObject {
     const jsonString = new TextDecoder().decode(data);
     const jsonData = jsonParseWrapper(jsonString, 'L1416');
     if (DEBUG) {
-      console.log("---- uploadData(): jsonData: ")
+      console.log("---- uploadData(): jsonData:")
       console.log(jsonData)
+      console.log('----------------------------')
     }
-    const requestAuthorized = jsonData.hasOwnProperty("SERVER_SECRET") || jsonData["SERVER_SECRET"] === _secret;
+
+    // admin/superuser, eventually this is only dev/local never production
+    const requestAuthorized = jsonData.hasOwnProperty("SERVER_SECRET") && jsonData["SERVER_SECRET"] === _secret;
+    const storageTokenFunded = (jsonData.hasOwnProperty("storageToken") && this.storageLimit > 0) ? true : false;
+
+    // if (!requestAuthorized) {
+    //   // if not admin, we could be owner, but for now we consume any budget
+    //   const _budget_token_string = jsonData["storageToken"];
+    //   if (_budget_token_string) {
+    //     const _budget_token = JSON.parse(_budget_token_string);
+    //     if (DEBUG) console.log("uploadData(): using budget token: ", _budget_token)
+    //     const _storage_token_hash = await this.env.LEDGER_NAMESPACE.get(_budget_token.token_hash);
+    //     if (!_storage_token_hash) returnError(request, "Invalid budget token", 507);
+    //     const _ledger_resp = jsonParseWrapper(_storage_token_hash, 'L1329');
+    //     if (DEBUG) console.log("uploadData(): _ledger_resp: ", _ledger_resp)
+    //     if (_ledger_resp.used) returnError(request, "Budget token already used", 507);
+    //     // spend it
+    //     _ledger_resp.used = true;
+    //     // we're not too picky on double-using in this case
+    //     await this.env.LEDGER_NAMESPACE.put(_ledger_resp.token_hash, JSON.stringify(_ledger_resp))
+    //     const newOrAddedSize = Number(_ledger_resp.size);
+    //     // we check minimum levels later
+    //     this.storageLimit += newOrAddedSize;
+    //     await this.storage.put("storageLimit", this.storageLimit);
+    //     if (DEBUG) {
+    //       console.log("uploadData(): newOrAddedSize: ", newOrAddedSize)
+    //       console.log("uploadData(): storageLimit: ", this.storageLimit)
+    //     }
+    //   }
+    // }
 
     const { searchParams } = new URL(request.url);
     const targetChannel = searchParams.get('targetChannel');
@@ -1278,13 +1409,17 @@ export class ChannelServer implements DurableObject {
       const size = Number(jsonData["size"]);
       _sb_assert(this.storageLimit !== undefined, "storageLimit undefined");
       const currentStorage = Number(await this.storage.get("storageLimit"));
-      _sb_assert(currentStorage === this.storageLimit, "storage out of whatck");
+      _sb_assert(currentStorage === this.storageLimit, "storage out of whack");
       this.storageLimit += size;
       await this.storage.put("storageLimit", this.storageLimit);
       if (DEBUG) console.log(`uploadData(): increased budget by ${this.storageLimit} bytes`)
     }
+
+    // double check minimum budget
+    if (this.storageLimit < NEW_CHANNEL_MINIMUM_BUDGET)
+      return returnError(request, `Channel is left below minimum (minimum is ${NEW_CHANNEL_MINIMUM_BUDGET} bytes)`, 507);
     
-    if ((this.room_owner === jsonData["roomOwner"]) || requestAuthorized) {
+    if ((this.room_owner === jsonData["roomOwner"]) || requestAuthorized || storageTokenFunded) {
       if (DEBUG) console.log("==== uploadData() allowed - creating a new channel ====")
 
       let entriesBuffer: Record<string, string> = {};
