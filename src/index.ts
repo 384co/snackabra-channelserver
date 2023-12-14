@@ -1012,6 +1012,13 @@ export class ChannelServer implements DurableObject {
     return returnResult(request, JSON.stringify({ motherChannel: this.motherChannel }), 200);
   }
 
+  // MTG: new function to ensure that the size is within parameters
+  #validateSize = (size: number) => {
+    if (size === Infinity) return Infinity; // special case
+    if (size <= STORAGE_SIZE_MIN) size = STORAGE_SIZE_MIN;
+    if (size > (2 ** 52)) throw new Error(`Storage size too large (max 2^52 and we got ${size})`);
+  }
+
   /*
      Transfer storage budget from one channel to another. Use the target
      channel's budget, and just get the channel ID from the request
@@ -1027,7 +1034,10 @@ export class ChannelServer implements DurableObject {
     const targetChannel = searchParams.get('targetChannel');
     console.log(searchParams.get('transferBudget'))
     if(DEBUG) console.log(`[budd()]: transferBudget from query paramater: ${searchParams.get('transferBudget')} bytes`)
-    let transferBudget = this.#roundSize(Number(searchParams.get('transferBudget')));
+    // MTG: the roundeSize is causing odd behavior, so we're removing it for now
+    // let transferBudget = this.#roundSize(Number(searchParams.get('transferBudget')));
+    let transferBudget = Number(searchParams.get('transferBudget'));
+    this.#validateSize(transferBudget);
     if (DEBUG) console.log(`[budd()]: transferBudget after roundSize: ${transferBudget} bytes`)
     if (!targetChannel)
       return returnError(request, '[budd()]: No target channel specified', 400);
