@@ -22,8 +22,9 @@
 
 */
 
-const DEBUG = true;
-const DEBUG2 = false;
+import type { EnvType } from './env'
+import { VERSION, DEBUG, DEBUG2 } from './env'
+import { _sb_assert, returnResult, returnError, handleErrors,  } from './workers'
 
 if (DEBUG) console.log("++++ channel server code loaded ++++ DEBUG is enabled ++++")
 if (DEBUG2) console.log("++++ DEBUG2 (verbose) enabled ++++")
@@ -59,99 +60,9 @@ const MAX_BUDGET_TRANSFER = 1024 * 1024 * 1024 * 1024 * 1024; // 1 PB
 const ALLOW_OWNER_KEY_ROTATION = false;
 
 import type { ChannelKeys, SBChannelId, ChannelAdminData, ChannelKeyStrings } from 'snackabra';
-import { arrayBufferToBase64, base64ToArrayBuffer, jsonParseWrapper, SBCrypto } from 'snackabra';
+import { arrayBufferToBase64, base64ToArrayBuffer, jsonParseWrapper, SBCrypto, version } from 'snackabra';
 const sbCrypto = new SBCrypto()
 
-// this section has some type definitions that helps us with CF types
-type EnvType = {
-  // ChannelServerAPI
-  channels: DurableObjectNamespace,
-  // used for worker-to-worker (see toml)
-  notifications: Fetcher
-  // primarily for raw uploads and raw budget allocations
-  SERVER_SECRET: string,
-  // KV Namespaces
-  MESSAGES_NAMESPACE: KVNamespace,
-  KEYS_NAMESPACE: KVNamespace,
-  LEDGER_NAMESPACE: KVNamespace,
-  IMAGES_NAMESPACE: KVNamespace,
-  RECOVERY_NAMESPACE: KVNamespace,
-  // looks like: '{"key_ops":["encrypt"],"ext":true,"kty":"RSA","n":"6WeMtsPoblahblahU3rmDUgsc","e":"AQAB","alg":"RSA-OAEP-256"}'
-  LEDGER_KEY: string,
-}
-
-// internal - handle assertions
-function _sb_assert(val: unknown, msg: string) {
-  if (!(val)) {
-    const m = `<< SB assertion error: ${msg} >>`;
-    throw new Error(m);
-  }
-}
-
-// Reminder of response codes we use:
-//
-// 101: Switching Protocols (downgrade error)
-// 200: OK
-// 400: Bad Request
-// 401: Unauthorized
-// 403: Forbidden
-// 404: Not Found
-// 405: Method Not Allowed
-// 413: Payload Too Large
-// 418: I'm a teapot
-// 429: Too Many Requests
-// 500: Internal Server Error
-// 501: Not Implemented
-// 507: Insufficient Storage (WebDAV/RFC4918)
-//
-type ResponseCode = 101 | 200 | 400 | 401 | 403 | 404 | 405 | 413 | 418 | 429 | 500 | 501 | 507;
-
-function returnResult(request: Request, contents: any, status: ResponseCode, delay = 0) {
-  const corsHeaders = {
-    "Access-Control-Allow-Methods": "POST, OPTIONS, GET",
-    "Access-Control-Allow-Headers": "Content-Type, authorization",
-    "Access-Control-Allow-Credentials": "true",
-    "Access-Control-Allow-Origin": request.headers.get("Origin") ?? "*",
-    "Content-Type": "application/json;",
-  }
-  if (DEBUG2) console.log('++++++++++++HEADERS+++++++++++++\n\n', corsHeaders)
-  return new Promise<Response>((resolve) => {
-    setTimeout(() => {
-      if (DEBUG2) console.log("++++ returnResult() contents:", contents, "status:", status)
-      resolve(new Response(contents, { status: status, headers: corsHeaders }));
-    }, delay);
-  });
-}
-
-function returnError(_request: Request, errorString: string, status: ResponseCode, delay = 0) {
-  if (DEBUG) console.log("**** ERROR: (status: " + status + ")\n" + errorString);
-  if (!delay && ((status == 401) || (status == 403))) delay = 50; // delay if auth-related
-  return returnResult(_request, `{ "error": "${errorString}" }`, status);
-}
-
-// this handles UNEXPECTED errors
-async function handleErrors(request: Request, func: () => Promise<Response>) {
-  try {
-    return await func();
-  } catch (err: any) {
-    if (err instanceof Error) {
-      if (request.headers.get("Upgrade") == "websocket") {
-        const [_client, server] = Object.values(new WebSocketPair());
-        if ((server as any).accept) {
-          (server as any).accept(); // CF typing override (TODO: report this)
-          server.send(JSON.stringify({ error: '[handleErrors()] ' + err.message + '\n' + err.stack }));
-          server.close(1011, "Uncaught exception during session setup");
-          console.log("webSocket close (error)")
-        }
-        return returnResult(request, null, 101);
-      } else {
-        return returnResult(request, err.stack, 500)
-      }
-    } else {
-      return returnError(request, "Unknown error type (?) in top level", 500);
-    }
-  }
-}
 
 /**
  * API calls are in one of two forms:
@@ -191,8 +102,9 @@ async function handleErrors(request: Request, func: () => Promise<Response>) {
  *     /api/fetchDataMigration/
  *
  *     Channel API (async):
- *     /api/notifications/       : sign up for notifications (disabled)
- *     /api/getLastMessageTimes/ : queries multiple channels for last message timestamp
+ *     /api/info                 : channel server info
+ *     /api/notifications        : sign up for notifications (disabled)
+ *     /api/getLastMessageTimes  : queries multiple channels for last message timestamp (disabled)
  *
  *     Channel API (synchronous)          : [O] means [Owner] only
  *                                              note that locked rooms are not accessible until accepted   
@@ -236,7 +148,7 @@ export default {
         case "api": // /api/... is only case currently
           return handleApiRequest(path.slice(1), request, env);
         default:
-          return returnError(request, "Not found (must give API endpoint)", 404)
+          return returnError(request, "Not found (must give API endpoint '/api/...')", 404)
       }
     });
   }
@@ -260,6 +172,30 @@ async function callDurableObject(name: SBChannelId, path: Array<string>, request
   return roomObject.fetch(newRequest);
 }
 
+function channelServerInfo(request: Request, env: EnvType) {
+  const url = new URL(request.url);
+  let storageUrl: string | null = null
+  if (url.hostname === 'localhost' && url.port === '3845') {
+    storageUrl = 'http://localhost:3843';
+  } else if (url.protocol === 'https:' && url.hostname.split('.').length >= 2) {
+    const storageServer = env.STORAGE_SERVER; // Replace with your environment variable
+    const domainParts = url.hostname.split('.');
+    if (storageServer && domainParts.length >= 2) {
+      domainParts[0] = storageServer; // Replace the top-level domain with STORAGE_SERVER
+      storageUrl = `https://${domainParts.join('.')}`;
+    }
+  } // and if nothing matches then storageUrl is null:
+  if (!storageUrl)
+    return { error: "Could not determine storage server URL"}
+  var retVal = {
+    version: VERSION,
+    storage_server: storageUrl,
+    jslib_version: version,
+    environment: env.ENVIRONMENT ? env.ENVIRONMENT : undefined,
+  }
+  return retVal
+}
+
 // 'path' is the request path, starting AFTER '/api'
 async function handleApiRequest(path: Array<string>, request: Request, env: EnvType) {
   if (DEBUG) {
@@ -269,20 +205,25 @@ async function handleApiRequest(path: Array<string>, request: Request, env: EnvT
   }
   try {
     switch (path[0]) {
+      case "info":
+        return returnResult(request, JSON.stringify(channelServerInfo(request, env)), 200)
       case "room":
       case "channel":
         return callDurableObject(path[1], path.slice(2), request, env);
       case "notifications":
         return returnError(request, "Device (Apple) notifications are disabled (use web notifications)", 400);
       case "getLastMessageTimes":
-        {
-          const _rooms: any = await request.json();
-          const lastMessageTimes: Array<any> = [];
-          for (let i = 0; i < _rooms.length; i++) {
-            lastMessageTimes[_rooms[i]] = await lastTimeStamp(_rooms[i], env);
-          }
-          return returnResult(request, JSON.stringify(lastMessageTimes), 200);
-        }
+        // ToDo: this needs to be modified to receive a userId for each channel requested
+        //       as well as limit how many can be queried at once
+        return returnError(request, "getLastMessageTimes disabled on this server (see release notes)", 400)
+        // {
+        //   const _rooms: any = await request.json();
+        //   const lastMessageTimes: Array<any> = [];
+        //   for (let i = 0; i < _rooms.length; i++) {
+        //     lastMessageTimes[_rooms[i]] = await lastTimeStamp(_rooms[i], env);
+        //   }
+        //   return returnResult(request, JSON.stringify(lastMessageTimes), 200);
+        // }
       default:
         return returnResult(request, JSON.stringify({ error: "Not found (this is an API endpoint, the URI was malformed)" }), 404)
     }
@@ -583,6 +524,7 @@ export class ChannelServer implements DurableObject {
           }
         } else if (this.visitorCalls[apiCall]) {
           // TODO: locked rooms should not be accessible until accepted
+          // UPDATE: this is done at api call level, if locked and unless accepted, no api calls allowed
           // const data = jsonParseWrapper(msg.data.toString(), 'L733');
           // const _name: JsonWebKey = jsonParseWrapper(data.name, 'L578');
           // const isPreviousVisitor = sbCrypto.lookupKey(_name, this.visitors) >= 0;
@@ -971,6 +913,13 @@ export class ChannelServer implements DurableObject {
 
   // channels approve storage by creating storage token out of their budget
   async #handleNewStorage(request: Request) {
+    if (this.locked) {
+      // ToDo: need test cases
+      const data = jsonParseWrapper(new TextDecoder().decode(await request.arrayBuffer()), 'L976') || {}
+      const isAccepted = sbCrypto.lookupKey(data.userId, this.accepted_requests) >= 0;
+      if (!isAccepted)
+        return returnError(request, '[/storageRequest]: Either no such channel or you are not authorized', 401);
+    }
     const { searchParams } = new URL(request.url);
     const size = this.#roundSize(Number(searchParams.get('size')));
     const storageLimit = this.storageLimit;
@@ -985,7 +934,11 @@ export class ChannelServer implements DurableObject {
     await this.env.LEDGER_NAMESPACE.put(token_hash, JSON.stringify(kv_data));
     const encrypted_token_id = arrayBufferToBase64(await crypto.subtle.encrypt({ name: "RSA-OAEP" }, this.ledgerKey!, token_buffer));
     const hashed_room_id = arrayBufferToBase64(await crypto.subtle.digest('SHA-256', (new TextEncoder).encode(this.room_id)));
-    const token = { token_hash: token_hash, hashed_room_id: hashed_room_id, encrypted_token_id: encrypted_token_id };
+    const token = {
+      token_hash: token_hash,
+      hashed_room_id: hashed_room_id,
+      encrypted_token_id: encrypted_token_id
+    };
     return returnResult(request, JSON.stringify(token), 200);
   }
 
