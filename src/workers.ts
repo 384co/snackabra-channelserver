@@ -59,7 +59,7 @@ export function returnBinaryResult(request: Request, payload: BodyInit) {
     return new Response(payload, { status: 200, headers: corsHeaders });
 }
 
-export function returnError(_request: Request, errorString: string, status: ResponseCode, delay = 0) {
+export function returnError(_request: Request, errorString: string, status: ResponseCode = 500, delay = 0) {
     if (DEBUG) console.log("**** ERROR: (status: " + status + ")\n" + errorString);
     if (!delay && ((status == 401) || (status == 403))) delay = 50; // delay if auth-related
     return returnResult(_request, `{ "error": "${errorString}" }`, status);
@@ -73,6 +73,7 @@ export async function handleErrors(request: Request, func: () => Promise<Respons
         if (err instanceof Error) {
             if (request.headers.get("Upgrade") == "websocket") {
                 const [_client, server] = Object.values(new WebSocketPair());
+                if (!server) return returnError(request, "Missing server from client/server of websocket (?)")
                 if ((server as any).accept) {
                     (server as any).accept(); // CF typing override (TODO: report this)
                     server.send(JSON.stringify({ error: '[handleErrors()] ' + err.message + '\n' + err.stack }));

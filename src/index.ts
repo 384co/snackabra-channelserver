@@ -59,7 +59,7 @@ const MAX_BUDGET_TRANSFER = 1024 * 1024 * 1024 * 1024 * 1024; // 1 PB
 // see notes in jslib on owner key rotation
 const ALLOW_OWNER_KEY_ROTATION = false;
 
-import type { ChannelKeys, SBChannelId, ChannelAdminData, ChannelKeyStrings, SBUserId } from 'snackabra';
+import type { ChannelKeys, SBChannelId, ChannelAdminData, ChannelKeyStrings } from 'snackabra';
 import { arrayBufferToBase64, base64ToArrayBuffer, jsonParseWrapper, SBCrypto, version } from 'snackabra';
 const sbCrypto = new SBCrypto()
 
@@ -206,9 +206,8 @@ function channelServerInfo(request: Request, env: EnvType) {
 
 // 'path' is the request path, starting AFTER '/api'
 async function handleApiRequest(path: Array<string>, request: Request, env: EnvType) {
-  if (DEBUG) {
-    console.log(`==== handleApiRequest() path:`);
-    console.log(path);
+  if (DEBUG)  {
+    console.log(`==== handleApiRequest() path:`, path);
     if (DEBUG2) console.log(request.headers);
   }
   try {
@@ -217,6 +216,7 @@ async function handleApiRequest(path: Array<string>, request: Request, env: EnvT
         return returnResult(request, JSON.stringify(channelServerInfo(request, env)), 200)
       case "room":
       case "channel":
+        if (!path[1]) throw new Error("room|channel needs more params")
         return callDurableObject(path[1], path.slice(2), request, env);
       case "notifications":
         return returnError(request, "Device (Apple) notifications are disabled (use web notifications)", 400);
@@ -240,18 +240,19 @@ async function handleApiRequest(path: Array<string>, request: Request, env: EnvT
   }
 }
 
-async function lastTimeStamp(room_id: SBChannelId, env: EnvType) {
-  let list_response = await env.MESSAGES_NAMESPACE.list({ "prefix": room_id });
-  let message_keys: any = list_response.keys.map((res) => {
-    return res.name
-  });
-  if (message_keys.length === 0) return '0'
-  while (!list_response.list_complete) {
-    list_response = await env.MESSAGES_NAMESPACE.list({ "cursor": list_response.cursor })
-    message_keys = [...message_keys, list_response.keys];
-  }
-  return message_keys[message_keys.length - 1].slice(room_id.length);
-}
+// .... currently getLastMessageTimes is disabled ... once it's back we will need this
+// async function lastTimeStamp(room_id: SBChannelId, env: EnvType) {
+//   let list_response = await env.MESSAGES_NAMESPACE.list({ "prefix": room_id });
+//   let message_keys: any = list_response.keys.map((res) => {
+//     return res.name
+//   });
+//   if (message_keys.length === 0) return '0'
+//   while (!list_response.list_complete) {
+//     list_response = await env.MESSAGES_NAMESPACE.list({ "cursor": list_response.cursor })
+//     message_keys = [...message_keys, list_response.keys];
+//   }
+//   return message_keys[message_keys.length - 1].slice(room_id.length);
+// }
 
 interface Dictionary<T> {
   [index: string]: T;
@@ -293,8 +294,8 @@ export class ChannelServer implements DurableObject {
   lastTimestamp: number = 0; // monotonically increasing timestamp
   storageLimit: number = 0;
   verified_guest: string = '';
-  // visitors: Array<JsonWebKey> = [];
-  visitors: Array<SBUserId> = [];
+  visitors: Array<JsonWebKey> = [];
+  // visitors: Array<SBUserId> = [];
   join_requests: Array<JsonWebKey> = [];
   accepted_requests: Array<JsonWebKey> = [];
   // lockedKeys: Array<JsonWebKey> = []; // tracks history of lock keys
