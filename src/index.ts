@@ -59,7 +59,7 @@ const MAX_BUDGET_TRANSFER = 1024 * 1024 * 1024 * 1024 * 1024; // 1 PB
 // see notes in jslib on owner key rotation
 const ALLOW_OWNER_KEY_ROTATION = false;
 
-import type { ChannelKeys, SBChannelId, ChannelAdminData, ChannelKeyStrings } from 'snackabra';
+import type { ChannelKeys, SBChannelId, ChannelAdminData, ChannelKeyStrings, SBUserId } from 'snackabra';
 import { arrayBufferToBase64, base64ToArrayBuffer, jsonParseWrapper, SBCrypto, version } from 'snackabra';
 const sbCrypto = new SBCrypto()
 
@@ -294,12 +294,14 @@ export class ChannelServer implements DurableObject {
   lastTimestamp: number = 0; // monotonically increasing timestamp
   storageLimit: number = 0;
   verified_guest: string = '';
-  visitors: Array<JsonWebKey> = [];
-  // visitors: Array<SBUserId> = [];
-  join_requests: Array<JsonWebKey> = [];
-  accepted_requests: Array<JsonWebKey> = [];
+  // visitors: Array<JsonWebKey> = [];
+  visitors: Array<SBUserId> = [];
+  // join_requests: Array<JsonWebKey> = [];
+  join_requests: Array<SBUserId> = [];
+  // accepted_requests: Array<JsonWebKey> = [];
+  accepted_requests: Array<SBUserId> = [];
   // lockedKeys: Array<JsonWebKey> = []; // tracks history of lock keys
-  encryptedLockedKeys: Map<string, string> = new Map(); // maps from visitor pubKey to encrypted locked key
+  encryptedLockedKeys: Map<SBUserId, string> = new Map(); // maps from visitor pubKey to encrypted locked key
   room_capacity: number = 20;
   ownerUnread: number = 0;
   locked: boolean = false;
@@ -608,9 +610,12 @@ export class ChannelServer implements DurableObject {
         webSocket.send(JSON.stringify({ error: "ERROR: First message needs to contain pubKey" }));
         return;
       }
-      const _name: JsonWebKey = jsonParseWrapper(data.name, 'L578');
-      const isPreviousVisitor = sbCrypto.lookupKey(_name, this.visitors) >= 0;
-      const isAccepted = sbCrypto.lookupKey(_name, this.accepted_requests) >= 0;
+      // const _name: JsonWebKey = jsonParseWrapper(data.name, 'L578');
+      const userId: SBUserId = (data as any).userId
+      // const isPreviousVisitor = sbCrypto.lookupKey(_name, this.visitors) >= 0;
+      const isPreviousVisitor = this.visitors.includes(userId)
+      // const isAccepted = sbCrypto.lookupKey(_name, this.accepted_requests) >= 0;
+      const isAccepted = this.accepted_requests.includes(userId)
       if (!isPreviousVisitor && this.visitors.length >= this.room_capacity) {
         webSocket.close(4000, 'ERROR: The room is not accepting any more visitors.');
         return;
@@ -851,9 +856,11 @@ export class ChannelServer implements DurableObject {
 
   async #acceptVisitor(request: Request) {
     const data = await request.json();
-    const acceptPubKey: JsonWebKey = jsonParseWrapper((data as any).pubKey, 'L783');
+    // const acceptPubKey: JsonWebKey = jsonParseWrapper((data as any).pubKey, 'L783');
+    const userId: SBUserId = (data as any).userId
     // const ind = this.join_requests.indexOf((data as any).pubKey as string);
-    const ind = sbCrypto.lookupKey(acceptPubKey, this.join_requests);
+    // const ind = sbCrypto.lookupKey(acceptPubKey, this.join_requests);
+    const ind = this.join_requests.indexOf(userId)
     if (ind >= 0) {
       this.accepted_requests = [...this.accepted_requests, ...this.join_requests.splice(ind, 1)];
       if (DEBUG) console.log("Encrypted locked keys:", this.encryptedLockedKeys)
@@ -967,7 +974,8 @@ export class ChannelServer implements DurableObject {
     if (this.locked) {
       // ToDo: need test cases
       const data = jsonParseWrapper(new TextDecoder().decode(await request.arrayBuffer()), 'L976') || {}
-      const isAccepted = sbCrypto.lookupKey(data.userId, this.accepted_requests) >= 0;
+      // const isAccepted = sbCrypto.lookupKey(data.userId, this.accepted_requests) >= 0;
+      const isAccepted = this.accepted_requests.includes(data.userId)
       if (!isAccepted)
         return returnError(request, '[/storageRequest]: Either no such channel or you are not authorized', 401);
     }
