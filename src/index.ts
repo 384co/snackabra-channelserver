@@ -281,7 +281,7 @@ type SessionType = {
  */
 export class ChannelServer implements DurableObject {
   storage: DurableObjectStorage;
-  env: EnvType;
+  // env: EnvType;
   initializePromise: Promise<void> | null = null;
   sessions: Array<any> = [];
   #channelKeys?: ChannelKeys
@@ -333,11 +333,11 @@ export class ChannelServer implements DurableObject {
     return s;
   }
 
-  constructor(state: DurableObjectState, env: EnvType) {
+  constructor(state: DurableObjectState, public env: EnvType) {
     // NOTE: DO storage has a different API than global KV, see:
     // https://developers.cloudflare.com/workers/runtime-apis/durable-objects/#transactional-storage-api
     this.storage = state.storage;
-    this.env = env;
+    // this.env = env;
 
     this.ownerCalls = {
       "/acceptVisitor": this.#acceptVisitor.bind(this),
