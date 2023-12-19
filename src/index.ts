@@ -885,7 +885,14 @@ export class ChannelServer implements DurableObject {
     const data = await request.json();
     const acceptPubKey: JsonWebKey = jsonParseWrapper((data as any).pubKey, 'L783');
     // const ind = this.join_requests.indexOf((data as any).pubKey as string);
-    const ind = sbCrypto.lookupKey(acceptPubKey, this.join_requests);
+    let ind = sbCrypto.lookupKey(acceptPubKey, this.join_requests);
+    console.log("ind: ", ind)
+    if(ind === -1) {
+      console.log("Forcing acceptPubKey to join_requests")
+      this.join_requests.push(acceptPubKey);
+      ind = sbCrypto.lookupKey(acceptPubKey, this.join_requests);
+      console.log("ind: ", ind)
+    }
     if (ind >= 0) {
       this.accepted_requests = [...this.accepted_requests, ...this.join_requests.splice(ind, 1)];
       this.lockedKeys[(data as any).pubKey] = (data as any).lockedKey;
