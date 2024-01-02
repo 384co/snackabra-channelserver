@@ -24,7 +24,7 @@
 
 import type { EnvType } from './env'
 import { VERSION, DEBUG, DEBUG2 } from './env'
-import { _sb_assert, returnResult, returnError, handleErrors,  } from './workers'
+import { _sb_assert, returnResult, returnError, handleErrors, } from './workers'
 
 if (DEBUG) console.log("++++ channel server code loaded ++++ DEBUG is enabled ++++")
 if (DEBUG2) console.log("++++ DEBUG2 (verbose) enabled ++++")
@@ -143,7 +143,7 @@ export default {
         `\n${msg}` +
         `\n${'='.repeat(msg.length)}` +
         `\n`
-        );
+      );
       if (DEBUG2) console.log(request.headers);
     }
     return await handleErrors(request, async () => {
@@ -179,7 +179,7 @@ async function callDurableObject(name: SBChannelId, path: Array<string>, request
   if (DEBUG2) { console.log("callDurableObject() newUrl:"); console.log(newUrl); }
   return roomObject.fetch(newRequest);
 }
-
+//MTG: would like to understand what this is used for exactly, I assume for understanding feature sets between various channel servers?
 function channelServerInfo(request: Request, env: EnvType) {
   const url = new URL(request.url);
   let storageUrl: string | null = null
@@ -194,7 +194,7 @@ function channelServerInfo(request: Request, env: EnvType) {
     }
   } // and if nothing matches then storageUrl is null:
   if (!storageUrl)
-    return { error: "Could not determine storage server URL"}
+    return { error: "Could not determine storage server URL" }
   var retVal = {
     version: VERSION,
     storage_server: storageUrl,
@@ -206,7 +206,7 @@ function channelServerInfo(request: Request, env: EnvType) {
 
 // 'path' is the request path, starting AFTER '/api'
 async function handleApiRequest(path: Array<string>, request: Request, env: EnvType) {
-  if (DEBUG)  {
+  if (DEBUG) {
     console.log(`==== handleApiRequest() path:`, path);
     if (DEBUG2) console.log(request.headers);
   }
@@ -224,14 +224,14 @@ async function handleApiRequest(path: Array<string>, request: Request, env: EnvT
         // ToDo: this needs to be modified to receive a userId for each channel requested
         //       as well as limit how many can be queried at once
         return returnError(request, "getLastMessageTimes disabled on this server (see release notes)", 400)
-        // {
-        //   const _rooms: any = await request.json();
-        //   const lastMessageTimes: Array<any> = [];
-        //   for (let i = 0; i < _rooms.length; i++) {
-        //     lastMessageTimes[_rooms[i]] = await lastTimeStamp(_rooms[i], env);
-        //   }
-        //   return returnResult(request, JSON.stringify(lastMessageTimes), 200);
-        // }
+      // {
+      //   const _rooms: any = await request.json();
+      //   const lastMessageTimes: Array<any> = [];
+      //   for (let i = 0; i < _rooms.length; i++) {
+      //     lastMessageTimes[_rooms[i]] = await lastTimeStamp(_rooms[i], env);
+      //   }
+      //   return returnResult(request, JSON.stringify(lastMessageTimes), 200);
+      // }
       default:
         return returnResult(request, JSON.stringify({ error: "Not found (this is an API endpoint, the URI was malformed)" }), 404)
     }
@@ -305,7 +305,7 @@ export class ChannelServer implements DurableObject {
   room_capacity: number = 20;
   ownerUnread: number = 0;
   locked: boolean = false;
-  motd: string = '';
+  motd: string = ''; // MTG: do we still need motd? Couldnt this be a message type on the channel?
   ledgerKey: CryptoKey | null = null;
   personalRoom: boolean = false;
   motherChannel: string = '';
@@ -575,9 +575,18 @@ export class ChannelServer implements DurableObject {
   // fetch most recent messages from local (worker) KV
   async #getRecentMessages(howMany: number, cursor = ''): Promise<Map<string, unknown>> {
     const listOptions: DurableObjectListOptions = { limit: howMany, prefix: this.room_id, reverse: true };
-    if (cursor !== '')
-      listOptions.startAfter = cursor;
+    if (cursor !== '') {
+      //MTG: this is what we actually want, I tested with this to make sure its correct. Discovered in music app CF docs are unclear on actual behavior.
+      listOptions.end = cursor;
+      // listOptions.startAfter = cursor;
+    }
+
+    console.log("listOptions: ")
+    console.log(listOptions)
     const keys = Array.from((await this.storage.list(listOptions)).keys());
+
+    console.log("keys: ")
+    console.log(keys)
     // see this blog post for details on why we're setting allowConcurrency:
     // https://blog.cloudflare.com/durable-objects-easy-fast-correct-choose-three/
     const getOptions: DurableObjectGetOptions = { allowConcurrency: true };
@@ -635,7 +644,7 @@ export class ChannelServer implements DurableObject {
           // this is not done globally, but per visitor (with getchannelkeys)
           if (DEBUG)
             console.log("visitor is accepted to a locked room, will be provided with get channel keys")
- 
+
           //   // TODO: this mechanism needs testing
           //   // const encrypted_key = this.lockedKeys[sbCrypto.lookupKey(_name, this.lockedKeys)];
           //   const encryptedLockedKey = this.encryptedLockedKeys.get(data.name) || null;
@@ -957,6 +966,7 @@ export class ChannelServer implements DurableObject {
   }
 
   // NOTE: current design limits this to 2^52 bytes, future limit will be 2^64 bytes
+  // TODO: this function has some odd behavior, needs testing. It seems to cut storage budget in half or return correctly in some cases? This was breaking when MTG was doing budd operations with the store code in sizes of 4GiB
   #roundSize(size: number, roundUp = true) {
     if (size === Infinity) return Infinity; // special case
     if (size <= STORAGE_SIZE_MIN) size = STORAGE_SIZE_MIN;
@@ -1027,7 +1037,7 @@ export class ChannelServer implements DurableObject {
     if (!targetChannel)
       return returnError(request, '[budd()]: No target channel specified', 400);
     if (this.room_id === targetChannel)
-        return returnResult(request, JSON.stringify({ success: true }), 200); // no-op
+      return returnResult(request, JSON.stringify({ success: true }), 200); // no-op
     if (!this.storageLimit) {
       if (DEBUG) console.log("storageLimit missing in mother channel?", this.#describe());
       return returnError(request, `[budd()]: Mother channel (${this.room_id.slice(0, 12)}...) either does not exist, or has not been initialized, or lacks storage budget`, 400);
@@ -1221,7 +1231,9 @@ export class ChannelServer implements DurableObject {
         }
       }
       // console.log("Sending web notification", options)
-      return await envNotifications.fetch("https://notifications.384.dev/notify", options)
+      // return await envNotifications.fetch("https://notifications.384.dev/notify", options)
+      // MTG: we are reaching to a heroku endpoint here not a cloudflare one, CF doesnt support http2 fetch for notification servers
+      return await fetch("https://notify.384.dev/notify", options)
     } catch (err) {
       console.log(err)
       console.log("Error sending web notification")
@@ -1276,7 +1288,7 @@ export class ChannelServer implements DurableObject {
       console.log(jsonData)
       console.log("===============================")
     }
-    
+
     // either admin (max size) or using storage token
     if (!(jsonData.hasOwnProperty("SERVER_SECRET") && jsonData["SERVER_SECRET"] === this.env.SERVER_SECRET)) {
       if (jsonData.hasOwnProperty("storageToken")) {
@@ -1427,7 +1439,7 @@ export class ChannelServer implements DurableObject {
     // double check minimum budget
     if (this.storageLimit < NEW_CHANNEL_MINIMUM_BUDGET)
       return returnError(request, `Channel is left below minimum (minimum is ${NEW_CHANNEL_MINIMUM_BUDGET} bytes)`, 507);
-    
+
     if ((this.room_owner === jsonData["roomOwner"]) || requestAuthorized || storageTokenFunded) {
       if (DEBUG) console.log("==== uploadData() allowed - creating a new channel ====")
 
