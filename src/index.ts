@@ -580,13 +580,8 @@ export class ChannelServer implements DurableObject {
       listOptions.end = cursor;
       // listOptions.startAfter = cursor;
     }
-
-    console.log("listOptions: ")
-    console.log(listOptions)
     const keys = Array.from((await this.storage.list(listOptions)).keys());
 
-    console.log("keys: ")
-    console.log(keys)
     // see this blog post for details on why we're setting allowConcurrency:
     // https://blog.cloudflare.com/durable-objects-easy-fast-correct-choose-three/
     const getOptions: DurableObjectGetOptions = { allowConcurrency: true };
