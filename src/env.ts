@@ -1,4 +1,4 @@
-export const VERSION = "2.0.0 (pre) (build 06)"
+export const VERSION = "2.0.0 (pre) (build 12)"
 export const DEBUG = true;
 export const DEBUG2 = false;
 

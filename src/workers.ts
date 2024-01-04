@@ -5,6 +5,106 @@
  */
 
 import { DEBUG, DEBUG2 } from './env'
+import { NEW_CHANNEL_MINIMUM_BUDGET as _NEW_CHANNEL_MINIMUM_BUDGET } from 'snackabra'
+
+/**
+ * API calls are in one of two forms:
+ * 
+ * ::
+ * 
+ *     /api/v2/<api_call>/
+ *     /api/v2/channel/<id>/<api_call>/
+ * 
+ * The first form is asynchronous, the latter is synchronous.
+ * A 'sync' call means that there's only a single server endpoint
+ * that is handling calls. The channel id thus constitutes
+ * the point of synchronization.
+ * 
+ * Currently, api calls are strictly one or the other. That will
+ * likely change.
+ * 
+ * Finally, one api endpoint is special:
+ * 
+ * ::
+ * 
+ *     /api/v2/channel/<id>/websocket
+ * 
+ * Which will upgrade protocol to a websocket connection.
+ * 
+ * Previous design was divided into separate shard and channel
+ * servers, but this version is merged. For historical continuity,
+ * below we divide them into shard and channel calls.
+ * 
+ * ::
+ * 
+ *     Shard API:
+ *     /api/storeRequest/
+ *     /api/storeData/
+ *     /api/fetchData/
+ *     /api/migrateStorage/
+ *     /api/fetchDataMigration/
+ *
+ *     Channel API (async):
+ *     /api/v2/info                 : channel server info
+ *     /api/v2/getLastMessageTimes  : queries multiple channels for last message timestamp (disabled)
+ *
+ *     Channel API (synchronous)                : [O] means [Owner] only
+ *     /api/v2/channel/<ID>/websocket           : connect to channel socket (wss protocol)
+ *     /api/v2/channel/<ID>/oldMessages
+ *     /api/v2/channel/<ID>/updateRoomCapacity  : [O]
+ *     /api/v2/channel/<ID>/budd                : [O]
+ *     /api/v2/channel/<ID>/getAdminData        : [O]
+ *     /api/v2/channel/<ID>/getJoinRequests     : [O]
+ *     /api/v2/channel/<ID>/getChannelKeys      : New: get owner pub key, channel pub key
+ *     /api/v2/channel/<ID>/getMother           : [O]
+ *     /api/v2/channel/<ID>/getRoomCapacity     : [O]
+ *     /api/v2/channel/<ID>/getStorageLimit     : ToDo: per-userId storage limit system (until then shared)
+ *     /api/v2/channel/<ID>/acceptVisitor       : [O]
+ *     /api/v2/channel/<ID>/channelLocked
+ *     /api/v2/channel/<ID>/ownerUnread         : [O]
+ *     /api/v2/channel/<ID>/storageRequest
+ *     /api/v2/channel/<ID>/downloadData
+ *     /api/v2/channel/<ID>/uploadChannel       : (admin only or with budget channel provided)
+ *     /api/v2/channel/<ID>/postPubKey
+ * 
+ * The following are in the process of being reviewed / refactored / deprecated:
+ * 
+ * ::
+ *
+ *     /api/v2/notifications        : sign up for notifications (disabled)
+ *     /api/v2/channel/<ID>/roomLocked          : (alias for /channelLocked)
+ *     /api/v2/channel/<ID>/lockRoom            : [O]
+ *     /api/v2/channel/<ID>/motd                : [O]
+ *     /api/v2/channel/<ID>/ownerKeyRotation    : [O] (deprecated)
+ *     /api/v2/channel/<ID>/registerDevice      : (disabled)
+ *     /api/v2/channel/<ID>/uploadRoom          : (admin only or with budget channel provided)
+ *     /api/v2/channel/<ID>/authorizeRoom       : (admin only)
+ *     /api/v2/channel/<ID>/getPubKeys          : [O]
+ * 
+ */
+
+const _STORAGE_SIZE_UNIT = 4096 // 4KB
+
+export const serverConstants = {
+    // minimum unt of storage
+    STORAGE_SIZE_UNIT: _STORAGE_SIZE_UNIT,
+
+    // Currently minimum (raw) storage is set to 32KB. This will not
+    // be LOWERED, but future design changes may RAISE that. 
+    STORAGE_SIZE_MIN: 8 * _STORAGE_SIZE_UNIT,
+
+    // Current maximum (raw) storage is set to 32MB. This may change.
+    STORAGE_SIZE_MAX: 8192 * _STORAGE_SIZE_UNIT,
+
+    // minimum when creating (budding) a new channel
+    NEW_CHANNEL_MINIMUM_BUDGET: _NEW_CHANNEL_MINIMUM_BUDGET,
+
+    // new channel budget (bootstrap) is 3 GB (about $1)
+    NEW_CHANNEL_BUDGET: 3 * 1024 * 1024 * 1024, // 3 GB
+
+    // sanity check - set a max at one petabyte (2^50)
+    MAX_BUDGET_TRANSFER: 1024 * 1024 * 1024 * 1024 * 1024, // 1 PB
+}
 
 // internal - handle assertions
 export function _sb_assert(val: unknown, msg: string) {
