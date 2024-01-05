@@ -35,16 +35,18 @@ import type { SBChannelKeys, SBChannelId, ChannelAdminData, SBUserId, /* SBUserP
 import { SB384, arrayBufferToBase64, base64ToArrayBuffer, jsonParseWrapper, /* SBCrypto, */ version } from 'snackabra';
 // const sbCrypto = new SBCrypto()
 
+const SEP = '='.repeat(60) + '\n'
+
 export default {
   async fetch(request: Request, env: EnvType) {
     if (DEBUG) {
       const msg = `==== [${request.method}] Fetch called: ${request.url}`;
       console.log(
-        `\n` +
+        SEP +
         `\n${'='.repeat(msg.length)}` +
         `\n${msg}` +
         `\n${'='.repeat(msg.length)}` +
-        `\n`
+        SEP
       );
       if (DEBUG2) console.log(request.headers);
     }
@@ -60,19 +62,26 @@ export default {
   }
 }
 
-// 'channelId' is channel name, 'path' is the rest of the path
+// calling this switches from 'generic' (anonymous) microservice to a
+// (synchronous) Durable Object (unique per channel)
 async function callDurableObject(channelId: SBChannelId, path: Array<string>, request: Request, env: EnvType) {
-  if (DEBUG) {
-    console.log("==== callDurableObject() name:", channelId, "path:", path)
-    if (DEBUG2) { console.log(request); console.log(env) }
-  }
-  const roomObject = env.channels.get(env.channels.idFromName(channelId));
+  const durableObjectId = env.channels.idFromName(channelId);
+  const durableObject = env.channels.get(durableObjectId);
   const newUrl = new URL(request.url);
   newUrl.pathname = "/" + channelId + "/" + path.join("/");
   const newRequest = new Request(newUrl.toString(), request);
-  if (DEBUG) console.log("callDurableObject() newUrl:", newUrl);
+  if (DEBUG) {
+    console.log(
+      SEP, '\n',
+      "==== callDurableObject():",
+      "\nchannelId:", channelId, "\n", SEP,
+      "\npath:", path, '\n', SEP,
+      "\ndurableObjectId:\n", durableObjectId, '\n', SEP,
+      "\nnewUrl:\n", newUrl, SEP)
+    if (DEBUG2) { console.log(request); console.log(env) }
+  }
   // we direct the fetch 'at' the durable object
-  return roomObject.fetch(newRequest);
+  return durableObject.fetch(newRequest);
 }
 
 function channelServerInfo(request: Request, env: EnvType) {
@@ -105,8 +114,6 @@ async function handleApiRequest(path: Array<string>, request: Request, env: EnvT
     switch (path[0]) {
       case 'info':
         return returnResult(request, JSON.stringify(channelServerInfo(request, env)), 200)
-      case 'room':
-        return returnError(request, "api 'room' not supported", 400)
       case 'channel':
         if (!path[1]) throw new Error("channel needs more params")
         return callDurableObject(path[1], path.slice(2), request, env);
@@ -146,6 +153,7 @@ async function handleApiRequest(path: Array<string>, request: Request, env: EnvT
 //   return message_keys[message_keys.length - 1].slice(room_id.length);
 // }
 
+//#region Local TYPES
 interface Dictionary<T> {
   [index: string]: T;
 }
@@ -162,6 +170,7 @@ type SessionType = {
   quit: boolean,
   receivedUserInfo: boolean
 }
+//#endregion - Local TYPES
 
 // <newPage> 
 /**
@@ -173,7 +182,7 @@ type SessionType = {
  * Note: historically channels were referred to as 'rooms'.
  */
 export class ChannelServer implements DurableObject {
-  channelId: SBChannelId = '';
+  channelId?: SBChannelId;
 
   /* all these properties are backed in storage (DO KV) with below keys */
   /* 'channelData'         */ channelData?: SBChannelData        // does not change
@@ -224,7 +233,7 @@ export class ChannelServer implements DurableObject {
   // DEBUG helper function to produce a string explainer of the current state
   #describe(): string {
     let s = 'CHANNEL STATE:\n';
-    s += `room_id: ${this.channelData?.channelId}\n`;
+    s += `channelId: ${this.channelData?.channelId}\n`;
     s += `ownerId: ${this.channelData?.ownerPublicKey}\n`;
     // s += `verified_guest: ${this.verified_guest}\n`;
     s += `channelCapacity: ${this.channelCapacity}\n`;
@@ -403,31 +412,31 @@ export class ChannelServer implements DurableObject {
   // }
 
   // load channel from storage: either it's been descheduled, or it's a new channel
-  async #initialize(channelId: SBChannelId) {
+  async #initialize(channelData: SBChannelData) {
     try {
-      if (DEBUG) console.log(`==== ChannelServer.initialize() called for room: ${channelId} ====`)
+      _sb_assert(channelData && channelData.channelId, "ERROR: no channel data found in parameters (fatal)")
 
-      const _channelData: SBChannelData = jsonParseWrapper(await this.#getKey('channelData'), 'L409')
-      _sb_assert(_channelData, "ERROR: no channel data found in environment (fatal)")
-      _sb_assert(_channelData.channelId === channelId, "ERROR: channel data does not match channel ID (fatal)")
-      this.channelId = channelId;
-      this.channelData = _channelData
+      if (DEBUG) console.log(`==== ChannelServer.initialize() called for channel: ${channelData.channelId} ====`)
+
+      // const _channelData: SBChannelData = jsonParseWrapper(await this.#getKey('channelData'), 'L409')
+      // _sb_assert(_channelData, "ERROR: no channel data found in environment (fatal)")
+      // _sb_assert(_channelData.channelId === channelId, "ERROR: channel data does not match channel ID (fatal)")
 
       const ledgerKeyString = this.env.LEDGER_KEY; _sb_assert(ledgerKeyString, "ERROR: no ledger key found in environment (fatal)")
-      const ledgerKey = await crypto.subtle.importKey("jwk", jsonParseWrapper(ledgerKeyString, 'L217'), { name: "RSA-OAEP", hash: 'SHA-256' }, true, ["encrypt"])
+      const ledgerKey = await crypto.subtle.importKey("jwk", jsonParseWrapper(ledgerKeyString, 'L424'), { name: "RSA-OAEP", hash: 'SHA-256' }, true, ["encrypt"])
       this.ledgerKey = ledgerKey; // a bit quicker
 
       this.lastTimestamp = Number(await this.#getKey('lastTimestamp')) || 0;
       this.channelCapacity = Number(await this.#getKey('channelCapacity')) || 20
 
-      this.visitors = jsonParseWrapper(await this.#getKey('visitors') || JSON.stringify([]), 'L423');
+      this.visitors = jsonParseWrapper(await this.#getKey('visitors') || JSON.stringify([]), 'L430');
       this.ownerUnread = Number(await this.#getKey('ownerUnread')) || 0;
       this.locked = (await this.#getKey('locked')) === 'true' ? true : false;
-      this.joinRequests = jsonParseWrapper(await this.#getKey('joinRequests') || JSON.stringify([]), 'L426');
+      this.joinRequests = jsonParseWrapper(await this.#getKey('joinRequests') || JSON.stringify([]), 'L433');
 
       this.storageLimit = Number(await this.#getKey('storageLimit'))
 
-      this.acceptedRequests = jsonParseWrapper(await this.#getKey('acceptedRequests') || JSON.stringify([]), 'L224');
+      this.acceptedRequests = jsonParseWrapper(await this.#getKey('acceptedRequests') || JSON.stringify([]), 'L437');
       this.encryptedLockedKeys = this.deserializeMap(await this.#getKey('encryptedLockedKeys') || '[]');
 
       // TODO: test refactored lock
@@ -435,56 +444,73 @@ export class ChannelServer implements DurableObject {
       //   // this.lockedKeys[this.accepted_requests[i]] = await storage.get(this.accepted_requests[i]);
       //   this.lockedKeys[this.accepted_requests[i].x!] = await this.storage.get(this.accepted_requests[i]);
 
-      if (DEBUG) {
-        console.log("Done creating channel", this.channelData!.channelId)
-        if (DEBUG2) console.log(this)
-      }
+      // we do these LAST since it signals that we've fully initialized the channel
+      this.channelId = channelData.channelId;
+      this.channelData = channelData
+
+      if (DEBUG) console.log("++++ Done creating channel:\n", channelData.channelId, '\n', this.channelData)
+      if (DEBUG2) console.log(SEP, 'Full DO info\n', this, '\n', SEP)
+
     } catch (error: any) {
+      if (DEBUG) console.error(`Failed to initialize channel (${error})`)
       throw new Error(`Failed to initialize channel (${error})`)
     }
 
   }
 
+  // this is the fetch picked up by the Durable Object
   async fetch(request: Request) {
-    if (DEBUG) {
-      console.log(`==== [Durable Object] fetch() called: ${request.url}`)
-      if (DEBUG2) console.log(request.headers)
-    }
     const url = new URL(request.url);
     const path = url.pathname.slice(1).split('/');
-    if (DEBUG) console.log("path: ", path)
 
-    // handle cases of either new channel, or reloaded object
+    // this should always be the channel ID
+    if (!path || path.length < 2) return returnError(request, "ERROR: invalid API (should be '/api/v2/channel/<channelId>/<api>')", 400);
+    const channelId = path[0]
+    const apiCall = '/' + path[1]
+
+    if (DEBUG) {
+      console.log(
+        '\n', SEP,
+        '[Durable Object] fetch() called:\n',
+        '  channelId:', channelId, '\n',
+        '    apiCall:', apiCall, '\n',
+        '  full path:', path, '\n',
+        SEP, '\n', request.url, '\n', SEP)
+      if (DEBUG2) console.log(request.headers, '\n', SEP)
+    }
+
+    if (this.channelId && channelId && (this.channelId !== channelId)) return returnError(request, "Internal Error (L478)", 500);
+
+    if (apiCall === '/create') {
+      if (this.channelId) return returnError(request, `ERROR: channel already exists (asked to create '${channelId}')`, 400);
+      if (DEBUG) console.log('\n', SEP, '\n', 'NEW CHANNEL ... creating ...')
+      const ret = await this.#createChannel(request.clone());
+      if (DEBUG) console.log('.... created\n', SEP)
+      if (ret) return ret; // if there was an error, return it, otherwise it was successful
+      return returnResult(request, JSON.stringify({ success: true }), 200);
+    }
+
+    // if this object doesn't have it's correct channelId, that means it needs to be initialized
     if (!this.channelId) {
-      const channelId = await ((this.storage.get('channelId') as Promise<string>)
-        .catch((error) => { return returnError(request, `ERROR: unable to fetch channelId ${error} from KV`, 500); }))
-      if (channelId) {
-        // channel exists but object needs reloading
-        if (channelId !== path[0]) {
-          if (DEBUG) {
-            console.log("**** channelId mismatch:");
-            console.log("channelId: ", channelId);
-            console.log("path[0]: ", path[0]);
-          }
-          return returnError(request, "ERROR: channelId mismatch (?)", 500);
-        }
-        // bootstrap from storage
-        this.channelId = channelId;
-        await this
-          .#initialize(channelId)
-          .catch((err) => { return returnError(request, `Channel failed to initialize (${err})`, 500); });
-      } else if ((path) && (path[1] === 'create')) {
-        // first time we're talking to this object, it's new
-        if (DEBUG) console.log("====\n==== new channel, creating\n====")
-        const ret = await this.#createChannel(request.clone());
-        if (ret) return ret; // if there was an error, return it, otherwise fall through (which means it was created)
-        if (DEBUG) console.log("====\n==== CREATED\n====")
-        return returnResult(request, JSON.stringify({ success: true }), 200);
-      } else {
+      const channelData = jsonParseWrapper(await (this.storage.get('channelData') as Promise<string>), 'L495') as SBChannelData
+        // .catch((error: any) => {
+        //   if (DEBUG) console.error("ERROR: failed to get channelId from storage: ", error)
+        //   return returnError(request, `Internal Error (L498)`, 500);
+        // });
+      if (!channelData || !channelData.channelId) {
         // no channel, no object, no upload, no dice
-        console.log(this.#describe())
-        return returnError(request, "Not found (no channel) - only permitted first-touch is 'create'", 404);
+        if (DEBUG) console.error('DO not initialized, but channelData is not in KV (?). Here is what we know:\n', channelId, '\n', channelData, '\n', SEP, '\n', this.#describe(), '\n', SEP)
+        return returnError(request, "No such channel, or you are not authorized.", 401);
       }
+      // channel exists but object needs reloading
+      if (channelId !== channelData.channelId) {
+        if (DEBUG) console.log("**** channelId mismatch:\n", channelId, "\n", channelData);
+        return returnError(request, "Internal Error (L504)", 500);
+      }
+      // bootstrap from storage
+      await this
+        .#initialize(channelData) // it will throw an error if there's an issue
+        .catch(() => { return returnError(request, `Internal Error (L509)`, 500); });
     }
 
     // if (this.verified_guest === '') // TODO: this needed?
@@ -494,17 +520,6 @@ export class ChannelServer implements DurableObject {
       return returnError(request, "ERROR: channelId mismatch (?) [L522]", 500);
 
     return await handleErrors(request, async () => {
-
-      // // SSO code - this would optionally verify public key from a public record room->key
-      // if (this.room_owner === '') {
-      //   this.room_id = url.pathname.split('/')[1];
-      //   const keyFetch_json = await fetch("https://m063.dpn.workers.dev/api/v1/pubKeys?roomId=" + this.room_id)
-      //   this.room_owner = JSON.stringify(keyFetch_json.ownerKey);
-      //   this.encryptionKey = JSON.stringify(keyFetch_json.encryptionKey);
-      // }
-
-      // API section, all *synchronous* API calls are routed trough here
-      const apiCall = '/' + path[1]
       try {
         if (apiCall === "/websocket") {
           if (DEBUG) console.log("---- websocket request")
@@ -986,20 +1001,34 @@ export class ChannelServer implements DurableObject {
     const storageLimit = this.storageLimit;
     if (size > storageLimit) return returnError(request, 'Not sufficient storage budget left in channel', 507);
     if (size > serverConstants.STORAGE_SIZE_MAX) return returnResult(request, `Storage size too large (max ${serverConstants.STORAGE_SIZE_MAX} bytes)`, 413);
+
     this.storageLimit = storageLimit - size;
-    this.storage.put('storageLimit', this.storageLimit);
-    const token_buffer = crypto.getRandomValues(new Uint8Array(48)).buffer;
-    const token_hash_buffer = await crypto.subtle.digest('SHA-256', token_buffer)
-    const token_hash = arrayBufferToBase64(token_hash_buffer);
-    const kv_data = { used: false, size: size, motherChannel: this.channelId };
-    await this.env.LEDGER_NAMESPACE.put(token_hash, JSON.stringify(kv_data));
-    const encrypted_token_id = arrayBufferToBase64(await crypto.subtle.encrypt({ name: "RSA-OAEP" }, this.ledgerKey!, token_buffer));
-    const hashed_room_id = arrayBufferToBase64(await crypto.subtle.digest('SHA-256', (new TextEncoder).encode(this.channelId)));
-    const token = {
-      token_hash: token_hash,
-      hashed_room_id: hashed_room_id,
-      encrypted_token_id: encrypted_token_id
-    };
+    this.storage.put('storageLimit', this.storageLimit); // here we've consumed it
+    const token = arrayBufferToBase64(crypto.getRandomValues(new Uint8Array(48)).buffer);
+    await this.env.LEDGER_NAMESPACE.put(token,
+      JSON.stringify(
+        {
+          used: false,
+          size: size,
+          motherChannel: this.channelId,
+          created: Date.now()
+        }
+      ));
+
+    // const token_buffer = crypto.getRandomValues(new Uint8Array(48)).buffer;
+    // const token_hash_buffer = await crypto.subtle.digest('SHA-256', token_buffer)
+    // const token_hash = arrayBufferToBase64(token_hash_buffer);
+    // const kv_data = { used: false, size: size, motherChannel: this.channelId };
+    // await this.env.LEDGER_NAMESPACE.put(token_hash, JSON.stringify(kv_data));
+    // const encrypted_token_id = arrayBufferToBase64(await crypto.subtle.encrypt({ name: "RSA-OAEP" }, this.ledgerKey!, token_buffer));
+    // const hashed_room_id = arrayBufferToBase64(await crypto.subtle.digest('SHA-256', (new TextEncoder).encode(this.channelId)));
+    // const token = {
+    //   token_hash: token_hash,
+    //   hashed_room_id: hashed_room_id,
+    //   encrypted_token_id: encrypted_token_id
+    // };
+
+    if (DEBUG) console.log(`[newStorage()]: Created new storage token (${token.slice(0, 12)}...) for ${size} bytes`);
     return returnResult(request, JSON.stringify(token), 200);
   }
 
@@ -1060,7 +1089,7 @@ export class ChannelServer implements DurableObject {
     jsonData["motherChannel"] = this.channelId; // we leave a birth certificate behind
 
     const newUrl = new URL(request.url);
-    newUrl.pathname = `/api/channel/${targetChannel}/uploadRoom`;
+    newUrl.pathname = `/api/channel/${targetChannel}/uploadChannel`;
     const newRequest = new Request(newUrl.toString(), {
       method: 'POST',
       body: JSON.stringify(jsonData),
@@ -1081,7 +1110,7 @@ export class ChannelServer implements DurableObject {
     if (DEBUG) console.log('++++ putting budget in ledger ... reading back:', await this.env.LEDGER_NAMESPACE.get(targetChannel))
 
     // note that if the next operation fails, the ledger entry for the transfer is still there for possible recovery
-    return callDurableObject(targetChannel, ['uploadRoom'], newRequest, this.env)
+    return callDurableObject(targetChannel, ['uploadChannel'], newRequest, this.env)
 
     // return callDurableObject(targetChannel, [ `budd?targetChannel=${targetChannel}&transferBudget=${size}&serverSecret=${_secret}` ], request, this.env);
   }
@@ -1392,7 +1421,7 @@ export class ChannelServer implements DurableObject {
 
     // note that for a new room, "initialize" will fetch data from "this.storage" into object
     await this
-      .#initialize(newChannelId)
+      .#initialize(_cd)
       .catch(err => { return returnError(request, `Error initializing room [L1385]: ${err}`, 500) });
     if (DEBUG) console.log("++++ CREATED channel:", this.#describe());
     return null; // null means no errors

@@ -49,6 +49,7 @@ import { NEW_CHANNEL_MINIMUM_BUDGET as _NEW_CHANNEL_MINIMUM_BUDGET } from 'snack
  *     /api/v2/getLastMessageTimes  : queries multiple channels for last message timestamp (disabled)
  *
  *     Channel API (synchronous)                : [O] means [Owner] only
+ *     /api/v2/channel/<ID>/create              : New: create with storage token
  *     /api/v2/channel/<ID>/websocket           : connect to channel socket (wss protocol)
  *     /api/v2/channel/<ID>/oldMessages
  *     /api/v2/channel/<ID>/updateRoomCapacity  : [O]
