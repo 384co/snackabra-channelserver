@@ -47,6 +47,7 @@ export default {
         `\n${msg}` +
         `\n${'='.repeat(msg.length)}` +
         SEP
+        `\n`
       );
       if (DEBUG2) console.log(request.headers);
     }
@@ -83,7 +84,7 @@ async function callDurableObject(channelId: SBChannelId, path: Array<string>, re
   // we direct the fetch 'at' the durable object
   return durableObject.fetch(newRequest);
 }
-
+//MTG: would like to understand what this is used for exactly, I assume for understanding feature sets between various channel servers?
 function channelServerInfo(request: Request, env: EnvType) {
   const url = new URL(request.url);
   let storageUrl: string | null = null
@@ -573,8 +574,11 @@ export class ChannelServer implements DurableObject {
   async #getRecentMessages(howMany: number, cursor = ''): Promise<Map<string, unknown>> {
     const listOptions: DurableObjectListOptions = { limit: howMany, prefix: this.channelId, reverse: true };
     if (cursor !== '')
-      listOptions.startAfter = cursor;
+      //MTG: this is what we actually want, I tested with this to make sure its correct. Discovered in music app CF docs are unclear on actual behavior.
+      listOptions.end = cursor;
+      // listOptions.startAfter = cursor;
     const keys = Array.from((await this.storage.list(listOptions)).keys());
+
     // see this blog post for details on why we're setting allowConcurrency:
     // https://blog.cloudflare.com/durable-objects-easy-fast-correct-choose-three/
     const getOptions: DurableObjectGetOptions = { allowConcurrency: true };
@@ -1278,7 +1282,9 @@ export class ChannelServer implements DurableObject {
       }
       // console.log("Sending web notification", options)
       // ToDo: needs to be environment setting not static
-      return await envNotifications.fetch("https://notifications.384.dev/notify", options)
+      // return await envNotifications.fetch("https://notifications.384.dev/notify", options)
+      // MTG: we are reaching to a heroku endpoint here not a cloudflare one, CF doesnt support http2 fetch for notification servers
+      return await fetch("https://notify.384.dev/notify", options)
     } catch (err) {
       console.log(err)
       console.log("Error sending web notification")
