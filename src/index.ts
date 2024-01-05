@@ -42,12 +42,9 @@ export default {
     if (DEBUG) {
       const msg = `==== [${request.method}] Fetch called: ${request.url}`;
       console.log(
-        SEP +
         `\n${'='.repeat(msg.length)}` +
         `\n${msg}` +
-        `\n${'='.repeat(msg.length)}` +
-        SEP
-        `\n`
+        `\n${'='.repeat(msg.length)}`
       );
       if (DEBUG2) console.log(request.headers);
     }
@@ -73,12 +70,11 @@ async function callDurableObject(channelId: SBChannelId, path: Array<string>, re
   const newRequest = new Request(newUrl.toString(), request);
   if (DEBUG) {
     console.log(
-      SEP, '\n',
-      "==== callDurableObject():",
-      "\nchannelId:", channelId, "\n", SEP,
-      "\npath:", path, '\n', SEP,
-      "\ndurableObjectId:\n", durableObjectId, '\n', SEP,
-      "\nnewUrl:\n", newUrl, SEP)
+      "==== callDurableObject():\n",
+      "channelId:", channelId, "\n",
+      "path:", path, '\n',
+      durableObjectId, '\n')
+      // "newUrl:\n", newUrl, SEP) // very wordy
     if (DEBUG2) { console.log(request); console.log(env) }
   }
   // we direct the fetch 'at' the durable object
@@ -205,7 +201,8 @@ export class ChannelServer implements DurableObject {
   // env: EnvType;
   initializePromise: Promise<void> | null = null;
   sessions: Array<any> = [];
-  #channelKeys?: SBChannelKeys
+
+  #channelKeys?: SBChannelKeys = null // TODO: needs to be loaded
 
   // #channelKeyStrings?: ChannelKeyStrings
 
@@ -449,7 +446,7 @@ export class ChannelServer implements DurableObject {
       this.channelId = channelData.channelId;
       this.channelData = channelData
 
-      if (DEBUG) console.log("++++ Done creating channel:\n", channelData.channelId, '\n', this.channelData)
+      if (DEBUG) console.log("++++ Done initializing channel:\n", this.channelId, '\n', this.channelData)
       if (DEBUG2) console.log(SEP, 'Full DO info\n', this, '\n', SEP)
 
     } catch (error: any) {
@@ -493,6 +490,7 @@ export class ChannelServer implements DurableObject {
 
     // if this object doesn't have it's correct channelId, that means it needs to be initialized
     if (!this.channelId) {
+      if (DEBUG) console.log("**** channel object not initialized ...")
       const channelData = jsonParseWrapper(await (this.storage.get('channelData') as Promise<string>), 'L495') as SBChannelData
         // .catch((error: any) => {
         //   if (DEBUG) console.error("ERROR: failed to get channelId from storage: ", error)
@@ -500,7 +498,7 @@ export class ChannelServer implements DurableObject {
         // });
       if (!channelData || !channelData.channelId) {
         // no channel, no object, no upload, no dice
-        if (DEBUG) console.error('DO not initialized, but channelData is not in KV (?). Here is what we know:\n', channelId, '\n', channelData, '\n', SEP, '\n', this.#describe(), '\n', SEP)
+        if (DEBUG) console.error('Not initialized, but channelData is not in KV (?). Here is what we know:\n', channelId, '\n', channelData, '\n', SEP, '\n', this.#describe(), '\n', SEP)
         return returnError(request, "No such channel, or you are not authorized.", 401);
       }
       // channel exists but object needs reloading
@@ -1434,10 +1432,11 @@ export class ChannelServer implements DurableObject {
   }
 
   async #getChannelKeys(request: Request) {
-    if (this.#channelKeys)
-      return returnError(request, "Channel keys not initialized", 500);
+    if (!this.channelData)
+      return returnError(request, "Channel keys ('ChannelData') not initialized", 500);
     else
-      return returnResult(request, JSON.stringify(this.#channelKeys!.channelData), 200);
+      // return returnResult(request, JSON.stringify(this.#channelKeys!.channelData), 200);
+      return returnResult(request, JSON.stringify(this.channelData), 200);
 
     // const data: any = {};
     // data.ownerKey = this.#channelKeyStrings.ownerKey;
