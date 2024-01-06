@@ -4,6 +4,7 @@
  * this file should be the same between channel and storage server
  */
 
+import { assemblePayload } from 'snackabra';
 import { DEBUG, DEBUG2 } from './env'
 import { NEW_CHANNEL_MINIMUM_BUDGET as _NEW_CHANNEL_MINIMUM_BUDGET } from 'snackabra'
 
@@ -45,9 +46,11 @@ import { NEW_CHANNEL_MINIMUM_BUDGET as _NEW_CHANNEL_MINIMUM_BUDGET } from 'snack
  *     /api/fetchDataMigration/
  *
  *     Channel API (async):
- *     /api/v2/info                 : channel server info
+ *     /api/v2/info                 : channel server info (only API that is json)
  *     /api/v2/getLastMessageTimes  : queries multiple channels for last message timestamp (disabled)
  *
+ *     NOTE: all channel api endpoints are binary (payload)
+ * 
  *     Channel API (synchronous)                : [O] means [Owner] only
  *     /api/v2/channel/<ID>/create              : New: create with storage token
  *     /api/v2/channel/<ID>/websocket           : connect to channel socket (wss protocol)
@@ -115,6 +118,15 @@ export function _sb_assert(val: unknown, msg: string) {
     }
 }
 
+// appends one to the other
+export function _appendBuffer(buffer1: Uint8Array | ArrayBuffer, buffer2: Uint8Array | ArrayBuffer): ArrayBuffer {
+    const tmp = new Uint8Array(buffer1.byteLength + buffer2.byteLength);
+    tmp.set(new Uint8Array(buffer1), 0);
+    tmp.set(new Uint8Array(buffer2), buffer1.byteLength);
+    return tmp.buffer;
+  }
+  
+
 // Reminder of response codes we use:
 //
 // 101: Switching Protocols (downgrade error)
@@ -145,11 +157,23 @@ function _corsHeaders(request: Request, contentType: string) {
     return corsHeaders;
 }
 
-export function returnResult(request: Request, contents: any, status: ResponseCode, delay = 0) {
+export function returnResult(request: Request, contents: any = null, status: ResponseCode = 200, delay = 0) {
+    const corsHeaders = _corsHeaders(request, "application/octet-stream");
+    return new Promise<Response>((resolve) => {
+        setTimeout(() => {
+            if (DEBUG2) console.log("++++ returnResult() contents:", contents, "status:", status)
+            if (contents) contents = assemblePayload(contents);
+            resolve(new Response(contents, { status: status, headers: corsHeaders }));
+        }, delay);
+    });
+}
+
+export function returnResultJson(request: Request, contents: any = null, status: ResponseCode = 200, delay = 0) {
     const corsHeaders = _corsHeaders(request, "application/json; charset=utf-8");
     return new Promise<Response>((resolve) => {
         setTimeout(() => {
             if (DEBUG2) console.log("++++ returnResult() contents:", contents, "status:", status)
+            if (contents) contents = JSON.stringify(contents);
             resolve(new Response(contents, { status: status, headers: corsHeaders }));
         }, delay);
     });
@@ -163,7 +187,7 @@ export function returnBinaryResult(request: Request, payload: BodyInit) {
 export function returnError(_request: Request, errorString: string, status: ResponseCode = 500, delay = 0) {
     if (DEBUG) console.log("**** ERROR: (status: " + status + ")\n" + errorString);
     if (!delay && ((status == 401) || (status == 403))) delay = 50; // delay if auth-related
-    return returnResult(_request, `{ "error": "${errorString}" }`, status);
+    return returnResultJson(_request, `{ "error": "${errorString}" }`, status);
 }
 
 // this handles UNEXPECTED errors
