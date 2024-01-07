@@ -21,6 +21,82 @@ Follow format from [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/
   eg, it will provide the storage server that (always)
   corresponds to any (new) storage requests
 
+- removed blockedMessages code
+
+- all SSO / Admin code removed
+
+- all api calls changed to allow binary or string (json)
+
+- almost all api calls require a body including separately
+  wrapped and signed 'apiBody'
+
+- lock mechanism changed: now essentially more of a firewall
+
+- 'verifiedGuest' concept removed (moving to app layers)
+
+- 'channelKeys' mostly removed; keys are now ChannelData,
+  and strictly speaking only needs Owner public key
+
+- all crypto conversions/formats mostly removed, now
+  use the jslib 'SB384' class
+
+- characteristics like 'motd' remoed (moved to app level)
+
+- added 'ttl' mechanism to messages
+
+- added 'subChannel' concept (look for 'i2')
+
+- now tracking 'motherChannel' throughout
+
+- creating channels can now be done through either 'budd'
+  or an explicit storage token
+
+- 'LEDGER_KEY' concept removed
+
+- 'personalRoom' concept removed
+
+- 'joinRequests' and joining is all removed, a locked
+  channel now will block hard if userId not pre-accepted
+
+- no concept of 'first message' anymore - userId must
+  identify and authenticate on every api call and message
+
+- signing no longer HMAC, now using ECDSA
+
+- any concepts of 'cookies' removed
+
+- 'sendTo' userId now allowed; Owner gets copies
+
+- special case of TTL '0' supported - ephemeral messages
+  that will not be stored
+
+- no global cursor, they are on per-session basis
+
+- several data structures that were clunky arrays
+  are now either Set() or Map()
+
+- added internal cache of SB384 objects matching visitors
+
+- all admin-related api endpoints removed
+
+- no concept of 'owner rotation' - owner controls
+  encryption keys directly above (outside) channel
+
+- well-defined concept of ChannelMessage, with
+  validator, as well as well-defined 'stripped'
+
+- broke out 'env.ts' and 'workers.ts'.  the latter
+  is code that is shared verbatim with storage servers
+
+- much code that was explicit / utils have been
+  removed and is imported from jslib
+
+- channel identifiers are now a32, meaning base62x43
+  (256 bits)
+
+- standardized "you're not allowed to do that" messages
+  to all use the same (ANONYMOUS_CANNOT_CONNECT_MSG)
+
 ## [1.1.0] - 2023-03-01
 
 ### Added
