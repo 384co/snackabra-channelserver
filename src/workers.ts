@@ -187,7 +187,7 @@ export function returnBinaryResult(request: Request, payload: BodyInit) {
 export function returnError(_request: Request, errorString: string, status: ResponseCode = 500, delay = 0) {
     if (DEBUG) console.log("**** ERROR: (status: " + status + ")\n" + errorString);
     if (!delay && ((status == 401) || (status == 403))) delay = 50; // delay if auth-related
-    return returnResultJson(_request, `{ "error": "${errorString}" }`, status);
+    return returnResultJson(_request, { success: false, error: errorString }, status);
 }
 
 // this handles UNEXPECTED errors

@@ -138,7 +138,7 @@ function channelServerInfo(request: Request, env: EnvType) {
   if (!storageUrl) {
     const msg = "ERROR: Could not determine storage server URL"
     console.error(msg)
-    return { error: msg }
+    return { success: false, error: msg }
   }
   var retVal = {
     version: VERSION,
@@ -249,127 +249,6 @@ export class ChannelServer implements DurableObject {
     }
   }
 
-  // // load channel from storage: either it's been descheduled, or it's a new channel
-  // async #initialize(channelId: SBChannelId) {
-  //   try {
-  //     if (DEBUG) console.log(`==== ChannelServer.initialize() called for room: ${channelId} ====`)
-  //     this.channelId = channelId;
-  //     await this.storage.put('channelId', channelId); // in case we're new
-
-  //     const ledgerKeyString = this.env.LEDGER_KEY; _sb_assert(ledgerKeyString, "ERROR: no ledger key found in environment (fatal)")
-
-  //     // ledger is RSA-OAEP so we do not use sbCrypto
-  //     const ledgerKey = await crypto.subtle.importKey("jwk", jsonParseWrapper(ledgerKeyString, 'L217'), { name: "RSA-OAEP", hash: 'SHA-256' }, true, ["encrypt"])
-  //     this.ledgerKey = ledgerKey; // a bit quicker
-
-  //     // // #getKey() needs it
-  //     // this.personalRoom = (await this.#getKey('personalRoom')) == 'false' ? false : true;
-
-  //     // const keyStrings: ChannelKeyStrings = {
-  //     //   ownerKey: await this.#getKey('ownerKey') || '',
-  //     //   encryptionKey: await this.#getKey('encryptionKey') || '',
-  //     //   signKey: await this.#getKey('signKey') || ''
-  //     //   // lock key is on a per-visitor basis
-  //     // }
-  //     // if (DEBUG) console.log("keyStrings: ", keyStrings)
-
-  //     // verify owner key viz room ID
-  //     const ownerKeyJWK: JsonWebKey = jsonParseWrapper(keyStrings.ownerKey, 'L426')
-  //     if (!(await sbCrypto.verifyChannelId(ownerKeyJWK, channelId))) {
-  //       if (DEBUG) {
-  //         console.log("ERROR: owner key does not match room ID (fatal)");
-  //         console.log("ownerKey: ", keyStrings.ownerKey);
-  //         console.log("generated room_id: ", await sbCrypto.sb384Hash(ownerKeyJWK));
-  //         console.log("room_id: ", channelId);
-  //       }
-  //       throw new Error("ERROR: owner key does not match room ID (fatal)");
-  //     }
-
-  //     this.#channelKeyStrings = keyStrings;
-  //     this.#channelKeys = await sbCrypto.channelKeyStringsToCryptoKeys(keyStrings)
-
-  //     this.lastTimestamp = Number(await this.#getKey('lastTimestamp')) || 0;
-  //     this.room_owner_old_format = await this.#getKey('ownerKey');
-  //     this.ownerId = await this.#getKey('ownerId');
-  //     if (this.room_owner_old_format && !this.ownerId) {
-  //       // create the new format
-  //       const _owner = sbCrypto.JWKToSBUserId(jsonParseWrapper(this.room_owner_old_format, 'L436'))
-  //       if (!_owner) {
-  //         throw new Error("ERROR: unable to convert owner key to owner id (fatal)")
-  //       } else {
-  //         this.ownerId = _owner
-  //         await this.storage.put('ownerId', this.ownerId) // upgrade KV
-  //       }
-  //     }
-  //     this.verified_guest = await this.#getKey('guestKey') || '';
-  //     const roomCapacity = await this.#getKey('room_capacity')
-  //     this.room_capacity = roomCapacity === '0' ? 0 : Number(roomCapacity) || 20;
-  //     this.visitors = jsonParseWrapper(await this.#getKey('visitors') || JSON.stringify([]), 'L220');
-  //     this.ownerUnread = Number(await this.#getKey('ownerUnread')) || 0;
-  //     this.locked = (await this.#getKey('locked')) === 'true' ? true : false;
-  //     this.join_requests = jsonParseWrapper(await this.#getKey('join_requests') || JSON.stringify([]), 'L223');
-
-  //     const storageTokenSizeString = await this.storage.get('storageTokenSize')
-  //     const storageTokenSize = storageTokenSizeString ? Number(storageTokenSizeString) : undefined
-
-  //     const storageLimit = Number(await this.#getKey('storageLimit'))
-
-  //     if (storageLimit === Infinity) {
-  //       // if there is no storageLimit, then this is a new room
-  //       const ledgerData = await this.env.LEDGER_NAMESPACE.get(room_id);
-  //       if (ledgerData) {
-  //         // if there's a ledger entry then it's a budded room
-  //         const { size, mother } = jsonParseWrapper(ledgerData, 'L311');
-
-  //         // this.storageLimit = size // hmm
-  //         if (storageTokenSize) {
-  //           this.storageLimit = storageTokenSize
-  //         } else {
-  //           this.storageLimit = 0 // this will actually be topped up in 'upload'
-  //         }
-  //         if (DEBUG2) console.log(`note that size in ledger was ${size}, in case that differs from json`)
-  //         this.motherChannel = mother
-  //         if (DEBUG) console.log(`[initialize] Found storageLimit in ledger: ${this.storageLimit}`)
-  //       } else {
-  //         if (storageTokenSize) {
-  //           this.storageLimit = storageTokenSize
-  //           this.motherChannel = await this.storage.get('motherChannel') || 'unknown';
-  //           if (DEBUG) console.log(`++++ new channel, initializing with storage token (${this.storageLimit / (1024 * 1024)} MiB)`)
-  //         } else {
-  //           this.storageLimit = NEW_CHANNEL_BUDGET;
-  //           this.motherChannel = 'BOOTSTRAP';
-  //           if (DEBUG) console.log(`++++ new channel, no SIZE provided, setting to default (${this.storageLimit / (1024 * 1024)} MiB)`)
-  //         }
-  //       }
-  //       await this.storage.put('motherChannel', this.motherChannel);
-  //       await this.storage.put('storageLimit', this.storageLimit);
-  //     } else {
-  //       this.storageLimit = storageLimit;
-  //       this.motherChannel = await this.#getKey('motherChannel') || 'grandfathered';
-  //     }
-
-  //     this.accepted_requests = jsonParseWrapper(await this.#getKey('accepted_requests') || JSON.stringify([]), 'L224');
-  //     // this.encryptedLockedKeys = jsonParseWrapper(await this.#getKey('encryptedLockedKeys'), 'L467') || [];
-  //     this.encryptedLockedKeys = this.deserializeMap(await this.#getKey('encryptedLockedKeys') || '[]');
-
-  //     // TODO: test refactored lock
-  //     // for (let i = 0; i < this.accepted_requests.length; i++)
-  //     //   // this.lockedKeys[this.accepted_requests[i]] = await storage.get(this.accepted_requests[i]);
-  //     //   this.lockedKeys[this.accepted_requests[i].x!] = await this.storage.get(this.accepted_requests[i]);
-
-  //     // this.motd = await this.#getKey('motd') || '';
-
-  //     if (DEBUG) {
-  //       console.log("Done creating room:")
-  //       console.log("room_id: ", this.room_id)
-  //       if (DEBUG2) console.log(this)
-  //     }
-  //   } catch (error: any) {
-  //     throw new Error(`Failed to initialize channel (${error})`)
-  //   }
-
-  // }
-
   // load channel from storage: either it's been descheduled, or it's a new channel
   async #initialize(channelData: SBChannelData) {
     try {
@@ -407,21 +286,35 @@ export class ChannelServer implements DurableObject {
       const channelId = path[0]
       const apiCall = '/' + path[1]
 
-      try {  
-        if (!(request.method === 'POST' && request.headers.get('content-type') === 'application/octet-stream"' && request.body))
+      try {
+        var _apiBody: ChannelApiBody
+        if (apiCall === '/getChannelKeys') {
+          if (DEBUG) console.log("---- getChannelKeys request (no apiBody)") // only channel api that doesn't require an apiBody
+        } else if (!(request.method === 'POST' && request.headers.get('content-type') === 'application/octet-stream"' && request.body)) {
+          if (DEBUG) {
+            console.log("---- fetch() called, but not POST or no body")
+            console.log(request.method)
+            console.log(request.headers.get('content-type'))
+            console.log(request.body)
+          }
           return returnError(request, "Channel API call yet no body content or malformed body", 400)
-        const apiBody = validate_ChannelApiBody(extractPayload(await request.arrayBuffer())) // will throw if anything wrong
-        if (DEBUG) {
-          console.log(
-            '\n', SEP,
-            '[Durable Object] fetch() called:\n',
-            '  channelId:', channelId, '\n',
-            '    apiCall:', apiCall, '\n',
-            '  full path:', path, '\n',
-            SEP, request.url, '\n', SEP,
-            'apiBody: \n', apiBody, '\n', SEP)
-          if (DEBUG2) console.log(request.headers, '\n', SEP)
+        } else {
+          const ab = await request.arrayBuffer()
+          if (DEBUG) console.log("---- fetch() called, request body:\n", ab)
+          _apiBody = validate_ChannelApiBody(extractPayload(ab)) // will throw if anything wrong
+          if (DEBUG) {
+            console.log(
+              '\n', SEP,
+              '[Durable Object] fetch() called:\n',
+              '  channelId:', channelId, '\n',
+              '    apiCall:', apiCall, '\n',
+              '  full path:', path, '\n',
+              SEP, request.url, '\n', SEP,
+              'apiBody: \n', _apiBody, '\n', SEP)
+            if (DEBUG2) console.log(request.headers, '\n', SEP)
+          }
         }
+        const apiBody = _apiBody!
   
         if (this.channelId && channelId && (this.channelId !== channelId)) return returnError(request, "Internal Error (L478)", 500);
   
@@ -657,7 +550,8 @@ export class ChannelServer implements DurableObject {
         // TODO:all channel messages are verified before we forward
 
         // appending timestamp to channel id. this is global, unique message identifier
-        const key = this.channelId + "_" + ts;
+        // six '_' characters allow for owner to manage subchannels.
+        const key = this.channelId + "______" + ts;
 
         // // TODO: last use of Dictioary :-)
         // const _x: Dictionary<string> = {}
@@ -1087,114 +981,6 @@ export class ChannelServer implements DurableObject {
       throw err
     }
   }
-
-  // async #verifySign(secretKey: CryptoKey, sign: any, contents: string) {
-  //   const _sign = base64ToArrayBuffer(decodeURIComponent(sign));
-  //   const encoder = new TextEncoder();
-  //   const encoded = encoder.encode(contents);
-  //   const verified = await crypto.subtle.verify(
-  //     { name: 'ECDSA', hash: 'SHA-256' },
-  //     secretKey,
-  //     _sign,
-  //     encoded
-  //   );
-  //   return verified;
-  // }
-
-  // async #verifyCookie(request: Request): Promise<boolean> {
-  //   const cookies: any = {};
-  //   request.headers.has('cookie') && request.headers.get('cookie')!.split(';').forEach(function (cookie) {
-  //     const parts = cookie.match(/(.*?)=(.*)$/)
-  //     if (parts && parts.length > 2 && parts[1])
-  //       cookies[parts[1].trim()] = (parts[2] || '').trim();
-  //   });
-  //   if (!cookies.hasOwnProperty('token_' + this.room_id))
-  //     return false;
-  //   const verificationKey = await crypto.subtle.importKey("jwk", jsonParseWrapper(await this.env.KEYS_NAMESPACE.get(this.room_id + '_authorizationKey'), 'L778'), {
-  //     name: "ECDSA",
-  //     namedCurve: "P-384"
-  //   }, false, ['verify']);
-  //   const auth_parts = cookies['token_' + this.room_id].split('.');
-  //   const payload = auth_parts[0];
-  //   const sign = auth_parts[1];
-  //   return (await this.#verifySign(verificationKey, sign, payload + '_' + this.room_id) && ((new Date()).getTime() - parseInt(payload)) < 86400000);
-  // }
-
-  // // this checks if OWNER has signed the request
-  // async #verifyAuthSign(request: Request): Promise<boolean> {
-  //   try {
-  //     if (DEBUG) console.log("==== verifyAuthSign():")
-  //     if (!this.#channelKeys) {
-  //       if (DEBUG) console.log("verifyAuthSign(): no channel keys")
-  //       return false;
-  //     }
-  //     const authHeader = request.headers.get('authorization');
-  //     if (DEBUG) console.log("[verifyAuthSign] authHeader:", authHeader)
-  //     if (!authHeader) {
-  //       if (DEBUG) {
-  //         console.log("verifyAuthSign(): no authorization header")
-  //         console.log("request.headers:", request.headers)
-  //       }
-  //       return false;
-  //     }
-  //     const auth_parts = authHeader.split('.');
-  //     if (DEBUG) console.log("[verifyAuthSign] auth_parts:", auth_parts)
-  //     if (auth_parts.length !== 2 || !auth_parts[0] || !auth_parts[1]) {
-  //       if (DEBUG) console.log("verifyAuthSign(): auth_parts.length !== 2 or missing parts")
-  //       return false;
-  //     }
-  //     if (new Date().getTime() - parseInt(auth_parts[0]) > 60000) {
-  //       if (DEBUG) console.log("verifyAuthSign(): auth token expired")
-  //       return false;
-  //     }
-  //     const sign = auth_parts[1];
-  //     const owner = new SB384(this.#channelKeys!.userPublicKey)
-  //     await owner.ready
-  //     const roomSignKey = this.#channelKeys!.channelPublicKey
-  //     const verificationKey = await crypto.subtle.deriveKey(
-  //       {
-  //         name: "ECDH",
-  //         public: owner.publicKey  // looks like possible issues with cloudflare worker types?
-  //       },
-  //       roomSignKey,
-  //       {
-  //         name: "HMAC",
-  //         hash: "SHA-256",
-  //         length: 256
-  //       },
-  //       false,
-  //       ["verify"]);
-  //     if (DEBUG2) {
-  //       console.log("==== [verifyAuthSign] ====")
-  //       console.log("sign (auth_parts[1]): ", sign)
-  //       console.log("ownerKey            : ", this.#channelKeys!.userPublicKey)
-  //       console.log("roomSignKey         : ", roomSignKey)
-  //       console.log("verificationKey     : ", verificationKey)
-  //       console.log("auth_parts[0]       : ", auth_parts[0])
-  //     }
-  //     const result = await crypto.subtle.verify("HMAC", verificationKey, base64ToArrayBuffer(sign), new TextEncoder().encode(auth_parts[0]));
-  //     if (DEBUG) console.log("[verifyAuthSign] returning: ", result)
-  //     return result
-  //   } catch (err) {
-  //     console.error("[#verifyAuthSign]: ", err)
-  //     throw (err)
-  //   }
-  // }
-
-  // async #verifyAuth(request: Request): Promise<boolean> {
-  //   try {
-  //     return await this.#verifyAuthSign(request) || await this.#verifyCookie(request)
-  //   } catch (e) {
-  //     console.error("[#verifyAuth] Error:", e); 
-  //     throw e
-  //   }
-  // }
-
-  // return (
-  //   await this.#verifyCookie(request).catch((e) => { throw e; }) || 
-  //   await this.#verifyAuthSign(request).catch((e) => { throw e; })
-  //   )
-
 
   #registerDevice(request: Request) {
     return returnError(request, "registerDevice is disabled, use web notifications", 400)
