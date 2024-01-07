@@ -34,7 +34,7 @@ if (DEBUG2) console.log("++++ DEBUG2 (verbose) enabled ++++")
 
 import type { SBChannelId, ChannelAdminData, SBUserId, SBChannelData, ChannelApiBody } from 'snackabra';
 import { SB384, arrayBufferToBase64, jsonParseWrapper, 
-  version, validate_ChannelApiBody, validate_ChannelMessage } from 'snackabra';
+  version, validate_ChannelApiBody, validate_ChannelMessage, validate_SBChannelData } from 'snackabra';
 import { SBUserPublicKey } from 'snackabra'
 // const sbCrypto = new SBCrypto()
 
@@ -286,6 +286,8 @@ export class ChannelServer implements DurableObject {
       const channelId = path[0]
       const apiCall = '/' + path[1]
 
+      const requestClone = request.clone()
+
       try {
         var _apiBody: ChannelApiBody
         if (apiCall === '/getChannelKeys') {
@@ -301,7 +303,7 @@ export class ChannelServer implements DurableObject {
         } else {
           const ab = await request.arrayBuffer()
           if (DEBUG) console.log("---- fetch() called, request body:\n", ab)
-          _apiBody = validate_ChannelApiBody(extractPayload(ab)) // will throw if anything wrong
+          _apiBody = validate_ChannelApiBody(extractPayload(ab).payload) // will throw if anything wrong
           if (DEBUG) {
             console.log(
               '\n', SEP,
@@ -321,7 +323,7 @@ export class ChannelServer implements DurableObject {
         if (apiCall === '/create') {
           if (this.channelId) return returnError(request, `ERROR: channel already exists (asked to create '${channelId}')`, 400);
           if (DEBUG) console.log('\n', SEP, '\n', 'NEW CHANNEL ... creating ...')
-          const ret = await this.#createChannel(request.clone());
+          const ret = await this.#createChannel(requestClone, apiBody);
           if (DEBUG) console.log('.... created\n', SEP)
           if (ret) return ret; // if there was an error, return it, otherwise it was successful
           return returnResultJson(request, { success: true }, 200);
@@ -512,7 +514,7 @@ export class ChannelServer implements DurableObject {
         if (typeof msg.data === "string") {
           message = jsonParseWrapper(msg.data.toString(), 'L594');
         } else if (msg.data instanceof ArrayBuffer) {
-          message = extractPayload(msg.data)
+          message = extractPayload(msg.data).payload
         } else {
           throw new Error("Cannot parse contents type (not json nor arraybuffer)")
         }
@@ -691,7 +693,7 @@ export class ChannelServer implements DurableObject {
 
   async #acceptVisitor(request: Request, apiBody: ChannelApiBody) {
     _sb_assert(apiBody.apiPayload, "acceptVisitor(): need to provide userId")
-    const data = extractPayload(apiBody.apiPayload!)
+    const data = extractPayload(apiBody.apiPayload!).payload
     if (data && data.userId && typeof data.userId === 'string') {
       if (!this.accepted.has(data.userId)) {
         if (this.accepted.size >= this.channelCapacity)
@@ -758,8 +760,8 @@ export class ChannelServer implements DurableObject {
   //   return returnResult(request, JSON.stringify({ motd: this.motd }), 200);
   // }
 
-  serializeMap = (map: Map<string, string>): string => JSON.stringify(Array.from(map.entries()))
-  deserializeMap = (jsonStr: string): Map<string, string> => new Map(JSON.parse(jsonStr));
+  // serializeMap = (map: Map<string, string>): string => JSON.stringify(Array.from(map.entries()))
+  // deserializeMap = (jsonStr: string): Map<string, string> => new Map(JSON.parse(jsonStr));
 
   // // TODO: we do not allow owner key rotations at the moment, but we need to add
   // // regular key rotation(s), so keeping this as template code
@@ -994,7 +996,7 @@ export class ChannelServer implements DurableObject {
       return;
     }
     if (DEBUG) console.log("Sending web notification", message)
-    message = JSON.parse(message)
+    message = jsonParseWrapper(message, 'L999')
     // if (message?.type === 'ack') return
 
     const date = new Date();
@@ -1079,23 +1081,26 @@ export class ChannelServer implements DurableObject {
   // }
 
 
-  async #createChannel(request: Request): Promise<Response | null> {
+  async #createChannel(request: Request, apiBody: ChannelApiBody): Promise<Response | null> {
     // request cloning is done by callee
-    const url = new URL(request.url);
 
-    const path = url.pathname.slice(1).split('/');
-    if (!path || path.length === 0) return returnError(request, "Invalid path, missing new channel ID", 400);
-    const newChannelId = path[0]; _sb_assert(newChannelId, "ERROR: no new channel ID");
+    // const url = new URL(request.url);
+    // const path = url.pathname.slice(1).split('/');
+    // if (!path || path.length === 0) return returnError(request, "Invalid path, missing new channel ID", 400);
+    // const newChannelId = path[0]; _sb_assert(newChannelId, "ERROR: no new channel ID");
+    // const jsonString = new TextDecoder().decode(await request.arrayBuffer());
+    // if (DEBUG) {
+    //   console.log(`==== createChannel(${newChannelId}) ====`)
+    //   console.log(jsonString)
+    //   console.log("========================================")
+    // }
+    // const _cd: SBChannelData = jsonParseWrapper(jsonString, 'L1303')
+    // _sb_assert(_cd.channelId && _cd.ownerPublicKey && _cd.storageToken, "ERROR: invalid channel data")
 
-    const jsonString = new TextDecoder().decode(await request.arrayBuffer());
-    if (DEBUG) {
-      console.log(`==== createChannel(${newChannelId}) ====`)
-      console.log(jsonString)
-      console.log("========================================")
-    }
-
-    const _cd: SBChannelData = jsonParseWrapper(jsonString, 'L1303')
-    _sb_assert(_cd.channelId && _cd.ownerPublicKey && _cd.storageToken, "ERROR: invalid channel data")
+    var _cd: SBChannelData = extractPayload(apiBody.apiPayload!).payload
+    _cd = validate_SBChannelData(_cd) // will throw if anything wrong
+    _sb_assert(_cd.storageToken, "[createChannel()] storageToken missing")
+    const newChannelId = _cd.channelId
 
     const _storage_token_hash = await this.env.LEDGER_NAMESPACE.get(_cd.storageToken!);
     const _ledger_resp = _storage_token_hash ? jsonParseWrapper(_storage_token_hash, 'L1307') : null;
