@@ -144,6 +144,7 @@ export function _appendBuffer(buffer1: Uint8Array | ArrayBuffer, buffer2: Uint8A
 // 507: Insufficient Storage (WebDAV/RFC4918)
 //
 export type ResponseCode = 101 | 200 | 400 | 401 | 403 | 404 | 405 | 413 | 418 | 429 | 500 | 501 | 507;
+const SEP = '='.repeat(60) + '\n'
 
 function _corsHeaders(request: Request, contentType: string) {
     const corsHeaders = {
@@ -168,15 +169,22 @@ export function returnResult(request: Request, contents: any = null, status: Res
     });
 }
 
-export function returnResultJson(request: Request, contents: any = null, status: ResponseCode = 200, delay = 0) {
+export function returnResultJson(request: Request, contents: any, status: ResponseCode = 200, delay = 0) {
     const corsHeaders = _corsHeaders(request, "application/json; charset=utf-8");
     return new Promise<Response>((resolve) => {
         setTimeout(() => {
-            if (DEBUG2) console.log("++++ returnResult() contents:", contents, "status:", status)
-            if (contents) contents = JSON.stringify(contents);
-            resolve(new Response(contents, { status: status, headers: corsHeaders }));
+            const json = JSON.stringify(contents);
+            if (DEBUG) console.log(
+                SEP, `++++ returnResult() - status '${status}':\n`,
+                SEP, 'contents:\n', contents, '\n',
+                SEP, 'json:\n', json, '\n', SEP)
+            resolve(new Response(json, { status: status, headers: corsHeaders }));
         }, delay);
     });
+}
+
+export function returnSuccess(request: Request) {
+    return returnResultJson(request, { success: true });
 }
 
 export function returnBinaryResult(request: Request, payload: BodyInit) {
@@ -195,7 +203,6 @@ export async function handleErrors(request: Request, func: () => Promise<Respons
     try {
         return await func();
     } catch (err: any) {
-        if (DEBUG) console.log("**** ERROR: (status: 500)\n", err.stack);
         if (err instanceof Error) {
             if (request.headers.get("Upgrade") == "websocket") {
                 const [_client, server] = Object.values(new WebSocketPair());
