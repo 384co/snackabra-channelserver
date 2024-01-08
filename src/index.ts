@@ -263,163 +263,180 @@ export class ChannelServer implements DurableObject {
 
   // this is the fetch picked up by the Durable Object
   async fetch(request: Request) {
-    return await handleErrors(request, async () => {
-      const url = new URL(request.url);
-      const path = url.pathname.slice(1).split('/');
-      // sanity check, this should always be the channel ID
-      if (!path || path.length < 2)
-        return returnError(request, "ERROR: invalid API (should be '/api/v2/channel/<channelId>/<api>')", 400);
-      const channelId = path[0]
-      const apiCall = '/' + path[1]
+    const url = new URL(request.url);
+    const path = url.pathname.slice(1).split('/');
+    // sanity check, this should always be the channel ID
+    if (!path || path.length < 2)
+      return returnError(request, "ERROR: invalid API (should be '/api/v2/channel/<channelId>/<api>')", 400);
+    const channelId = path[0]
+    const apiCall = '/' + path[1]
+    try {
+      console.log("111111 ==== ChannelServer.fetch() ==== phase ONE ==== 111111")
       const requestClone = request.clone(); // todo: might not be needed to be fully cloned here
-      try {
-        var _apiBody: ChannelApiBody
-        const contentType = request.headers.get('content-type')
-        if (!(request.method === 'POST' && contentType && request.body)) {
-          if (DEBUG) {
-            console.log("---- fetch() called, but not 'POST' and/or no body")
-            console.log(request.method)
-            console.log(contentType)
-            console.log(request.body)
-          }
-          return returnError(request, "Channel API call yet no body content or malformed body", 400)
+      var _apiBody: ChannelApiBody
+      const contentType = request.headers.get('content-type')
+      if (!(request.method === 'POST' && contentType && request.body)) {
+        if (DEBUG) {
+          console.log("---- fetch() called, but not 'POST' and/or no body")
+          console.log(request.method)
+          console.log(contentType)
+          console.log(request.body)
+        }
+        return returnError(request, "Channel API call yet no body content or malformed body", 400)
+      } else {
+        // we accept json or binary
+        if (contentType.indexOf("application/json") !== -1) {
+          _apiBody = jsonParseWrapper(await request.json(), "L289");
+        } else if (contentType.indexOf("application/octet-stream") !== -1) {
+          const ab = await request.arrayBuffer()
+          _apiBody = extractPayload(ab).payload
         } else {
-          // we accept json or binary
-          if (contentType.indexOf("application/json") !== -1) {
-            _apiBody = jsonParseWrapper(await request.json(), "L289");
-          } else if (contentType.indexOf("application/octet-stream") !== -1) {
-            const ab = await request.arrayBuffer()
-            _apiBody = extractPayload(ab).payload
-          } else {
-            return returnError(request, `Channel API call but do not understand content type ${contentType}`, 400)
-          }
-          _apiBody = validate_ChannelApiBody(_apiBody) // will throw if anything wrong
-          if (DEBUG) {
-            console.log(
-              SEP,
-              '[Durable Object] fetch() called:\n',
-              '  channelId:', channelId, '\n',
-              '    apiCall:', apiCall, '\n',
-              '  full path:', path, '\n',
-              SEP, request.url, '\n', SEP,
-              'apiBody: \n', _apiBody, '\n', SEP)
-            if (DEBUG2) console.log(request.headers, '\n', SEP)
-          }
+          return returnError(request, `Channel API call but do not understand content type ${contentType}`, 400)
         }
-        const apiBody = _apiBody!
-  
-        if (this.channelId && channelId && (this.channelId !== channelId)) return returnError(request, "Internal Error (L478)", 500);
-  
-        if (apiCall === '/create') {
-          if (this.channelId) return returnError(request, `ERROR: channel already exists (asked to create '${channelId}')`, 400);
-          if (DEBUG) console.log('\n', SEP, '\n', 'NEW CHANNEL ... creating ...')
-          const ret = await this.#createChannel(requestClone, apiBody);
-          if (DEBUG) console.log('.... created\n', SEP)
-          if (ret) return ret; // if there was an error, return it, otherwise it was successful
-          else return returnResultJson(request, { success: true });
+        _apiBody = validate_ChannelApiBody(_apiBody) // will throw if anything wrong
+        if (DEBUG) {
+          console.log(
+            SEP,
+            '[Durable Object] fetch() called:\n',
+            '  channelId:', channelId, '\n',
+            '    apiCall:', apiCall, '\n',
+            '  full path:', path, '\n',
+            SEP, request.url, '\n', SEP,
+            'apiBody: \n', _apiBody, '\n', SEP)
+          if (DEBUG2) console.log(request.headers, '\n', SEP)
         }
-  
-        // if this object doesn't have it's correct channelId, that means it needs to be initialized
-        if (!this.channelId) {
-          if (DEBUG) console.log("**** channel object not initialized ...")
-          const channelData = jsonParseWrapper(await (this.storage.get('channelData') as Promise<string>), 'L495') as SBChannelData
-          if (!channelData || !channelData.channelId) {
-            // no channel, no object, no upload, no dice
-            if (DEBUG) console.error('Not initialized, but channelData is not in KV (?). Here is what we know:\n', channelId, '\n', channelData, '\n', SEP, '\n', this.#describe(), '\n', SEP)
-            return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
-          }
-          // channel exists but object needs reloading
-          if (channelId !== channelData.channelId) {
-            if (DEBUG) console.log("**** channelId mismatch:\n", channelId, "\n", channelData);
-            return returnError(request, "Internal Error (L327)", 500);
-          }
-          // bootstrap from storage
-          await this
-            .#initialize(channelData) // it will throw an error if there's an issue
-            .catch(() => { return returnError(request, `Internal Error (L332)`, 500); });
-        }
-  
-        if (this.channelId !== path[0])
-          return returnError(request, "ERROR: channelId mismatch (?) [L454]", 500);
-
-        // if we're locked, and this is not an owner call, then we need to check if the visitor is accepted
-        if (this.locked && !apiBody.isOwner && !this.accepted.has(apiBody.userId))
-          return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
-
-        // if it's not locked, we keep track of visitors
-        if (!this.locked && !this.visitors.has(apiBody.userId)) {
-          // new visitor
-          if (!apiBody.userPublicKey)
-            return returnError(request, "Need your userPublicKey on this (or prior) operation/message ...", 401);
-          if (this.visitors.size >= this.channelCapacity) {
-            if (DEBUG) console.log(`---- channel ${this.channelId} full, rejecting new visitor ${apiBody.userId}`)
-            return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
-          }
-          this.visitors.set(apiBody.userId, apiBody.userPublicKey)
-          await this.storage.put('visitors', assemblePayload(this.visitors))
-          this.visitorKeys.set(apiBody.userId, await (new SB384(apiBody.userPublicKey).ready))
-        }
-
-        // check signature, check for owner status
-        // const sender = await (new SB384(apiBody.userPublicKey).ready)
-        const sender = this.visitorKeys.get(apiBody.userId)!
-        _sb_assert(sender, "Internal Error [L483]")
-        _sb_assert(apiBody.userId === sender.userId, "Internal Error [L484]")
-
-        const viewBuf = new ArrayBuffer(8);
-        const view = new DataView(viewBuf);
-        view.setFloat64(0, apiBody.timestamp);
-        const pathAsArrayBuffer = new TextEncoder().encode(apiBody.path).buffer
-        const prefixBuf = _appendBuffer(viewBuf, pathAsArrayBuffer)
-        const apiPayloadBuf = apiBody.apiPayload
-        // verification covers timestamp + path + apiPayload
-        const verified = await sbCrypto.verify(sender.publicKey, apiBody.sign, apiPayloadBuf ? _appendBuffer(prefixBuf, apiPayloadBuf) : prefixBuf)
-        if (!verified) {
-          if (DEBUG) {
-            console.error("ERROR: signature verification failed")
-            console.log("apiBody:\n", apiBody)
-          }
-          return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
-        }
-        apiBody.isOwner = this.channelId === sender.ownerChannelId
-
-        // ToDo: verify that the 'embeded' path is same as path coming through in request
-      
-        if (apiCall === "/websocket") {
-          if (DEBUG) console.log("---- websocket request")
-          if (request.headers.get("Upgrade") != "websocket") {
-            if (DEBUG) console.log("---- websocket request, but not websocket (error)")
-            return returnError(request, "Expected websocket", 400);
-          }
-          const ip = request.headers.get("CF-Connecting-IP");
-          const pair = new WebSocketPair(); // that's CF websocket pair
-          if (DEBUG) console.log("---- websocket request, creating session")
-          await this.#setUpNewSession(pair[1], ip, apiBody); // we use one ourselves
-          if (DEBUG) console.log("---- websocket request, returning session")
-          return new Response(null, { status: 101, webSocket: pair[0] }); // we return the other to the client
-        } else if (this.ownerCalls[apiCall]) {
-          if (!apiBody.isOwner) {
-            if (DEBUG) console.log("---- owner call, but not owner (error)");
-            return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
-          }
-          try {
-            const result = await this.ownerCalls[apiCall]!(request, apiBody);
-            if (DEBUG) console.log("owner call succeeded")
-            return result
-          } catch (error: any) {
-            console.log("ERROR: owner call failed: ", error)
-            return returnError(request, `API ERROR [${apiCall}]: ${error.message} \n ${error.stack}`, 500);
-          }
-        } else if (this.visitorCalls[apiCall]) {
-
-          return await this.visitorCalls[apiCall]!(request, apiBody);
-        } else {
-          return returnError(request, "API endpoint not found: " + apiCall, 404)
-        }
-      } catch (error: any) {
-        return returnError(request, `API ERROR [${apiCall}]: ${error.message} \n ${error.stack}`, 500);
       }
-    });
+
+      console.log("222222 ==== ChannelServer.fetch() ==== phase TWO ==== 222222")
+      
+      const apiBody = _apiBody!
+
+      if (this.channelId && channelId && (this.channelId !== channelId)) return returnError(request, "Internal Error (L478)", 500);
+
+      if (apiCall === '/create') {
+        if (this.channelId) return returnError(request, `ERROR: channel already exists (asked to create '${channelId}')`, 400);
+        if (DEBUG) console.log('\n', SEP, '\n', 'NEW CHANNEL ... creating ...')
+        const ret = await this.#createChannel(requestClone, apiBody);
+        if (DEBUG) console.log('.... created\n', SEP)
+        if (ret) return ret; // if there was an error, return it, otherwise it was successful
+        else return returnResultJson(request, { success: true });
+      }
+
+      console.log("333333 ==== ChannelServer.fetch() ==== phase THREE ==== 333333")
+
+      // if this object doesn't have it's correct channelId, that means it needs to be initialized
+      if (!this.channelId) {
+        if (DEBUG) console.log("**** channel object not initialized ...")
+        const channelData = jsonParseWrapper(await (this.storage.get('channelData') as Promise<string>), 'L495') as SBChannelData
+        if (!channelData || !channelData.channelId) {
+          // no channel, no object, no upload, no dice
+          if (DEBUG) console.error('Not initialized, but channelData is not in KV (?). Here is what we know:\n', channelId, '\n', channelData, '\n', SEP, '\n', this.#describe(), '\n', SEP)
+          return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
+        }
+        // channel exists but object needs reloading
+        if (channelId !== channelData.channelId) {
+          if (DEBUG) console.log("**** channelId mismatch:\n", channelId, "\n", channelData);
+          return returnError(request, "Internal Error (L327)", 500);
+        }
+        // bootstrap from storage
+        await this
+          .#initialize(channelData) // it will throw an error if there's an issue
+          .catch(() => { return returnError(request, `Internal Error (L332)`, 500); });
+      }
+
+      console.log("444444 ==== ChannelServer.fetch() ==== phase FOUR ==== 444444")
+
+      if (this.channelId !== path[0])
+        return returnError(request, "ERROR: channelId mismatch (?) [L454]", 500);
+
+      // if we're locked, and this is not an owner call, then we need to check if the visitor is accepted
+      if (this.locked && !apiBody.isOwner && !this.accepted.has(apiBody.userId))
+        return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
+
+      // if it's not locked, we keep track of visitors
+      if (!this.locked && !this.visitors.has(apiBody.userId)) {
+        // new visitor
+        if (!apiBody.userPublicKey)
+          return returnError(request, "Need your userPublicKey on this (or prior) operation/message ...", 401);
+        if (this.visitors.size >= this.channelCapacity) {
+          if (DEBUG) console.log(`---- channel ${this.channelId} full, rejecting new visitor ${apiBody.userId}`)
+          return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
+        }
+        this.visitors.set(apiBody.userId, apiBody.userPublicKey)
+        await this.storage.put('visitors', assemblePayload(this.visitors))
+        this.visitorKeys.set(apiBody.userId, await (new SB384(apiBody.userPublicKey).ready))
+      }
+
+      console.log("555555 ==== ChannelServer.fetch() ==== phase FIVE ==== 555555")
+
+      // check signature, check for owner status
+      // const sender = await (new SB384(apiBody.userPublicKey).ready)
+      const sender = this.visitorKeys.get(apiBody.userId)!
+      _sb_assert(sender, "Internal Error [L483]")
+      _sb_assert(apiBody.userId === sender.userId, "Internal Error [L484]")
+
+      const viewBuf = new ArrayBuffer(8);
+      const view = new DataView(viewBuf);
+      view.setFloat64(0, apiBody.timestamp);
+      const pathAsArrayBuffer = new TextEncoder().encode(apiBody.path).buffer
+      const prefixBuf = _appendBuffer(viewBuf, pathAsArrayBuffer)
+      const apiPayloadBuf = apiBody.apiPayload
+
+      
+      // verification covers timestamp + path + apiPayload
+      const verified = await sbCrypto.verify(sender.signKey, apiBody.sign, apiPayloadBuf ? _appendBuffer(prefixBuf, apiPayloadBuf) : prefixBuf)
+      if (!verified) {
+        if (DEBUG) {
+          console.error("ERROR: signature verification failed")
+          console.log("apiBody:\n", apiBody)
+        }
+        return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
+      }
+      apiBody.isOwner = this.channelId === sender.ownerChannelId
+
+      console.log("666666 ==== ChannelServer.fetch() ==== phase SIX ==== 666666")
+
+      // ToDo: verify that the 'embeded' path is same as path coming through in request
+    
+      if (apiCall === "/websocket") {
+        console.log("==== ChannelServer.fetch() ==== websocket request ====")
+        if (DEBUG) console.log("---- websocket request")
+        if (request.headers.get("Upgrade") != "websocket") {
+          if (DEBUG) console.log("---- websocket request, but not websocket (error)")
+          return returnError(request, "Expected websocket", 400);
+        }
+        const ip = request.headers.get("CF-Connecting-IP");
+        const pair = new WebSocketPair(); // that's CF websocket pair
+        if (DEBUG) console.log("---- websocket request, creating session")
+        await this.#setUpNewSession(pair[1], ip, apiBody); // we use one ourselves
+        if (DEBUG) console.log("---- websocket request, returning session")
+        return new Response(null, { status: 101, webSocket: pair[0] }); // we return the other to the client
+      } else if (this.ownerCalls[apiCall]) {
+        console.log("==== ChannelServer.fetch() ==== owner call ====")
+        if (!apiBody.isOwner) {
+          if (DEBUG) console.log("---- owner call, but not owner (error)");
+          return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
+        }
+        try {
+          const result = await this.ownerCalls[apiCall]!(request, apiBody);
+          if (DEBUG) console.log("owner call succeeded")
+          return result
+        } catch (error: any) {
+          console.log("ERROR: owner call failed: ", error)
+          console.log(error.stack)
+          return returnError(request, `API ERROR [L410] [${apiCall}]: ${error.message} \n ${error.stack}`, 500);
+        }
+      } else if (this.visitorCalls[apiCall]) {
+        console.log("==== ChannelServer.fetch() ==== owner call ====")
+        return await this.visitorCalls[apiCall]!(request, apiBody);
+      } else {
+        return returnError(request, "API endpoint not found: " + apiCall, 404)
+      }
+    } catch (error: any) {
+      console.trace("ERROR: failed to initialize channel", error)
+      console.log(error.stack)
+      return returnError(request, `API ERROR [L421] [${apiCall}]: ${error.message} \n ${error.stack}`, 500);
+    }
   }
 
   // fetch most recent messages from local (worker) KV
@@ -703,16 +720,21 @@ export class ChannelServer implements DurableObject {
     this.storageLimit = storageLimit - size;
     this.storage.put('storageLimit', this.storageLimit); // here we've consumed it
     const token = arrayBufferToBase64(crypto.getRandomValues(new Uint8Array(48)).buffer);
-    await this.env.LEDGER_NAMESPACE.put(token,
-      JSON.stringify(
-        {
-          used: false,
-          size: size,
-          motherChannel: this.channelId,
-          created: Date.now()
-        }
-      ));
-    if (DEBUG) console.log(`[newStorage()]: Created new storage token (${token.slice(0, 12)}...) for ${size} bytes`);
+    const tokenData = JSON.stringify(
+      {
+        used: false,
+        size: size,
+        motherChannel: this.channelId,
+        created: Date.now()
+      }
+    )
+    await this.env.LEDGER_NAMESPACE.put(token, tokenData);
+    if (DEBUG)
+      console.log(`[newStorage()]: Created new storage token for ${size} bytes\n`,
+        '  token:', token, '\n',
+        '  tokenData:', tokenData, '\n',
+        '  new mother storage limit:', this.storageLimit, '\n',
+        '  ledger entry:', await this.env.LEDGER_NAMESPACE.get(token));
     return returnResult(request, JSON.stringify(token), 200);
   }
 
@@ -964,7 +986,9 @@ export class ChannelServer implements DurableObject {
       console.warn('No mother channel')
     }
     _ledger_resp.used = true;
-    await this.env.LEDGER_NAMESPACE.put(_cd.storageToken!, JSON.stringify(_ledger_resp)) // now token is spent
+    const newLedgerEntry = JSON.stringify(_ledger_resp)
+    await this.env.LEDGER_NAMESPACE.put(_cd.storageToken!, newLedgerEntry) // now token is spent
+    if (DEBUG) console.log(`++++ createChannel() from token: ledger entry (${_cd.storageToken}) updated to:\n`, newLedgerEntry)
     await this.storage.put('storageLimit', storageTokenSize); // and now new channel can spend it
     if (DEBUG) console.log("++++ createChannel() from token: starting size: ", storageTokenSize)
 
