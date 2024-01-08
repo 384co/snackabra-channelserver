@@ -918,13 +918,25 @@ export class ChannelServer implements DurableObject {
 
     var _cd: SBChannelData = extractPayload(apiBody.apiPayload!).payload
     _cd = validate_SBChannelData(_cd) // will throw if anything wrong
-    _sb_assert(_cd.storageToken, "[createChannel()] storageToken missing")
+    _sb_assert(_cd.storageToken, "[createChannel()] storageToken missing in API call")
     const newChannelId = _cd.channelId
 
+    // note: any issues involving tokens will not be provided detailed client 'debug' info
+    // todo: once this working, simplify the below
     const _storage_token_hash = await this.env.LEDGER_NAMESPACE.get(_cd.storageToken!);
+    if (!_storage_token_hash) {
+      if(DEBUG) console.log(`ERROR **** Token '${_cd.storageToken}' not found`)
+      return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
+    }
     const _ledger_resp = _storage_token_hash ? jsonParseWrapper(_storage_token_hash, 'L1307') : null;
-    if (!_ledger_resp) return returnError(request, `Having issues processing storage token ${_cd.storageToken}, got '${_storage_token_hash}'`, 507);
-    if (_ledger_resp.used) return returnError(request, "Storage token already used", 507);
+    if (!_ledger_resp) {
+      console.error(`ERROR **** Having issues processing storage token '${_cd.storageToken}'\n`, _storage_token_hash)
+      return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
+    }
+    if (_ledger_resp.used) {
+      if (DEBUG) console.log(`ERROR **** Token '${_cd.storageToken}' already used\n`, _ledger_resp)
+      return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
+    }
     if (DEBUG) console.log("++++ createChannel() from token: ledger response: ", _ledger_resp)
 
     const owner = new SB384(_cd.ownerPublicKey)
