@@ -231,9 +231,17 @@ export class ChannelServer implements DurableObject {
       if (DEBUG) console.log(`==== ChannelServer.initialize() called for channel: ${channelData.channelId} ====`)
 
       const channelState = await this.storage.get(['channelId', 'channelData', 'motherChannel', 'storageLimit', 'channelCapacity', 'lastTimestamp', 'visitors', 'locked'])
+      const storedChannelData = jsonParseWrapper(channelState.get('channelData') as string, 'L234') as SBChannelData
       
-      if (!channelState || !channelState.has('channelId') || channelState.get('channelId') !== channelData.channelId)
-        throw new Error('Internal Error (L258)')
+      if (!channelState || !storedChannelData || !storedChannelData.channelId || storedChannelData.channelId !== channelData.channelId) {
+        if (DEBUG) {
+          console.log('ERROR: data missing or not matching:')
+          console.log('channelState:\n', channelState)
+          console.log('storedChannelData:\n', storedChannelData)
+          console.log('channelData:\n', channelData)
+        }
+        throw new Error('Internal Error [L236]')
+      }
 
       this.storageLimit = Number(channelState.get('storageLimit')) || 0
       this.channelCapacity = Number(channelState.get('channelCapacity')) || 20
@@ -247,8 +255,9 @@ export class ChannelServer implements DurableObject {
       if (DEBUG) console.log("++++ Done initializing channel:\n", this.channelId, '\n', this.channelData)
       if (DEBUG2) console.log(SEP, 'Full DO info\n', this, '\n', SEP)
     } catch (error: any) {
-      if (DEBUG) console.error(`Failed to initialize channel (${error})`)
-      throw new Error(`Failed to initialize channel (${error})`)
+      const msg = `ERROR failed to initialize channel [L250]: ${error.message}`
+      if (DEBUG) console.error(msg)
+      throw new Error(msg)
     }
   }
 
@@ -265,18 +274,26 @@ export class ChannelServer implements DurableObject {
       const requestClone = request.clone(); // todo: might not be needed to be fully cloned here
       try {
         var _apiBody: ChannelApiBody
-        if (!(request.method === 'POST' && request.headers.get('content-type') === 'application/octet-stream"' && request.body)) {
+        const contentType = request.headers.get('content-type')
+        if (!(request.method === 'POST' && contentType && request.body)) {
           if (DEBUG) {
             console.log("---- fetch() called, but not 'POST' and/or no body")
             console.log(request.method)
-            console.log(request.headers.get('content-type'))
+            console.log(contentType)
             console.log(request.body)
           }
           return returnError(request, "Channel API call yet no body content or malformed body", 400)
         } else {
-          const ab = await request.arrayBuffer()
-          if (DEBUG2) console.log("---- fetch() called, request body:\n", ab)
-          _apiBody = validate_ChannelApiBody(extractPayload(ab).payload) // will throw if anything wrong
+          // we accept json or binary
+          if (contentType.indexOf("application/json") !== -1) {
+            _apiBody = jsonParseWrapper(await request.json(), "L289");
+          } else if (contentType.indexOf("application/octet-stream") !== -1) {
+            const ab = await request.arrayBuffer()
+            _apiBody = extractPayload(ab).payload
+          } else {
+            return returnError(request, `Channel API call but do not understand content type ${contentType}`, 400)
+          }
+          _apiBody = validate_ChannelApiBody(_apiBody) // will throw if anything wrong
           if (DEBUG) {
             console.log(
               SEP,
@@ -488,9 +505,10 @@ export class ChannelServer implements DurableObject {
 
         if (message.ready) {
           // the client sends a "ready" message when it can start receiving, we fire off latest messages right awy
-          if (DEBUG) console.log("got ready message from client")
-          const latest100 = assemblePayload(await this.#getRecentMessages())!; _sb_assert(latest100, "Internal Error [L548]");
-          webSocket.send(latest100); // ToDo: no, we don't do this
+          if (DEBUG) console.log("got 'ready' message from client")
+          session.ready = true;
+          // const latest100 = assemblePayload(await this.#getRecentMessages())!; _sb_assert(latest100, "Internal Error [L548]");
+          // webSocket.send(latest100); // ToDo: no, we don't do this
           return;
         }
 
@@ -508,7 +526,7 @@ export class ChannelServer implements DurableObject {
           webSocket.send(JSON.stringify({ error: "Only Owner can set subchannel. Discarding message." }));
           return
         } else if (!message.i2) {
-          message.i2 = '____' // this is stripped later but it's convenient
+          message.i2 = '____' // default; use to keep track of where we're at in processing
         }
 
         // Time stamps are monotonically increasing. We enforce that they must be different.
@@ -523,31 +541,44 @@ export class ChannelServer implements DurableObject {
         // appending timestamp to channel id. this is global, unique message identifier
         const key = this.channelId + '_' + message.i2 + '_' + ts;
 
-        // // TODO: last use of Dictioary :-)
-        // const _x: Dictionary<string> = {}
-        // _x[key] = msgData;
-        // // We don't block on any of these: (ASYNC)
-        // // Here is the main workhorse ... actually send the message to every listener
-        // this.#broadcast(JSON.stringify(_x))
-        this.#broadcast(assemblePayload(new Map([[key, msg.data]]))!) // TODO: no not this
+        // TODO: sync TTL with 'i2'
+        var i2Key: string | null = null
+        if (message.ttl && message.ttl > 0 && message.ttl < 0xF) {
+          if (message.i2[3] === '_') {
+            // if there's a TTL, you can't have a subchannel using last character, this is an error
+            if (DEBUG) console.error("ERROR: subchannel cannot be used with TTL")
+            webSocket.send(JSON.stringify({ error: "Subchannel cannot be used with TTL. Discarding message." }));
+            return
+          } else {
+            // ttl is a digit 1-9, we append that to the i2 centerpiece
+            i2Key = this.channelId + '_' + message.i2.slice(0, 3) + message.ttl + '_' + ts;
+          }
+        }
 
-        // before sending and storing, we strip it down
-        message = this.#stripChannelMessage(message)
+        // we make sure any message has been stored properly before we broadcast it
 
-        // const msgData = assemblePayload(new Map([[key, message]]))!; _sb_assert(msgData, "Internal Error [L570]");
+        // strip it and package it
+        const messagePayload = assemblePayload(new Map([[key, assemblePayload(this.#stripChannelMessage(message))]]))!
 
         // ToDo: deduct storage from channel budget for message
-        //       and user budget as well. use sizeOf(msgData) as base
+        //       and user budget as well. use sizeOf(messagePayload) as base (and adjust down for TTL)
 
-        // storage into various KV depends on TTL
-        if (message.ttl && message.ttl !== 0) {
-        }          
-
-        // this.#broadcast(msgData)
-        
         // and store it for posterity both local and global KV
-        this.storage.put(key, msg.data); // we wait for local to succeed before global
-        this.env.MESSAGES_NAMESPACE.put(key, msg.data);
+        await this.storage.put(key, messagePayload); // we wait for local to succeed before global
+        await this.env.MESSAGES_NAMESPACE.put(key, messagePayload); // now make sure it's in global
+
+        if (i2Key) {
+          // we don't block on these (TTLs have slightly lower expected SLA)
+          this.storage.put(i2Key, messagePayload);
+          this.env.MESSAGES_NAMESPACE.put(i2Key, messagePayload);
+        }
+
+        // last but not least, we fire it off to all active sessions
+        this.#broadcast(messagePayload)
+          .catch((error: any) => {
+            console.error(`ERROR: failed to broadcast message: ${error.message}`)
+            webSocket.send(JSON.stringify({ error: `ERROR: failed to broadcast message: ${error.message}` }));
+          });
 
       } catch (error: any) {
         // Report any exceptions directly back to the client
@@ -594,15 +625,13 @@ export class ChannelServer implements DurableObject {
         } 
       } else {
         if (DEBUG) console.log(`session not ready, not forwarding message to ${session.userId}`);
-        // // This session hasn't sent the initial user info message yet, so we're not sending them
-        // // messages yet (no secret lurking!). Queue the message to be sent later.
-        // if (DEBUG) console.log("queueing message for session: ", message)
-        // session.blockedMessages.push(message);
       }
     }
     );
   }
   
+  // ToDo: change to be two steps - request set of keys, and separately support downloading
+  //       all the values given a set of keys. this can then line up with the new jslib SBMessageCache
   async #handleOldMessages(request: Request) {
     const { searchParams } = new URL(request.url);
     const currentMessagesLength = Number(searchParams.get('currentMessagesLength')) || 100;
@@ -638,7 +667,6 @@ export class ChannelServer implements DurableObject {
     } else {
       return returnError(request, "acceptVisitor(): could not parse the provided userId", 400)
     }
-
   }
 
   async #lockChannel(request: Request, _apiBody: ChannelApiBody) {
@@ -684,25 +712,12 @@ export class ChannelServer implements DurableObject {
           created: Date.now()
         }
       ));
-
-    // const token_buffer = crypto.getRandomValues(new Uint8Array(48)).buffer;
-    // const token_hash_buffer = await crypto.subtle.digest('SHA-256', token_buffer)
-    // const token_hash = arrayBufferToBase64(token_hash_buffer);
-    // const kv_data = { used: false, size: size, motherChannel: this.channelId };
-    // await this.env.LEDGER_NAMESPACE.put(token_hash, JSON.stringify(kv_data));
-    // const encrypted_token_id = arrayBufferToBase64(await crypto.subtle.encrypt({ name: "RSA-OAEP" }, this.ledgerKey!, token_buffer));
-    // const hashed_room_id = arrayBufferToBase64(await crypto.subtle.digest('SHA-256', (new TextEncoder).encode(this.channelId)));
-    // const token = {
-    //   token_hash: token_hash,
-    //   hashed_room_id: hashed_room_id,
-    //   encrypted_token_id: encrypted_token_id
-    // };
-
     if (DEBUG) console.log(`[newStorage()]: Created new storage token (${token.slice(0, 12)}...) for ${size} bytes`);
     return returnResult(request, JSON.stringify(token), 200);
   }
 
   async #getStorageLimit(request: Request) {
+    // ToDo: per-user storage boundaries
     return returnResult(request, JSON.stringify({ storageLimit: this.storageLimit }), 200);
   }
 
