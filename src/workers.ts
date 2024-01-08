@@ -195,6 +195,7 @@ export async function handleErrors(request: Request, func: () => Promise<Respons
     try {
         return await func();
     } catch (err: any) {
+        if (DEBUG) console.log("**** ERROR: (status: 500)\n", err.stack);
         if (err instanceof Error) {
             if (request.headers.get("Upgrade") == "websocket") {
                 const [_client, server] = Object.values(new WebSocketPair());
