@@ -97,6 +97,8 @@ Follow format from [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/
 - standardized "you're not allowed to do that" messages
   to all use the same (ANONYMOUS_CANNOT_CONNECT_MSG)
 
+- added class SBMessageCache. not activated yet.
+
 ## [1.1.0] - 2023-03-01
 
 ### Added
