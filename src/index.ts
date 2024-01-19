@@ -22,15 +22,16 @@
 
 */
 
-import { sbCrypto, extractPayload, assemblePayload, ChannelMessage } from 'snackabra'
+import { sbCrypto, extractPayload, assemblePayload, ChannelMessage, setDebugLevel } from 'snackabra'
 import type { EnvType } from './env'
-import { VERSION, DEBUG, DEBUG2 } from './env'
+import { VERSION } from './env'
 import { _sb_assert, returnResult, returnResultJson, returnError, returnSuccess, handleErrors, serverConstants, _appendBuffer } from './workers'
 
 console.log(`\n===============\n[channelserver] Loading version ${VERSION}\n===============\n`)
 
-if (DEBUG) console.log("++++ channel server code loaded ++++ DEBUG is enabled ++++")
-if (DEBUG2) console.log("++++ DEBUG2 (verbose) enabled ++++")
+// these are overriden from wrangler.toml (don't override them here)
+var DEBUG = false
+var DEBUG2 = false
 
 import type { SBChannelId, ChannelAdminData, SBUserId, SBChannelData, ChannelApiBody } from 'snackabra';
 import { SB384, arrayBufferToBase64, jsonParseWrapper, 
@@ -189,6 +190,12 @@ export class ChannelServer implements DurableObject {
   ownerCalls: ApiCallMap;   // API endpoints that require ownership
   webNotificationServer: string;
 
+  // used for caching message keys
+  private messageKeysCache: string[] = []; // L2 cache
+  private lastCacheTimestamp: number = 0; // mirrors lastTimestamp (should be the same)
+  private recentKeysCache: Set<string> = new Set(); // L1 cache
+  private lastL1CacheTimestamp: number = 0; // similar but tracks the 'set'
+
   // DEBUG helper function to produce a string explainer of the current state
   #describe(): string {
     let s = 'CHANNEL STATE:\n';
@@ -201,7 +208,15 @@ export class ChannelServer implements DurableObject {
   }
 
   constructor(state: DurableObjectState, public env: EnvType) {
-    // NOTE: DO storage has a different API than global KV, see:
+    // load from wrangler.toml (don't override here or in env.ts)
+    DEBUG = env.DEBUG_ON
+    DEBUG2 = env.VERBOSE_ON
+    if (DEBUG) console.log("++++ channel server code loaded ++++ DEBUG is enabled ++++")
+    if (DEBUG2) console.log("++++ DEBUG2 (verbose) enabled ++++")
+    // if we're on verbose mode, then we poke jslib to be on basic debug mode
+    if (DEBUG2) setDebugLevel(DEBUG)
+
+    // durObj storage has a different API than global KV, see:
     // https://developers.cloudflare.com/workers/runtime-apis/durable-objects/#transactional-storage-api
     this.storage = state.storage; // per-DO (eg per channel) storage
     this.webNotificationServer = env.WEB_NOTIFICATION_SERVER
@@ -209,6 +224,7 @@ export class ChannelServer implements DurableObject {
       // there's a 'hidden' "/create" endpoint, see below
       "/downloadData": this.#downloadAllData.bind(this),
       "/getChannelKeys": this.#getChannelKeys.bind(this),
+      "/getMessageKeys": this.#getMessageKeys.bind(this),
       "/getStorageLimit": this.#getStorageLimit.bind(this), // ToDo: should be per-userid basis
       "/oldMessages": this.#handleOldMessages.bind(this),
       "/registerDevice": this.#registerDevice.bind(this), // deprecated/notfunctional
@@ -252,6 +268,12 @@ export class ChannelServer implements DurableObject {
       // we do these LAST since it signals that we've fully initialized the channel
       this.channelId = channelData.channelId;
       this.channelData = channelData
+
+      // we prefetch message keys; 1000 is max
+      const listOptions: DurableObjectListOptions = { limit: 1000, prefix: this.channelId!, reverse: true };
+      const keys = Array.from((await this.storage.list(listOptions)).keys());
+      if (keys) this.messageKeysCache = keys
+      this.lastCacheTimestamp = this.lastTimestamp; // todo: add a check that ts of last key is same
 
       if (DEBUG) console.log("++++ Done initializing channel:\n", this.channelId, '\n', this.channelData)
       if (DEBUG2) console.log(SEP, 'Full DO info\n', this, '\n', SEP)
@@ -358,7 +380,7 @@ export class ChannelServer implements DurableObject {
       if (this.locked && !apiBody.isOwner && !this.accepted.has(apiBody.userId))
         return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
 
-      // and if it's not locked, then we keep track of visitors
+      // and if it's not locked, then we keep track of visitors, up to capacity level
       if (!this.locked && !this.visitors.has(apiBody.userId)) {
         // new visitor
         if (!apiBody.userPublicKey)
@@ -447,28 +469,7 @@ export class ChannelServer implements DurableObject {
     }
   }
 
-  // fetch most recent messages from local (worker) KV
-  async #getRecentMessages(howMany: number = 100, cursor = ''): Promise<Map<string, unknown>> {
-    const listOptions: DurableObjectListOptions = { limit: howMany, prefix: this.channelId!, reverse: true };
-    if (cursor !== '')
-      listOptions.end = cursor; // not '.startAfter'
-
-    // gets (lexicographically) latest 'howMany' keys
-    const keys = Array.from((await this.storage.list(listOptions)).keys());
-    _sb_assert(keys, "Internal Error [L469]")
-
-    // we fetch all keys in one go, then fetch all contents
-    // todo: conceivably, we could simply provide recent keys
-    // see this blog post for details on why we're setting allowConcurrency:
-    // https://blog.cloudflare.com/durable-objects-easy-fast-correct-choose-three/
-    const getOptions: DurableObjectGetOptions = { allowConcurrency: true };
-    const messageList = await this.storage.get(keys, getOptions);
-    _sb_assert(messageList, "Internal Error [L475]")
-    
-    // update: we now return the raw messageList, and let the caller decide what to do with it
-    return messageList
-  }
-
+  // safety/privacy measures
   #stripChannelMessage(msg: ChannelMessage): ChannelMessage {
     const ret: ChannelMessage = {}
     if (msg.f) ret.f = msg.f; else throw new Error("ERROR: missing 'f' ('from') in message")
@@ -482,42 +483,51 @@ export class ChannelServer implements DurableObject {
     return ret
   }
 
+  #appendMessageKeyToCache(newKey: string): void {
+    this.messageKeysCache.push(newKey);
+    if (this.messageKeysCache.length > 5000) {
+      // kludgy limiting of state size
+      this.messageKeysCache = this.messageKeysCache.slice(-500);
+    }
+    // Update the L1 cache with the latest 100 entries
+    this.recentKeysCache = new Set(this.messageKeysCache.slice(-100));
+  }
+  
   // process message, whether coming asynchronously from API call, or from websocket
-  // throw any issues back to caller. if the message is 'absorbed' 
-  // if it's a websocket message, then we also get the session object
-  async #processMessage(msg: any, apiBody: ChannelApiBody, session?: SessionType): Promise<ArrayBuffer | undefined> {
+  // throw any issues back to caller. all new messages come through here.
+  async #processMessage(msg: any, apiBody: ChannelApiBody) {
     var message: ChannelMessage = {}
     if (typeof msg === "string") {
       message = jsonParseWrapper(msg.toString(), 'L594');
     } else if (msg instanceof ArrayBuffer) {
-      message = extractPayload(msg).payload
+      message = extractPayload(extractPayload(msg).payload).payload
     } else {
       throw new Error("Cannot parse contents type (not json nor arraybuffer)")
     }
+    if (DEBUG) console.log(
+      "------------ getting message from client ------------",
+      "\n", msg, "\n", message, "\n-------------------------------------------------")
     message = validate_ChannelMessage(message) // will throw if anything wrong
 
-    if (DEBUG) {
-      console.log("------------ getting websocket (event) msg from client ------------")
-      if (DEBUG2) console.log(msg)
-      console.log(message)
-      console.log("-------------------------------------------------")
-    }
-
     if (message.ready) {
-      // the client sends a "ready" message when it can start receiving, we fire off latest messages right awy
+      // the client sends a "ready" message when it can start receiving
       if (DEBUG) console.log("got 'ready' message from client")
-      if (session) session.ready = true;
+      const session = this.sessions.get(apiBody.userId)
+      if (!session) throw new Error("Internal Error [L509]")
+      else session.ready = true;
+      // ToDo: we used to send latest 100 right away; we don't do that anymore.
       // const latest100 = assemblePayload(await this.#getRecentMessages())!; _sb_assert(latest100, "Internal Error [L548]");
-      // webSocket.send(latest100); // ToDo: no, we don't do this
+      // webSocket.send(latest100);
       return undefined; // all good
     }
 
     // at this point we have a validated, verified, and parsed message
     // a few minor things to check before proceeding
 
-    if (message.c) {
-      if (DEBUG) console.error("ERROR: Contents ('c') sent in the clear! Serious client-side error.")
-      throw new Error("Contents ('c') sent in the clear! Discarding message.");
+    if (typeof message.c === 'string') {
+      const msg = "[processMessage]: Contents ('c') sent as string. Discarding message."
+      if (DEBUG) console.error(msg)
+      throw new Error(msg);
     }
 
     if (message.i2 && !apiBody.isOwner) {
@@ -564,30 +574,33 @@ export class ChannelServer implements DurableObject {
     await this.storage.put(key, messagePayload); // we wait for local to succeed before global
     await this.env.MESSAGES_NAMESPACE.put(key, messagePayload); // now make sure it's in global
 
+    // update our cache
+    this.#appendMessageKeyToCache(key);
+
     if (i2Key) {
       // we don't block on these (TTLs have slightly lower expected SLA)
       this.storage.put(i2Key, messagePayload);
       this.env.MESSAGES_NAMESPACE.put(i2Key, messagePayload);
     }
 
-    return messagePayload
+    // everything looks good. we broadcast to all connected clients (if any)
+    this.#broadcast(messagePayload)
+    .catch((error: any) => {
+      throw new Error(`ERROR: failed to broadcast message: ${error.message}`)
+    });
   }
 
   async #handleSend(request: Request, apiBody: ChannelApiBody) {
-    _sb_assert(apiBody.apiPayload, "send(): need payload (the message)")
-    const data = extractPayload(apiBody.apiPayload!).payload
-    if (data && data.userId && typeof data.userId === 'string') {
-      if (!this.accepted.has(data.userId)) {
-        if (this.accepted.size >= this.channelCapacity)
-          return returnError(request, `This would exceed current channel capacity (${this.channelCapacity}); update that first`, 400)
-        // add to our accepted list
-        this.accepted.add(data.userId)
-        // write it back to storage
-        await this.storage.put('accepted', assemblePayload(this.accepted))
-      }
-      return returnSuccess(request);
-    } else {
-      return returnError(request, "acceptVisitor(): could not parse the provided userId", 400)
+    _sb_assert(apiBody && apiBody.apiPayload, "send(): need payload (the message)")
+    if (DEBUG) {
+      console.log("==== ChannelServer.handleSend() called ====")
+      console.log(apiBody)
+    }
+    try {
+      await this.#processMessage(apiBody.apiPayload!, apiBody)
+      return returnSuccess(request)
+    } catch (error: any) {
+      return returnError(request, error.message, 400);
     }
   }
 
@@ -622,12 +635,7 @@ export class ChannelServer implements DurableObject {
         try {
           const messagePayload = await this.#processMessage(msg.data, apiBody)
           if (!messagePayload) return; // nothing to do (not an error)
-          // everything looks good, we fire it off
-          this.#broadcast(messagePayload)
-            .catch((error: any) => {
-              console.error(`ERROR: failed to broadcast message: ${error.message}`)
-              webSocket.send(JSON.stringify({ error: `ERROR: failed to broadcast message: ${error.message}` }));
-            });
+
         } catch (error: any) {
           console.error(`ERROR: failed to process message: ${error.message}`)
           webSocket.send(JSON.stringify({ error: `ERROR: failed to process message: ${error.message}` }));
@@ -661,6 +669,7 @@ export class ChannelServer implements DurableObject {
 
   // broadcasts a message to all clients.
   async #broadcast(messagePayload: ArrayBuffer) {
+    if (this.sessions.size === 0) return; // nothing to do
     // MTG ToDo: we don't send notifications for everything? for example locked-out messages?
     if (DEBUG2) console.log("calling sendWebNotifications()", messagePayload);
     await this.#sendWebNotifications(); // ping anybody subscribing to channel
@@ -681,9 +690,30 @@ export class ChannelServer implements DurableObject {
     }
     );
   }
-  
-  // ToDo: change to be two steps - request set of keys, and separately support downloading
-  //       all the values given a set of keys. this can then line up with the new jslib SBMessageCache
+
+    // Older API
+  // fetch most recent messages from local (worker) KV
+  async #getRecentMessages(howMany: number = 100, cursor = ''): Promise<Map<string, unknown>> {
+    const listOptions: DurableObjectListOptions = { limit: howMany, prefix: this.channelId!, reverse: true };
+    if (cursor !== '')
+      listOptions.end = cursor; // not '.startAfter'; fetches up to cursor
+
+    // gets (lexicographically) latest 'howMany' keys
+    const keys = Array.from((await this.storage.list(listOptions)).keys());
+    _sb_assert(keys, "Internal Error [L469]")
+
+    // we fetch all keys in one go, then fetch all contents
+    // see this blog post for details on why we're setting allowConcurrency:
+    // https://blog.cloudflare.com/durable-objects-easy-fast-correct-choose-three/
+    const getOptions: DurableObjectGetOptions = { allowConcurrency: true };
+    const messageList = await this.storage.get(keys, getOptions);
+    _sb_assert(messageList, "Internal Error [L475]")
+    
+    // update: we now return the raw messageList, and let the caller decide what to do with it
+    return messageList
+  }
+
+  // Older API
   async #handleOldMessages(request: Request) {
     const { searchParams } = new URL(request.url);
     const currentMessagesLength = Number(searchParams.get('currentMessagesLength')) || 100;
@@ -693,6 +723,22 @@ export class ChannelServer implements DurableObject {
     // for (let [key, value] of messageMap)
     //   messageArray[key] = value;
     return returnResult(request, messageMap);
+  }
+
+  async #getMessageKeys(request: Request) {
+    // ToDo: carry forward these options from handleOldMessages()
+    // const { searchParams } = new URL(request.url);
+    // const currentMessagesLength = Number(searchParams.get('currentMessagesLength')) || 100;
+    // const cursor = searchParams.get('cursor') || '';
+
+    // main cache should always be in sync
+    _sb_assert(this.lastCacheTimestamp === this.lastTimestamp, "Internal Error [L735]")
+    if (this.lastL1CacheTimestamp !== this.lastTimestamp) {
+      // L1 cache is not up-to-date, update it from the L2 cache
+      this.recentKeysCache = new Set(this.messageKeysCache.slice(-100));
+    }
+    this.lastL1CacheTimestamp = this.lastTimestamp;
+    return returnResult(request, this.recentKeysCache)
   }
 
   async #handleChannelCapacityChange(request: Request) {
