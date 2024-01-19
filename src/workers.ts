@@ -52,24 +52,25 @@ import { NEW_CHANNEL_MINIMUM_BUDGET as _NEW_CHANNEL_MINIMUM_BUDGET } from 'snack
  *     NOTE: all channel api endpoints are binary (payload)
  * 
  *     Channel API (synchronous)                : [O] means [Owner] only
- *     /api/v2/channel/<ID>/create              : New: create with storage token
- *     /api/v2/channel/<ID>/websocket           : connect to channel socket (wss protocol)
- *     /api/v2/channel/<ID>/oldMessages
- *     /api/v2/channel/<ID>/updateRoomCapacity  : [O]
+ *     /api/v2/channel/<ID>/acceptVisitor       : [O]
  *     /api/v2/channel/<ID>/budd                : [O]
+ *     /api/v2/channel/<ID>/channelLocked
+ *     /api/v2/channel/<ID>/create              : New: create with storage token
+ *     /api/v2/channel/<ID>/downloadData
  *     /api/v2/channel/<ID>/getAdminData        : [O]
- *     /api/v2/channel/<ID>/getJoinRequests     : [O]
  *     /api/v2/channel/<ID>/getChannelKeys      : New: get owner pub key, channel pub key
+ *     /api/v2/channel/<ID>/getJoinRequests     : [O]
  *     /api/v2/channel/<ID>/getMother           : [O]
  *     /api/v2/channel/<ID>/getRoomCapacity     : [O]
  *     /api/v2/channel/<ID>/getStorageLimit     : ToDo: per-userId storage limit system (until then shared)
- *     /api/v2/channel/<ID>/acceptVisitor       : [O]
- *     /api/v2/channel/<ID>/channelLocked
+ *     /api/v2/channel/<ID>/oldMessages
  *     /api/v2/channel/<ID>/ownerUnread         : [O]
- *     /api/v2/channel/<ID>/storageRequest
- *     /api/v2/channel/<ID>/downloadData
- *     /api/v2/channel/<ID>/uploadChannel       : (admin only or with budget channel provided)
  *     /api/v2/channel/<ID>/postPubKey
+ *     /api/v2/channel/<ID>/send
+ *     /api/v2/channel/<ID>/storageRequest
+ *     /api/v2/channel/<ID>/updateRoomCapacity  : [O]
+ *     /api/v2/channel/<ID>/uploadChannel       : (admin only or with budget channel provided)
+ *     /api/v2/channel/<ID>/websocket           : connect to channel socket (wss protocol)
  * 
  * The following are in the process of being reviewed / refactored / deprecated:
  * 

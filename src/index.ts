@@ -207,13 +207,14 @@ export class ChannelServer implements DurableObject {
     this.webNotificationServer = env.WEB_NOTIFICATION_SERVER
     this.visitorCalls = {
       // there's a 'hidden' "/create" endpoint, see below
-      "/getChannelKeys": this.#getChannelKeys.bind(this),
-      "/oldMessages": this.#handleOldMessages.bind(this),
-      "/getStorageLimit": this.#getStorageLimit.bind(this), // ToDo: should be per-userid basis
-      "/storageRequest": this.#handleNewStorage.bind(this),
       "/downloadData": this.#downloadAllData.bind(this),
-      "/uploadChannel": this.#uploadData.bind(this),
+      "/getChannelKeys": this.#getChannelKeys.bind(this),
+      "/getStorageLimit": this.#getStorageLimit.bind(this), // ToDo: should be per-userid basis
+      "/oldMessages": this.#handleOldMessages.bind(this),
       "/registerDevice": this.#registerDevice.bind(this), // deprecated/notfunctional
+      "/send": this.#handleSend.bind(this),
+      "/storageRequest": this.#handleNewStorage.bind(this),
+      "/uploadChannel": this.#uploadData.bind(this),
     }
     this.ownerCalls = {
       "/acceptVisitor": this.#acceptVisitor.bind(this),
@@ -271,7 +272,9 @@ export class ChannelServer implements DurableObject {
     const channelId = path[0]
     const apiCall = '/' + path[1]
     try {
-      console.log("111111 ==== ChannelServer.fetch() ==== phase ONE ==== 111111")
+
+      if (DEBUG) console.log("111111 ==== ChannelServer.fetch() ==== phase ONE ==== 111111")
+      // phase 'one' - sort out parameters
       const requestClone = request.clone(); // todo: might not be needed to be fully cloned here
       var _apiBody: ChannelApiBody
       const contentType = request.headers.get('content-type')
@@ -307,7 +310,8 @@ export class ChannelServer implements DurableObject {
         }
       }
 
-      console.log("222222 ==== ChannelServer.fetch() ==== phase TWO ==== 222222")
+      if (DEBUG) console.log("222222 ==== ChannelServer.fetch() ==== phase TWO ==== 222222")
+      // phase 'two' - catch 'create' call, it's special
       
       const apiBody = _apiBody!
 
@@ -322,9 +326,9 @@ export class ChannelServer implements DurableObject {
         else return returnSuccess(request)
       }
 
-      console.log("333333 ==== ChannelServer.fetch() ==== phase THREE ==== 333333")
-
-      // if this object doesn't have it's correct channelId, that means it needs to be initialized
+      if (DEBUG) console.log("333333 ==== ChannelServer.fetch() ==== phase THREE ==== 333333")
+      // phase 'three' - check if 'we' just got created, in which case now we self-initialize
+      // (we've been created but not initialized if there's no channelId, yet api call is not 'create')
       if (!this.channelId) {
         if (DEBUG) console.log("**** channel object not initialized ...")
         const channelData = jsonParseWrapper(await (this.storage.get('channelData') as Promise<string>), 'L495') as SBChannelData
@@ -344,7 +348,8 @@ export class ChannelServer implements DurableObject {
           .catch(() => { return returnError(request, `Internal Error (L332)`); });
       }
 
-      console.log("444444 ==== ChannelServer.fetch() ==== phase FOUR ==== 444444")
+      if (DEBUG) console.log("444444 ==== ChannelServer.fetch() ==== phase FOUR ==== 444444")
+      // phase 'four' - if we're locked, then only accepted visitors can do anything at all
 
       if (this.channelId !== path[0])
         return returnError(request, "ERROR: channelId mismatch (?) [L454]");
@@ -353,7 +358,7 @@ export class ChannelServer implements DurableObject {
       if (this.locked && !apiBody.isOwner && !this.accepted.has(apiBody.userId))
         return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
 
-      // if it's not locked, we keep track of visitors
+      // and if it's not locked, then we keep track of visitors
       if (!this.locked && !this.visitors.has(apiBody.userId)) {
         // new visitor
         if (!apiBody.userPublicKey)
@@ -367,7 +372,8 @@ export class ChannelServer implements DurableObject {
         this.visitorKeys.set(apiBody.userId, await (new SB384(apiBody.userPublicKey).ready))
       }
 
-      console.log("555555 ==== ChannelServer.fetch() ==== phase FIVE ==== 555555")
+      if (DEBUG) console.log("555555 ==== ChannelServer.fetch() ==== phase FIVE ==== 555555")
+      // phase 'five' - every single api call is separately verified with provided visitor public key
 
       // check signature, check for owner status
       // const sender = await (new SB384(apiBody.userPublicKey).ready)
@@ -381,7 +387,6 @@ export class ChannelServer implements DurableObject {
       const pathAsArrayBuffer = new TextEncoder().encode(apiBody.path).buffer
       const prefixBuf = _appendBuffer(viewBuf, pathAsArrayBuffer)
       const apiPayloadBuf = apiBody.apiPayload
-
       
       // verification covers timestamp + path + apiPayload
       const verified = await sbCrypto.verify(sender.signKey, apiBody.sign, apiPayloadBuf ? _appendBuffer(prefixBuf, apiPayloadBuf) : prefixBuf)
@@ -392,9 +397,12 @@ export class ChannelServer implements DurableObject {
         }
         return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
       }
+
+      // form our own opinion if this is the Owner
       apiBody.isOwner = this.channelId === sender.ownerChannelId
 
-      console.log("666666 ==== ChannelServer.fetch() ==== phase SIX ==== 666666")
+      if (DEBUG) console.log("666666 ==== ChannelServer.fetch() ==== phase SIX ==== 666666")
+      // phase 'six' - we're ready to process the api call!
 
       // ToDo: verify that the 'embeded' path is same as path coming through in request
     
@@ -427,7 +435,7 @@ export class ChannelServer implements DurableObject {
           return returnError(request, `API ERROR [L410] [${apiCall}]: ${error.message} \n ${error.stack}`);
         }
       } else if (this.visitorCalls[apiCall]) {
-        console.log("==== ChannelServer.fetch() ==== owner call ====")
+        console.log("==== ChannelServer.fetch() ==== visitor call ====")
         return await this.visitorCalls[apiCall]!(request, apiBody);
       } else {
         return returnError(request, "API endpoint not found: " + apiCall, 404)
@@ -474,6 +482,115 @@ export class ChannelServer implements DurableObject {
     return ret
   }
 
+  // process message, whether coming asynchronously from API call, or from websocket
+  // throw any issues back to caller. if the message is 'absorbed' 
+  // if it's a websocket message, then we also get the session object
+  async #processMessage(msg: any, apiBody: ChannelApiBody, session?: SessionType): Promise<ArrayBuffer | undefined> {
+    var message: ChannelMessage = {}
+    if (typeof msg === "string") {
+      message = jsonParseWrapper(msg.toString(), 'L594');
+    } else if (msg instanceof ArrayBuffer) {
+      message = extractPayload(msg).payload
+    } else {
+      throw new Error("Cannot parse contents type (not json nor arraybuffer)")
+    }
+    message = validate_ChannelMessage(message) // will throw if anything wrong
+
+    if (DEBUG) {
+      console.log("------------ getting websocket (event) msg from client ------------")
+      if (DEBUG2) console.log(msg)
+      console.log(message)
+      console.log("-------------------------------------------------")
+    }
+
+    if (message.ready) {
+      // the client sends a "ready" message when it can start receiving, we fire off latest messages right awy
+      if (DEBUG) console.log("got 'ready' message from client")
+      if (session) session.ready = true;
+      // const latest100 = assemblePayload(await this.#getRecentMessages())!; _sb_assert(latest100, "Internal Error [L548]");
+      // webSocket.send(latest100); // ToDo: no, we don't do this
+      return undefined; // all good
+    }
+
+    // at this point we have a validated, verified, and parsed message
+    // a few minor things to check before proceeding
+
+    if (message.c) {
+      if (DEBUG) console.error("ERROR: Contents ('c') sent in the clear! Serious client-side error.")
+      throw new Error("Contents ('c') sent in the clear! Discarding message.");
+    }
+
+    if (message.i2 && !apiBody.isOwner) {
+      if (DEBUG) console.error("ERROR: non-owner message setting subchannel")
+      throw new Error("Only Owner can set subchannel. Discarding message.");
+    } else if (!message.i2) {
+      message.i2 = '____' // default; use to keep track of where we're at in processing
+    }
+
+    // Time stamps are monotonically increasing. We enforce that they must be different.
+    // Stored as a string of [0-3] to facilitate prefix searches (within 4x time ranges).
+    // We append "0000" for future needs, for example if we need above 1000 messages per second.
+    // Can represent epoch timestamps for the next 400+ years.
+    const tsNum = Math.max(Date.now(), this.lastTimestamp + 1);
+    this.lastTimestamp = tsNum;
+    this.storage.put('lastTimestamp', tsNum)
+    const ts = tsNum.toString(4).padStart(22, "0") + "0000" // total length 26
+
+    // appending timestamp to channel id. this is global, unique message identifier
+    const key = this.channelId + '_' + message.i2 + '_' + ts;
+
+    // TODO: sync TTL with 'i2'
+    var i2Key: string | null = null
+    if (message.ttl && message.ttl > 0 && message.ttl < 0xF) {
+      if (message.i2[3] === '_') {
+        // if there's a TTL, you can't have a subchannel using last character, this is an error
+        if (DEBUG) console.error("ERROR: subchannel cannot be used with TTL")
+        throw new Error("Subchannel cannot be used with TTL. Discarding message.")
+      } else {
+        // ttl is a digit 1-9, we append that to the i2 centerpiece
+        i2Key = this.channelId + '_' + message.i2.slice(0, 3) + message.ttl + '_' + ts;
+      }
+    }
+
+    // we make sure any message has been stored properly before we broadcast it
+
+    // strip it and package it
+    const messagePayload = assemblePayload(new Map([[key, assemblePayload(this.#stripChannelMessage(message))]]))!
+
+    // ToDo: deduct storage from channel budget for message
+    //       and user budget as well. use sizeOf(messagePayload) as base (and adjust down for TTL)
+
+    // and store it for posterity both local and global KV
+    await this.storage.put(key, messagePayload); // we wait for local to succeed before global
+    await this.env.MESSAGES_NAMESPACE.put(key, messagePayload); // now make sure it's in global
+
+    if (i2Key) {
+      // we don't block on these (TTLs have slightly lower expected SLA)
+      this.storage.put(i2Key, messagePayload);
+      this.env.MESSAGES_NAMESPACE.put(i2Key, messagePayload);
+    }
+
+    return messagePayload
+  }
+
+  async #handleSend(request: Request, apiBody: ChannelApiBody) {
+    _sb_assert(apiBody.apiPayload, "send(): need payload (the message)")
+    const data = extractPayload(apiBody.apiPayload!).payload
+    if (data && data.userId && typeof data.userId === 'string') {
+      if (!this.accepted.has(data.userId)) {
+        if (this.accepted.size >= this.channelCapacity)
+          return returnError(request, `This would exceed current channel capacity (${this.channelCapacity}); update that first`, 400)
+        // add to our accepted list
+        this.accepted.add(data.userId)
+        // write it back to storage
+        await this.storage.put('accepted', assemblePayload(this.accepted))
+      }
+      return returnSuccess(request);
+    } else {
+      return returnError(request, "acceptVisitor(): could not parse the provided userId", 400)
+    }
+  }
+
   async #setUpNewSession(webSocket: WebSocket, _ip: string | null, apiBody: ChannelApiBody) {
     _sb_assert(webSocket && (webSocket as any).accept, "ERROR: webSocket does not have accept() method (fatal)");
     (webSocket as any).accept(); // typing override (old issue with CF types)
@@ -502,101 +619,19 @@ export class ChannelServer implements DurableObject {
           webSocket.close(1011, "WebSocket broken (got a quit).");
           return;
         }
-
-        var message: ChannelMessage = {}
-        if (typeof msg.data === "string") {
-          message = jsonParseWrapper(msg.data.toString(), 'L594');
-        } else if (msg.data instanceof ArrayBuffer) {
-          message = extractPayload(msg.data).payload
-        } else {
-          throw new Error("Cannot parse contents type (not json nor arraybuffer)")
+        try {
+          const messagePayload = await this.#processMessage(msg.data, apiBody)
+          if (!messagePayload) return; // nothing to do (not an error)
+          // everything looks good, we fire it off
+          this.#broadcast(messagePayload)
+            .catch((error: any) => {
+              console.error(`ERROR: failed to broadcast message: ${error.message}`)
+              webSocket.send(JSON.stringify({ error: `ERROR: failed to broadcast message: ${error.message}` }));
+            });
+        } catch (error: any) {
+          console.error(`ERROR: failed to process message: ${error.message}`)
+          webSocket.send(JSON.stringify({ error: `ERROR: failed to process message: ${error.message}` }));
         }
-        message = validate_ChannelMessage(message) // will throw if anything wrong
-
-        if (DEBUG) {
-          console.log("------------ getting websocket (event) msg from client ------------")
-          if (DEBUG2) console.log(msg)
-          console.log(message)
-          console.log("-------------------------------------------------")
-        }
-
-        if (message.ready) {
-          // the client sends a "ready" message when it can start receiving, we fire off latest messages right awy
-          if (DEBUG) console.log("got 'ready' message from client")
-          session.ready = true;
-          // const latest100 = assemblePayload(await this.#getRecentMessages())!; _sb_assert(latest100, "Internal Error [L548]");
-          // webSocket.send(latest100); // ToDo: no, we don't do this
-          return;
-        }
-
-        // at this point we have a validated, verified, and parsed message
-        // a few minor things to check before proceeding
-
-        if (message.c) {
-          if (DEBUG) console.error("ERROR: Contents ('c') sent in the clear! Serious client-side error.")
-          webSocket.send(JSON.stringify({ error: "Contents ('c') sent in the clear! Discarding message." }));
-          return
-        }
-
-        if (message.i2 && !apiBody.isOwner) {
-          if (DEBUG) console.error("ERROR: non-owner message setting subchannel")
-          webSocket.send(JSON.stringify({ error: "Only Owner can set subchannel. Discarding message." }));
-          return
-        } else if (!message.i2) {
-          message.i2 = '____' // default; use to keep track of where we're at in processing
-        }
-
-        // Time stamps are monotonically increasing. We enforce that they must be different.
-        // Stored as a string of [0-3] to facilitate prefix searches (within 4x time ranges).
-        // We append "0000" for future needs, for example if we need above 1000 messages per second.
-        // Can represent epoch timestamps for the next 400+ years.
-        const tsNum = Math.max(Date.now(), this.lastTimestamp + 1);
-        this.lastTimestamp = tsNum;
-        this.storage.put('lastTimestamp', tsNum)
-        const ts = tsNum.toString(4).padStart(22, "0") + "0000" // total length 26
-
-        // appending timestamp to channel id. this is global, unique message identifier
-        const key = this.channelId + '_' + message.i2 + '_' + ts;
-
-        // TODO: sync TTL with 'i2'
-        var i2Key: string | null = null
-        if (message.ttl && message.ttl > 0 && message.ttl < 0xF) {
-          if (message.i2[3] === '_') {
-            // if there's a TTL, you can't have a subchannel using last character, this is an error
-            if (DEBUG) console.error("ERROR: subchannel cannot be used with TTL")
-            webSocket.send(JSON.stringify({ error: "Subchannel cannot be used with TTL. Discarding message." }));
-            return
-          } else {
-            // ttl is a digit 1-9, we append that to the i2 centerpiece
-            i2Key = this.channelId + '_' + message.i2.slice(0, 3) + message.ttl + '_' + ts;
-          }
-        }
-
-        // we make sure any message has been stored properly before we broadcast it
-
-        // strip it and package it
-        const messagePayload = assemblePayload(new Map([[key, assemblePayload(this.#stripChannelMessage(message))]]))!
-
-        // ToDo: deduct storage from channel budget for message
-        //       and user budget as well. use sizeOf(messagePayload) as base (and adjust down for TTL)
-
-        // and store it for posterity both local and global KV
-        await this.storage.put(key, messagePayload); // we wait for local to succeed before global
-        await this.env.MESSAGES_NAMESPACE.put(key, messagePayload); // now make sure it's in global
-
-        if (i2Key) {
-          // we don't block on these (TTLs have slightly lower expected SLA)
-          this.storage.put(i2Key, messagePayload);
-          this.env.MESSAGES_NAMESPACE.put(i2Key, messagePayload);
-        }
-
-        // last but not least, we fire it off to all active sessions
-        this.#broadcast(messagePayload)
-          .catch((error: any) => {
-            console.error(`ERROR: failed to broadcast message: ${error.message}`)
-            webSocket.send(JSON.stringify({ error: `ERROR: failed to broadcast message: ${error.message}` }));
-          });
-
       } catch (error: any) {
         // Report any exceptions directly back to the client
         const err_msg = '[handleSession()] ' + error.message + '\n' + error.stack + '\n';
