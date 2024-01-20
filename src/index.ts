@@ -192,6 +192,7 @@ export class ChannelServer implements DurableObject {
 
   // used for caching message keys
   private messageKeysCache: string[] = []; // L2 cache
+  messageKeysCacheMap: Map<string, number> = new Map(); // 'indexes' into messageKeysCache
   private lastCacheTimestamp: number = 0; // mirrors lastTimestamp (should be the same)
   private recentKeysCache: Set<string> = new Set(); // L1 cache
   private lastL1CacheTimestamp: number = 0; // similar but tracks the 'set'
@@ -225,6 +226,7 @@ export class ChannelServer implements DurableObject {
       "/downloadData": this.#downloadAllData.bind(this),
       "/getChannelKeys": this.#getChannelKeys.bind(this),
       "/getMessageKeys": this.#getMessageKeys.bind(this),
+      "/getMessages": this.#getMessages.bind(this),
       "/getStorageLimit": this.#getStorageLimit.bind(this), // ToDo: should be per-userid basis
       "/oldMessages": this.#handleOldMessages.bind(this),
       "/registerDevice": this.#registerDevice.bind(this), // deprecated/notfunctional
@@ -269,11 +271,12 @@ export class ChannelServer implements DurableObject {
       this.channelId = channelData.channelId;
       this.channelData = channelData
 
-      // we prefetch message keys; 1000 is max
-      const listOptions: DurableObjectListOptions = { limit: 1000, prefix: this.channelId!, reverse: true };
+      // we prefetch message keys; 1000 is max.  we only prefetch/cache non-subchannel messages for now
+      const listOptions: DurableObjectListOptions = { limit: 1000, prefix: this.channelId! + '______', reverse: true };
       const keys = Array.from((await this.storage.list(listOptions)).keys());
-      if (keys) this.messageKeysCache = keys
+      if (keys) this.messageKeysCache = keys // else leave it empty
       this.lastCacheTimestamp = this.lastTimestamp; // todo: add a check that ts of last key is same
+      this.messageKeysCacheMap = new Map(keys.map((key, index) => [key, index]));
 
       if (DEBUG) console.log("++++ Done initializing channel:\n", this.channelId, '\n', this.channelData)
       if (DEBUG2) console.log(SEP, 'Full DO info\n', this, '\n', SEP)
@@ -308,35 +311,42 @@ export class ChannelServer implements DurableObject {
           console.log(request.body)
         }
         return returnError(request, "Channel API call yet no body content or malformed body", 400)
+      }
+
+      // we accept json or binary (but soon only binary)
+      if (contentType.indexOf("application/json") !== -1) {
+        _apiBody = jsonParseWrapper(await request.json(), "L289");
+        console.warn("WARNING: using JSON for channel API call, soon to be deprecated (use binary)")
+      } else if (contentType.indexOf("application/octet-stream") !== -1) {
+        const ab = await request.arrayBuffer()
+        _apiBody = extractPayload(ab).payload
       } else {
-        // we accept json or binary
-        if (contentType.indexOf("application/json") !== -1) {
-          _apiBody = jsonParseWrapper(await request.json(), "L289");
-        } else if (contentType.indexOf("application/octet-stream") !== -1) {
-          const ab = await request.arrayBuffer()
-          _apiBody = extractPayload(ab).payload
-        } else {
-          return returnError(request, `Channel API call but do not understand content type ${contentType}`, 400)
-        }
-        _apiBody = validate_ChannelApiBody(_apiBody) // will throw if anything wrong
-        if (DEBUG) {
-          console.log(
-            SEP,
-            '[Durable Object] fetch() called:\n',
-            '  channelId:', channelId, '\n',
-            '    apiCall:', apiCall, '\n',
-            '  full path:', path, '\n',
-            SEP, request.url, '\n', SEP,
-            'apiBody: \n', _apiBody, '\n', SEP)
-          if (DEBUG2) console.log(request.headers, '\n', SEP)
-        }
+        return returnError(request, `Channel API call but do not understand content type ${contentType}`, 400)
+      }
+      const apiBody = validate_ChannelApiBody(_apiBody) // will throw if anything wrong
+
+      // if there's an apiPayloadBuf, we need to extract it
+      if (apiBody.apiPayload) return returnError(request, "[fetch]: do not provide 'apiPayload'", 400)
+      if (apiBody.apiPayloadBuf) {
+        apiBody.apiPayload = extractPayload(apiBody.apiPayloadBuf).payload
+        if (!apiBody.apiPayload) return returnError(request, "[fetch]: cannot extract from provided apiPayloadBuf", 400)
+      }
+
+      if (DEBUG) {
+        console.log(
+          SEP,
+          '[Durable Object] fetch() called:\n',
+          '  channelId:', channelId, '\n',
+          '    apiCall:', apiCall, '\n',
+          '  full path:', path, '\n',
+          SEP, request.url, '\n', SEP,
+          '    apiBody: \n', apiBody, '\n', SEP)
+        if (DEBUG2) console.log(request.headers, '\n', SEP)
       }
 
       if (DEBUG) console.log("222222 ==== ChannelServer.fetch() ==== phase TWO ==== 222222")
       // phase 'two' - catch 'create' call, it's special
       
-      const apiBody = _apiBody!
-
       if (this.channelId && channelId && (this.channelId !== channelId)) return returnError(request, "Internal Error (L478)");
 
       if (apiCall === '/create') {
@@ -408,7 +418,7 @@ export class ChannelServer implements DurableObject {
       view.setFloat64(0, apiBody.timestamp);
       const pathAsArrayBuffer = new TextEncoder().encode(apiBody.path).buffer
       const prefixBuf = _appendBuffer(viewBuf, pathAsArrayBuffer)
-      const apiPayloadBuf = apiBody.apiPayload
+      const apiPayloadBuf = apiBody.apiPayloadBuf
       
       // verification covers timestamp + path + apiPayload
       const verified = await sbCrypto.verify(sender.signKey, apiBody.sign, apiPayloadBuf ? _appendBuffer(prefixBuf, apiPayloadBuf) : prefixBuf)
@@ -484,41 +494,48 @@ export class ChannelServer implements DurableObject {
   }
 
   #appendMessageKeyToCache(newKey: string): void {
-    this.messageKeysCache.push(newKey);
     if (this.messageKeysCache.length > 5000) {
       // kludgy limiting of state size
-      this.messageKeysCache = this.messageKeysCache.slice(-500);
+      const keys = this.messageKeysCache.slice(-500);
+      // recreate the array and map
+      this.messageKeysCache = keys
+      this.messageKeysCacheMap = new Map(keys.map((key, index) => [key, index]));
     }
-    // Update the L1 cache with the latest 100 entries
-    this.recentKeysCache = new Set(this.messageKeysCache.slice(-100));
+
+    this.messageKeysCache.push(newKey);
+    this.messageKeysCacheMap.set(newKey, this.messageKeysCache.length - 1);
+    
   }
   
   // process message, whether coming asynchronously from API call, or from websocket
   // throw any issues back to caller. all new messages come through here.
-  async #processMessage(msg: any, apiBody: ChannelApiBody) {
-    var message: ChannelMessage = {}
-    if (typeof msg === "string") {
-      message = jsonParseWrapper(msg.toString(), 'L594');
-    } else if (msg instanceof ArrayBuffer) {
-      message = extractPayload(extractPayload(msg).payload).payload
-    } else {
-      throw new Error("Cannot parse contents type (not json nor arraybuffer)")
-    }
+  async #processMessage(msg: any, apiBody: ChannelApiBody): Promise<void> {
+    // var message: ChannelMessage = {}
+    // if (typeof msg === "string") {
+    //   message = jsonParseWrapper(msg.toString(), 'L594');
+    // } else if (msg instanceof ArrayBuffer) {
+    //   message = extractPayload(extractPayload(msg).payload).payload // TODO: hack
+    // } else {
+    //   throw new Error("Cannot parse contents type (not json nor arraybuffer)")
+    // }
+
+    const message: ChannelMessage = validate_ChannelMessage(msg) // will throw if anything wrong
     if (DEBUG) console.log(
       "------------ getting message from client ------------",
-      "\n", msg, "\n", message, "\n-------------------------------------------------")
-    message = validate_ChannelMessage(message) // will throw if anything wrong
+      "\n", msg, "\n", 
+      message, "\n",
+      "-------------------------------------------------")
 
     if (message.ready) {
       // the client sends a "ready" message when it can start receiving
       if (DEBUG) console.log("got 'ready' message from client")
       const session = this.sessions.get(apiBody.userId)
-      if (!session) throw new Error("Internal Error [L509]")
+      if (!session) throw new Error("Internal Error [L526]")
       else session.ready = true;
       // ToDo: we used to send latest 100 right away; we don't do that anymore.
       // const latest100 = assemblePayload(await this.#getRecentMessages())!; _sb_assert(latest100, "Internal Error [L548]");
       // webSocket.send(latest100);
-      return undefined; // all good
+      return; // all good
     }
 
     // at this point we have a validated, verified, and parsed message
@@ -574,13 +591,13 @@ export class ChannelServer implements DurableObject {
     await this.storage.put(key, messagePayload); // we wait for local to succeed before global
     await this.env.MESSAGES_NAMESPACE.put(key, messagePayload); // now make sure it's in global
 
-    // update our cache
-    this.#appendMessageKeyToCache(key);
-
     if (i2Key) {
       // we don't block on these (TTLs have slightly lower expected SLA)
       this.storage.put(i2Key, messagePayload);
       this.env.MESSAGES_NAMESPACE.put(i2Key, messagePayload);
+    } else {
+      // and currently it's only non-subchannel messages that we cache
+      this.#appendMessageKeyToCache(key);
     }
 
     // everything looks good. we broadcast to all connected clients (if any)
@@ -633,9 +650,9 @@ export class ChannelServer implements DurableObject {
           return;
         }
         try {
-          const messagePayload = await this.#processMessage(msg.data, apiBody)
-          if (!messagePayload) return; // nothing to do (not an error)
-
+          const message = extractPayload(msg.data).payload
+          if (!message) throw new Error("ERROR: could not process message payload")
+          await this.#processMessage(message, apiBody); // apiBody from original setup
         } catch (error: any) {
           console.error(`ERROR: failed to process message: ${error.message}`)
           webSocket.send(JSON.stringify({ error: `ERROR: failed to process message: ${error.message}` }));
@@ -696,6 +713,7 @@ export class ChannelServer implements DurableObject {
   async #getRecentMessages(howMany: number = 100, cursor = ''): Promise<Map<string, unknown>> {
     const listOptions: DurableObjectListOptions = { limit: howMany, prefix: this.channelId!, reverse: true };
     if (cursor !== '')
+      // actually this is suboptimal, but it won't matter in new design
       listOptions.end = cursor; // not '.startAfter'; fetches up to cursor
 
     // gets (lexicographically) latest 'howMany' keys
@@ -741,6 +759,44 @@ export class ChannelServer implements DurableObject {
     return returnResult(request, this.recentKeysCache)
   }
 
+  // return messages matching set of keys
+  async #getMessages(request: Request, apiBody: ChannelApiBody) {
+    _sb_assert(apiBody && apiBody.apiPayload, "getMessages(): need payload (the keys)")
+    if (DEBUG) console.log("==== ChannelServer.getMessages() called ====")
+    try {
+      if (!(apiBody.apiPayload instanceof Set)) throw new Error("[getMessages] payload needs to be a set of keys")
+      const clientKeys = apiBody.apiPayload as Set<string>
+      const validKeys = [];
+      for (const key of clientKeys) {
+        if (this.messageKeysCacheMap.has(key)) {
+          validKeys.push(key);
+        }
+      }
+      if (validKeys.length === 0) return returnError(request, "[getMessages] No valid keys found", 400)
+      const getOptions: DurableObjectGetOptions = { allowConcurrency: true };
+      const messages = await this.storage.get(validKeys, getOptions);
+      _sb_assert(messages, "Internal Error [L777]");
+      return returnResult(request, messages);
+    } catch (error: any) {
+      return returnError(request, error.message, 400);
+    }
+  }
+
+
+  // clientKeys: Set<string>): Promise<Map<string, unknown>> {
+
+  //   // Filter the client-provided keys against the messageKeysCacheMap
+  //   const validKeys = [...clientKeys].filter(key => this.messageKeysCacheMap.has(key));
+
+  //   // Fetch the objects from storage that correspond to the valid keys
+  //   const getOptions: DurableObjectGetOptions = { allowConcurrency: true };
+  //   const messages = await this.storage.get(validKeys, getOptions);
+  //   _sb_assert(messages, "Internal Error [L475]");
+
+  //   // Return the fetched messages
+  //   return messages;
+  // }
+
   async #handleChannelCapacityChange(request: Request) {
     const { searchParams } = new URL(request.url);
     const newLimit = searchParams.get('capacity');
@@ -748,10 +804,12 @@ export class ChannelServer implements DurableObject {
     this.storage.put('room_capacity', this.channelCapacity)
     return returnResultJson(request, { capacity: newLimit });
   }
+  
 
   async #acceptVisitor(request: Request, apiBody: ChannelApiBody) {
-    _sb_assert(apiBody.apiPayload, "acceptVisitor(): need to provide userId")
-    const data = extractPayload(apiBody.apiPayload!).payload
+    _sb_assert(apiBody.apiPayload, "[acceptVisitor] need to provide userId")
+    // const data = extractPayload(apiBody.apiPayload!).payload
+    const data = apiBody.apiPayload
     if (data && data.userId && typeof data.userId === 'string') {
       if (!this.accepted.has(data.userId)) {
         if (this.accepted.size >= this.channelCapacity)
@@ -763,7 +821,7 @@ export class ChannelServer implements DurableObject {
       }
       return returnSuccess(request);
     } else {
-      return returnError(request, "acceptVisitor(): could not parse the provided userId", 400)
+      return returnError(request, "[acceptVisitor] could not parse the provided userId", 400)
     }
   }
 
@@ -1018,10 +1076,14 @@ export class ChannelServer implements DurableObject {
 
   async #createChannel(request: Request, apiBody: ChannelApiBody): Promise<Response | null> {
     // request cloning is done by callee
-
-    var _cd: SBChannelData = extractPayload(apiBody.apiPayload!).payload
-    _cd = validate_SBChannelData(_cd) // will throw if anything wrong
-    _sb_assert(_cd.storageToken, "[createChannel()] storageToken missing in API call")
+    var _cd: SBChannelData | undefined = undefined
+    try {
+      // var _cd: SBChannelData = extractPayload(apiBody.apiPayload!).payload
+      _cd = validate_SBChannelData(apiBody.apiPayload) // will throw if anything wrong
+      if (!_cd.storageToken) return returnError(request, "[createChannel] storageToken missing in API call")
+    } catch (error: any) {
+      return returnError(request, "[createChannel] unable to parse channelData payload", 400);
+    }
     const newChannelId = _cd.channelId
 
     if (DEBUG) console.log("++++ createChannel() from token: channelData:\n====\n", _cd, "\n", "====")
