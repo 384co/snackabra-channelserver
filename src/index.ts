@@ -170,6 +170,7 @@ type SessionType = {
  */
 export class ChannelServer implements DurableObject {
   channelId?: SBChannelId; // convenience copy of what's in channeldata
+
   /* all these properties are backed in storage (both global and DO KV) with below keys */
   /* ----- these do not change after creation ----- */
   /* 'channelData'         */ channelData?: SBChannelData
@@ -182,6 +183,7 @@ export class ChannelServer implements DurableObject {
   /* 'locked'              */ locked: boolean = false;
   /* 'visitors'            */ visitors: Map<SBUserId, SBUserPublicKey> = new Map();
   /* 'accepted'            */ accepted: Set<SBUserId> = new Set();
+
   /* the rest are for run time and are not backed up as such to KVs  */
   visitorKeys: Map<SBUserId, SB384> = new Map();    // convenience caching of SB384 objects for any visitors
   sessions: Map<SBUserId, SessionType> = new Map(); // track open (websocket) sessions, keyed by userId
@@ -227,6 +229,7 @@ export class ChannelServer implements DurableObject {
       "/getChannelKeys": this.#getChannelKeys.bind(this),
       "/getMessageKeys": this.#getMessageKeys.bind(this),
       "/getMessages": this.#getMessages.bind(this),
+      "/getPubKeys": this.#getPubKeys.bind(this),
       "/getStorageLimit": this.#getStorageLimit.bind(this), // ToDo: should be per-userid basis
       "/oldMessages": this.#handleOldMessages.bind(this),
       "/registerDevice": this.#registerDevice.bind(this), // deprecated/notfunctional
@@ -271,12 +274,7 @@ export class ChannelServer implements DurableObject {
       this.channelId = channelData.channelId;
       this.channelData = channelData
 
-      // we prefetch message keys; 1000 is max.  we only prefetch/cache non-subchannel messages for now
-      const listOptions: DurableObjectListOptions = { limit: 1000, prefix: this.channelId! + '______', reverse: true };
-      const keys = Array.from((await this.storage.list(listOptions)).keys());
-      if (keys) this.messageKeysCache = keys // else leave it empty
-      this.lastCacheTimestamp = this.lastTimestamp; // todo: add a check that ts of last key is same
-      this.messageKeysCacheMap = new Map(keys.map((key, index) => [key, index]));
+      this.refreshCache() // see below
 
       if (DEBUG) console.log("++++ Done initializing channel:\n", this.channelId, '\n', this.channelData)
       if (DEBUG2) console.log(SEP, 'Full DO info\n', this, '\n', SEP)
@@ -286,6 +284,16 @@ export class ChannelServer implements DurableObject {
       throw new Error(msg)
     }
   }
+
+  async refreshCache() {
+    // we prefetch message keys; 1000 is max.  we only prefetch/cache non-subchannel messages for now
+    const listOptions: DurableObjectListOptions = { limit: 1000, prefix: this.channelId! + '______', reverse: true };
+    const keys = Array.from((await this.storage.list(listOptions)).keys());
+    if (keys) this.messageKeysCache = keys // else leave it empty
+    this.lastCacheTimestamp = this.lastTimestamp; // todo: add a check that ts of last key is same
+    this.messageKeysCacheMap = new Map(keys.map((key, index) => [key, index]));
+  }
+
 
   // this is the fetch picked up by the Durable Object
   async fetch(request: Request) {
@@ -582,7 +590,8 @@ export class ChannelServer implements DurableObject {
     // we make sure any message has been stored properly before we broadcast it
 
     // strip it and package it
-    const messagePayload = assemblePayload(new Map([[key, assemblePayload(this.#stripChannelMessage(message))]]))!
+    // const messagePayload = assemblePayload(new Map([[key, assemblePayload(this.#stripChannelMessage(message))]]))!
+    const messagePayload = assemblePayload(this.#stripChannelMessage(message))!
 
     // ToDo: deduct storage from channel budget for message
     //       and user budget as well. use sizeOf(messagePayload) as base (and adjust down for TTL)
@@ -750,7 +759,12 @@ export class ChannelServer implements DurableObject {
     // const cursor = searchParams.get('cursor') || '';
 
     // main cache should always be in sync
-    _sb_assert(this.lastCacheTimestamp === this.lastTimestamp, "Internal Error [L735]")
+    // _sb_assert(this.lastCacheTimestamp === this.lastTimestamp, "Internal Error [L735]")
+    if (this.lastCacheTimestamp !== this.lastTimestamp) {
+      if (DEBUG) console.log("**** message cache is out of sync, reloading it ...")
+      this.refreshCache()
+    }
+
     if (this.lastL1CacheTimestamp !== this.lastTimestamp) {
       // L1 cache is not up-to-date, update it from the L2 cache
       this.recentKeysCache = new Set(this.messageKeysCache.slice(-100));
@@ -758,7 +772,12 @@ export class ChannelServer implements DurableObject {
     this.lastL1CacheTimestamp = this.lastTimestamp;
     return returnResult(request, this.recentKeysCache)
   }
-
+  
+  // return known set of userId (hash) -> public key
+  async #getPubKeys(request: Request, _apiBody: ChannelApiBody) {
+    return returnResult(request, this.visitors)
+  }
+  
   // return messages matching set of keys
   async #getMessages(request: Request, apiBody: ChannelApiBody) {
     _sb_assert(apiBody && apiBody.apiPayload, "getMessages(): need payload (the keys)")
@@ -776,6 +795,7 @@ export class ChannelServer implements DurableObject {
       const getOptions: DurableObjectGetOptions = { allowConcurrency: true };
       const messages = await this.storage.get(validKeys, getOptions);
       _sb_assert(messages, "Internal Error [L777]");
+      // if (DEBUG) console.log(SEP, "==== ChannelServer.getMessages() returning ====\n", messages, "\n", SEP)
       return returnResult(request, messages);
     } catch (error: any) {
       return returnError(request, error.message, 400);
