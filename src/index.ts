@@ -22,7 +22,7 @@
 
 */
 
-import { sbCrypto, extractPayload, assemblePayload, ChannelMessage, setDebugLevel } from 'snackabra'
+import { sbCrypto, extractPayload, assemblePayload, ChannelMessage, stripChannelMessage, setDebugLevel } from 'snackabra'
 import type { EnvType } from './env'
 import { VERSION } from './env'
 import { _sb_assert, returnResult, returnResultJson, returnError, returnSuccess, handleErrors, serverConstants, _appendBuffer } from './workers'
@@ -487,20 +487,6 @@ export class ChannelServer implements DurableObject {
     }
   }
 
-  // safety/privacy measures
-  #stripChannelMessage(msg: ChannelMessage): ChannelMessage {
-    const ret: ChannelMessage = {}
-    if (msg.f) ret.f = msg.f; else throw new Error("ERROR: missing 'f' ('from') in message")
-    if (msg.c) ret.c = msg.c; else throw new Error("ERROR: missing 'ec' ('encrypted contents') in message")
-    if (msg.iv) ret.iv = msg.iv; else throw new Error("ERROR: missing 'iv' ('nonce') in message")
-    if (msg.s) ret.s = msg.s; else throw new Error("ERROR: missing 's' ('signature') in message")
-    if (msg.ts) ret.ts = msg.ts; else throw new Error("ERROR: missing 'ts' ('timestamp') in message")
-    if (msg.ttl && msg.ttl !== 0xF) ret.ttl = msg.ttl; // optional, and we strip default
-    if (msg.t) ret.t = msg.t; // optional
-    if (msg.i2 && msg.i2 !== '____') ret.i2 = msg.i2; // optional, also we strip out default value
-    return ret
-  }
-
   #appendMessageKeyToCache(newKey: string): void {
     if (this.messageKeysCache.length > 5000) {
       // kludgy limiting of state size
@@ -590,8 +576,8 @@ export class ChannelServer implements DurableObject {
     // we make sure any message has been stored properly before we broadcast it
 
     // strip it and package it
-    // const messagePayload = assemblePayload(new Map([[key, assemblePayload(this.#stripChannelMessage(message))]]))!
-    const messagePayload = assemblePayload(this.#stripChannelMessage(message))!
+    // const messagePayload = assemblePayload(new Map([[key, assemblePayload(stripChannelMessage(message))]]))!
+    const messagePayload = assemblePayload(stripChannelMessage(message))!
 
     // ToDo: deduct storage from channel budget for message
     //       and user budget as well. use sizeOf(messagePayload) as base (and adjust down for TTL)
