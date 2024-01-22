@@ -514,10 +514,9 @@ export class ChannelServer implements DurableObject {
     // }
 
     const message: ChannelMessage = validate_ChannelMessage(msg) // will throw if anything wrong
-    if (DEBUG) console.log(
+    if (DEBUG2) console.log(
       "------------ getting message from client ------------",
-      "\n", msg, "\n", 
-      message, "\n",
+      "\n", message, "\n",
       "-------------------------------------------------")
 
     if (message.ready) {
