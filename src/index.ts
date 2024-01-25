@@ -22,10 +22,10 @@
 
 */
 
-import { sbCrypto, extractPayload, assemblePayload, ChannelMessage, stripChannelMessage, setDebugLevel } from 'snackabra'
+import { sbCrypto, extractPayload, assemblePayload, ChannelMessage, stripChannelMessage, setDebugLevel, base62ToArrayBuffer, composeMessageKey } from 'snackabra'
 import type { EnvType } from './env'
 import { VERSION } from './env'
-import { _sb_assert, returnResult, returnResultJson, returnError, returnSuccess, handleErrors, serverConstants, _appendBuffer } from './workers'
+import { _sb_assert, returnResult, returnResultJson, returnError, returnSuccess, handleErrors, serverConstants, serverApiCosts, _appendBuffer } from './workers'
 
 console.log(`\n===============\n[channelserver] Loading version ${VERSION}\n===============\n`)
 
@@ -48,9 +48,9 @@ export default {
     if (DEBUG) {
       const msg = `==== [${request.method}] Fetch called: ${request.url}`;
       console.log(
-        `\n${'='.repeat(msg.length)}` +
+        `\n${'='.repeat(Math.max(msg.length, 60))}` +
         `\n${msg}` +
-        `\n${'='.repeat(msg.length)}`
+        `\n${'='.repeat(Math.max(msg.length, 60))}`
       );
       if (DEBUG2) console.log(request.headers);
     }
@@ -75,6 +75,8 @@ async function handleApiRequest(path: Array<string>, request: Request, env: EnvT
       case 'channel':
         if (!path[1]) throw new Error("channel needs more params")
         // todo: currently ALL api calls are routed through the DO, but there are some we could do at the microservice level
+        // TODO: actually we can move apiBody initial processing to here, and pass it to the DO;
+        //       that allows us to do some processing here (eg. verify signature) and not in the DO.
         return callDurableObject(path[1], path.slice(2), request, env);
       case "notifications":
         return returnError(request, "Device (Apple) notifications are disabled (use web notifications)", 400);
@@ -231,7 +233,7 @@ export class ChannelServer implements DurableObject {
       "/getMessages": this.#getMessages.bind(this),
       "/getPubKeys": this.#getPubKeys.bind(this),
       "/getStorageLimit": this.#getStorageLimit.bind(this), // ToDo: should be per-userid basis
-      "/oldMessages": this.#handleOldMessages.bind(this),
+      // "/oldMessages": this.#handleOldMessages.bind(this),
       "/registerDevice": this.#registerDevice.bind(this), // deprecated/notfunctional
       "/send": this.#handleSend.bind(this),
       "/storageRequest": this.#handleNewStorage.bind(this),
@@ -309,29 +311,33 @@ export class ChannelServer implements DurableObject {
       if (DEBUG) console.log("111111 ==== ChannelServer.fetch() ==== phase ONE ==== 111111")
       // phase 'one' - sort out parameters
       const requestClone = request.clone(); // todo: might not be needed to be fully cloned here
-      var _apiBody: ChannelApiBody
-      const contentType = request.headers.get('content-type')
-      if (!(request.method === 'POST' && contentType && request.body)) {
-        if (DEBUG) {
-          console.log("---- fetch() called, but not 'POST' and/or no body")
-          console.log(request.method)
-          console.log(contentType)
-          console.log(request.body)
-        }
-        return returnError(request, "Channel API call yet no body content or malformed body", 400)
-      }
 
-      // we accept json or binary (but soon only binary)
-      if (contentType.indexOf("application/json") !== -1) {
-        _apiBody = jsonParseWrapper(await request.json(), "L289");
-        console.warn("WARNING: using JSON for channel API call, soon to be deprecated (use binary)")
-      } else if (contentType.indexOf("application/octet-stream") !== -1) {
-        const ab = await request.arrayBuffer()
-        _apiBody = extractPayload(ab).payload
+      // if (!(request.method === 'POST' && contentType && request.body)) {
+      //   if (DEBUG) {
+      //     console.log("---- fetch() called, but not 'POST' and/or no body")
+      //     console.log(request.method)
+      //     console.log(contentType)
+      //     console.log(request.body)
+      //   }
+      //   return returnError(request, "Channel API call yet no body content or malformed body", 400)
+      // }
+
+      // if (contentType.indexOf("application/json") !== -1) {
+      //   _apiBody = jsonParseWrapper(await request.json(), "L289");
+      //   console.warn("WARNING: using JSON for channel API call, soon to be deprecated (use binary)")
+      // }
+
+      const contentType = request.headers.get('content-type');
+      let _apiBody: ChannelApiBody | null = null;
+      if (contentType?.includes("application/octet-stream")) {
+        _apiBody = extractPayload(await request.arrayBuffer()).payload;
       } else {
-        return returnError(request, `Channel API call but do not understand content type ${contentType}`, 400)
+        const apiBodyBuf62 = new URL(request.url).searchParams.get('apiBody');
+        const apiBodyBuf = apiBodyBuf62 ? base62ToArrayBuffer(apiBodyBuf62) : null;
+        _apiBody = apiBodyBuf ? extractPayload(apiBodyBuf).payload : null
       }
-      const apiBody = validate_ChannelApiBody(_apiBody) // will throw if anything wrong
+      if (!_apiBody) return returnError(request, "Channel API - cannot find and/or parse apiBody", 400);
+      const apiBody = validate_ChannelApiBody(_apiBody); // will throw if anything wrong
 
       // if there's an apiPayloadBuf, we need to extract it
       if (apiBody.apiPayload) return returnError(request, "[fetch]: do not provide 'apiPayload'", 400)
@@ -495,15 +501,14 @@ export class ChannelServer implements DurableObject {
       this.messageKeysCache = keys
       this.messageKeysCacheMap = new Map(keys.map((key, index) => [key, index]));
     }
-
     this.messageKeysCache.push(newKey);
     this.messageKeysCacheMap.set(newKey, this.messageKeysCache.length - 1);
-    
   }
   
-  // process message, whether coming asynchronously from API call, or from websocket
-  // throw any issues back to caller. all new messages come through here.
+  // all messages come through here. they're either through api call or websocket.
+  // any issues will throw.
   async #processMessage(msg: any, apiBody: ChannelApiBody): Promise<void> {
+
     // var message: ChannelMessage = {}
     // if (typeof msg === "string") {
     //   message = jsonParseWrapper(msg.toString(), 'L594');
@@ -513,14 +518,13 @@ export class ChannelServer implements DurableObject {
     //   throw new Error("Cannot parse contents type (not json nor arraybuffer)")
     // }
 
-    const message: ChannelMessage = validate_ChannelMessage(msg) // will throw if anything wrong
-    if (DEBUG2) console.log(
-      "------------ getting message from client ------------",
-      "\n", message, "\n",
+    if (DEBUG) console.log(
+      "------------ getting message from client (pre validation) ------------",
+      "\n", msg, "\n",
       "-------------------------------------------------")
 
-    if (message.ready) {
-      // the client sends a "ready" message when it can start receiving
+    if (msg.ready) {
+      // the client sends a "ready" message when it can start receiving; reception means websocket is all set up
       if (DEBUG) console.log("got 'ready' message from client")
       const session = this.sessions.get(apiBody.userId)
       if (!session) throw new Error("Internal Error [L526]")
@@ -530,6 +534,8 @@ export class ChannelServer implements DurableObject {
       // webSocket.send(latest100);
       return; // all good
     }
+
+    const message: ChannelMessage = validate_ChannelMessage(msg) // will throw if anything wrong
 
     // at this point we have a validated, verified, and parsed message
     // a few minor things to check before proceeding
@@ -547,41 +553,58 @@ export class ChannelServer implements DurableObject {
       message.i2 = '____' // default; use to keep track of where we're at in processing
     }
 
-    // Time stamps are monotonically increasing. We enforce that they must be different.
-    // Stored as a string of [0-3] to facilitate prefix searches (within 4x time ranges).
-    // We append "0000" for future needs, for example if we need above 1000 messages per second.
-    // Can represent epoch timestamps for the next 400+ years.
     const tsNum = Math.max(Date.now(), this.lastTimestamp + 1);
+    message.sts = tsNum; // server timestamp
     this.lastTimestamp = tsNum;
     this.storage.put('lastTimestamp', tsNum)
-    const ts = tsNum.toString(4).padStart(22, "0") + "0000" // total length 26
 
     // appending timestamp to channel id. this is global, unique message identifier
-    const key = this.channelId + '_' + message.i2 + '_' + ts;
+    // const key = this.channelId + '_' + message.i2 + '_' + ts;
+    const key = composeMessageKey(this.channelId!, tsNum, message.i2)
 
     // TODO: sync TTL with 'i2'
     var i2Key: string | null = null
     if (message.ttl && message.ttl > 0 && message.ttl < 0xF) {
+      // these are the cases where messages are also stored under a TTL subchannel
       if (message.i2[3] === '_') {
         // if there's a TTL, you can't have a subchannel using last character, this is an error
         if (DEBUG) console.error("ERROR: subchannel cannot be used with TTL")
         throw new Error("Subchannel cannot be used with TTL. Discarding message.")
       } else {
-        // ttl is a digit 1-9, we append that to the i2 centerpiece
-        i2Key = this.channelId + '_' + message.i2.slice(0, 3) + message.ttl + '_' + ts;
+        // ttl is a digit 1-9, we append that to the i2 centerpiece (eg encoded in subchannel)
+        // i2Key = this.channelId + '_' + message.i2.slice(0, 3) + message.ttl + '_' + ts;
+        i2Key = composeMessageKey(this.channelId!, tsNum, message.i2.slice(0, 3) + message.ttl)
       }
     }
 
-    // we make sure any message has been stored properly before we broadcast it
+    // messages with destinations are not allowed to have a long-term TTL
+    if (!message.ttl || message.ttl > 0x8) { // max currently defined message age, 10 days
+      if (message.t)
+        throw new Error("ERROR: any 'to' (routed) message must have a short TTL")
+    }
 
-    // strip it and package it
-    // const messagePayload = assemblePayload(new Map([[key, assemblePayload(stripChannelMessage(message))]]))!
+    // strip (minimize) it and, package it, result chunk is stand-alone except for channelId
     const messagePayload = assemblePayload(stripChannelMessage(message))!
 
-    // ToDo: deduct storage from channel budget for message
-    //       and user budget as well. use sizeOf(messagePayload) as base (and adjust down for TTL)
+    // final, final, we enforce storage limit
+    const messagePayloadSize = messagePayload.byteLength
+    if (messagePayloadSize > serverConstants.MAX_SB_BODY_SIZE) {
+      if (DEBUG) console.error(`ERROR: message too large (${messagePayloadSize} bytes)`)
+      throw new Error("Message too large. Discarding message.");
+    }
 
-    // and store it for posterity both local and global KV
+    if (DEBUG && messagePayloadSize <= 1024)
+      console.log("[info] this message could be stored as metadata (size <= 1KB)")
+
+    // consume storage budget
+    if ((messagePayloadSize * serverApiCosts.CHANNEL_STORAGE_MULTIPLIER) > this.storageLimit)
+      throw new Error("Storage limit exceeded. Message cannot be stored or broadcast. Discarding message.");
+    this.storageLimit -= (messagePayloadSize * serverApiCosts.CHANNEL_STORAGE_MULTIPLIER);
+    await this.storage.put('storageLimit', this.storageLimit)
+
+    // todo: add per-user budget limits; also adjust down cost for TTL
+
+    // and store it for posterity both local and global KV, before we broadcast
     await this.storage.put(key, messagePayload); // we wait for local to succeed before global
     await this.env.MESSAGES_NAMESPACE.put(key, messagePayload); // now make sure it's in global
 
@@ -648,7 +671,9 @@ export class ChannelServer implements DurableObject {
           if (!message) throw new Error("ERROR: could not process message payload")
           await this.#processMessage(message, apiBody); // apiBody from original setup
         } catch (error: any) {
-          console.error(`ERROR: failed to process message: ${error.message}`)
+          console.error(`[channel server websocket listener] error: <<${error.message}>>`)
+          // console.log(msg)
+          console.log(msg.data)
           webSocket.send(JSON.stringify({ error: `ERROR: failed to process message: ${error.message}` }));
         }
       } catch (error: any) {
@@ -702,40 +727,40 @@ export class ChannelServer implements DurableObject {
     );
   }
 
-    // Older API
-  // fetch most recent messages from local (worker) KV
-  async #getRecentMessages(howMany: number = 100, cursor = ''): Promise<Map<string, unknown>> {
-    const listOptions: DurableObjectListOptions = { limit: howMany, prefix: this.channelId!, reverse: true };
-    if (cursor !== '')
-      // actually this is suboptimal, but it won't matter in new design
-      listOptions.end = cursor; // not '.startAfter'; fetches up to cursor
+  //   // Older API
+  // // fetch most recent messages from local (worker) KV
+  // async #getRecentMessages(howMany: number = 100, cursor = ''): Promise<Map<string, unknown>> {
+  //   const listOptions: DurableObjectListOptions = { limit: howMany, prefix: this.channelId!, reverse: true };
+  //   if (cursor !== '')
+  //     // actually this is suboptimal, but it won't matter in new design
+  //     listOptions.end = cursor; // not '.startAfter'; fetches up to cursor
 
-    // gets (lexicographically) latest 'howMany' keys
-    const keys = Array.from((await this.storage.list(listOptions)).keys());
-    _sb_assert(keys, "Internal Error [L469]")
+  //   // gets (lexicographically) latest 'howMany' keys
+  //   const keys = Array.from((await this.storage.list(listOptions)).keys());
+  //   _sb_assert(keys, "Internal Error [L469]")
 
-    // we fetch all keys in one go, then fetch all contents
-    // see this blog post for details on why we're setting allowConcurrency:
-    // https://blog.cloudflare.com/durable-objects-easy-fast-correct-choose-three/
-    const getOptions: DurableObjectGetOptions = { allowConcurrency: true };
-    const messageList = await this.storage.get(keys, getOptions);
-    _sb_assert(messageList, "Internal Error [L475]")
+  //   // we fetch all keys in one go, then fetch all contents
+  //   // see this blog post for details on why we're setting allowConcurrency:
+  //   // https://blog.cloudflare.com/durable-objects-easy-fast-correct-choose-three/
+  //   const getOptions: DurableObjectGetOptions = { allowConcurrency: true };
+  //   const messageList = await this.storage.get(keys, getOptions);
+  //   _sb_assert(messageList, "Internal Error [L475]")
     
-    // update: we now return the raw messageList, and let the caller decide what to do with it
-    return messageList
-  }
+  //   // update: we now return the raw messageList, and let the caller decide what to do with it
+  //   return messageList
+  // }
 
-  // Older API
-  async #handleOldMessages(request: Request) {
-    const { searchParams } = new URL(request.url);
-    const currentMessagesLength = Number(searchParams.get('currentMessagesLength')) || 100;
-    const cursor = searchParams.get('cursor') || '';
-    const messageMap = await this.#getRecentMessages(currentMessagesLength, cursor);
-    // let messageArray: { [key: string]: any } = {};
-    // for (let [key, value] of messageMap)
-    //   messageArray[key] = value;
-    return returnResult(request, messageMap);
-  }
+  // // Older API
+  // async #handleOldMessages(request: Request) {
+  //   const { searchParams } = new URL(request.url);
+  //   const currentMessagesLength = Number(searchParams.get('currentMessagesLength')) || 100;
+  //   const cursor = searchParams.get('cursor') || '';
+  //   const messageMap = await this.#getRecentMessages(currentMessagesLength, cursor);
+  //   // let messageArray: { [key: string]: any } = {};
+  //   // for (let [key, value] of messageMap)
+  //   //   messageArray[key] = value;
+  //   return returnResult(request, messageMap);
+  // }
 
   async #getMessageKeys(request: Request) {
     // ToDo: carry forward these options from handleOldMessages()
@@ -787,7 +812,6 @@ export class ChannelServer implements DurableObject {
     }
   }
 
-
   // clientKeys: Set<string>): Promise<Map<string, unknown>> {
 
   //   // Filter the client-provided keys against the messageKeysCacheMap
@@ -810,7 +834,6 @@ export class ChannelServer implements DurableObject {
     return returnResultJson(request, { capacity: newLimit });
   }
   
-
   async #acceptVisitor(request: Request, apiBody: ChannelApiBody) {
     _sb_assert(apiBody.apiPayload, "[acceptVisitor] need to provide userId")
     // const data = extractPayload(apiBody.apiPayload!).payload
@@ -858,7 +881,7 @@ export class ChannelServer implements DurableObject {
     const { searchParams } = new URL(request.url);
     const size = this.#roundSize(Number(searchParams.get('size')));
     const storageLimit = this.storageLimit;
-    if (size > storageLimit) return returnError(request, 'Not sufficient storage budget left in channel', 507);
+    if (size > storageLimit) return returnError(request, `Not sufficient storage budget left in channel (${this.channelId})`, 507);
     if (size > serverConstants.STORAGE_SIZE_MAX)
       return returnError(request, `Storage size too large (max ${serverConstants.STORAGE_SIZE_MAX} bytes)`, 413);
 

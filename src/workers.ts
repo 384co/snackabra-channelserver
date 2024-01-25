@@ -109,7 +109,16 @@ export const serverConstants = {
 
     // sanity check - set a max at one petabyte (2^50)
     MAX_BUDGET_TRANSFER: 1024 * 1024 * 1024 * 1024 * 1024, // 1 PB
+
+    // see discussion in jslib
+    MAX_SB_BODY_SIZE: 64 * 1024
 }
+
+export const serverApiCosts = {
+    // multiplier of cost of storage on channel vs. storage server
+    CHANNEL_STORAGE_MULTIPLIER: 8,
+}
+
 
 // internal - handle assertions
 export function _sb_assert(val: unknown, msg: string) {
