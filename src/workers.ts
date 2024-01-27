@@ -53,38 +53,35 @@ import { NEW_CHANNEL_MINIMUM_BUDGET as _NEW_CHANNEL_MINIMUM_BUDGET } from 'snack
  * 
  *     Channel API (synchronous)                : [O] means [Owner] only
  *     /api/v2/channel/<ID>/acceptVisitor       : [O]
- *     /api/v2/channel/<ID>/budd                : [O]
- *     /api/v2/channel/<ID>/channelLocked
- *     /api/v2/channel/<ID>/create              : New: create with storage token
- *     /api/v2/channel/<ID>/downloadData
+ *     /api/v2/channel/<ID>/budd                : [O] either creates a new channel or transfers storage
+ *     /api/v2/channel/<ID>/downloadData        :     (v2 version not implemtened)
  *     /api/v2/channel/<ID>/getAdminData        : [O]
- *     /api/v2/channel/<ID>/getChannelKeys      : New: get owner pub key, channel pub key
+ *     /api/v2/channel/<ID>/getCapacity         : [O]
+ *     /api/v2/channel/<ID>/getChannelKeys      :     get owner pub key, channel pub key
  *     /api/v2/channel/<ID>/getJoinRequests     : [O]
  *     /api/v2/channel/<ID>/getMother           : [O]
- *     /api/v2/channel/<ID>/getRoomCapacity     : [O]
- *     /api/v2/channel/<ID>/getStorageLimit     : ToDo: per-userId storage limit system (until then shared)
- *     /api/v2/channel/<ID>/oldMessages
- *     /api/v2/channel/<ID>/ownerUnread         : [O]
- *     /api/v2/channel/<ID>/postPubKey
+ *     /api/v2/channel/<ID>/getPubKeys          :      returns Map<userId, pubKey>
+ *     /api/v2/channel/<ID>/getStorageLimit     :      (under development)
+ *     /api/v2/channel/<ID>/getStorageToken
+ *     /api/v2/channel/<ID>/lockChannel         : [O]
  *     /api/v2/channel/<ID>/send
- *     /api/v2/channel/<ID>/storageRequest
- *     /api/v2/channel/<ID>/updateRoomCapacity  : [O]
- *     /api/v2/channel/<ID>/uploadChannel       : (admin only or with budget channel provided)
- *     /api/v2/channel/<ID>/websocket           : connect to channel socket (wss protocol)
+ *     /api/v2/channel/<ID>/setCapacity         : [O]
+ *     /api/v2/channel/<ID>/uploadChannel       :     (v2 version not implemtened)
+ *     /api/v2/channel/<ID>/websocket           :     connect to channel socket (wss protocol)
  * 
- * The following are in the process of being reviewed / refactored / deprecated:
+ * The following are deprecated or disabled:
  * 
  * ::
  *
  *     /api/v2/notifications        : sign up for notifications (disabled)
- *     /api/v2/channel/<ID>/roomLocked          : (alias for /channelLocked)
- *     /api/v2/channel/<ID>/lockRoom            : [O]
+ *     /api/v2/channel/<ID>/locked              : deprecated, use getAdminData
  *     /api/v2/channel/<ID>/motd                : [O]
  *     /api/v2/channel/<ID>/ownerKeyRotation    : [O] (deprecated)
  *     /api/v2/channel/<ID>/registerDevice      : (disabled)
- *     /api/v2/channel/<ID>/uploadRoom          : (admin only or with budget channel provided)
- *     /api/v2/channel/<ID>/authorizeRoom       : (admin only)
- *     /api/v2/channel/<ID>/getPubKeys          : [O]
+ *     /api/v2/channel/<ID>/authorizeRoom       : (deprecated)
+ *     /api/v2/channel/<ID>/oldMessages         : deprecated
+ *     /api/v2/channel/<ID>/ownerUnread         : deprecated
+ *     /api/v2/channel/<ID>/postPubKey          : deprecated
  * 
  */
 
@@ -99,15 +96,16 @@ export const serverConstants = {
     STORAGE_SIZE_MIN: 8 * _STORAGE_SIZE_UNIT,
 
     // Current maximum (raw) storage is set to 32MB. This may change.
+    // Note that this is for SHARDS not CHANNEL
     STORAGE_SIZE_MAX: 8192 * _STORAGE_SIZE_UNIT,
 
     // minimum when creating (budding) a new channel
     NEW_CHANNEL_MINIMUM_BUDGET: _NEW_CHANNEL_MINIMUM_BUDGET,
 
-    // new channel budget (bootstrap) is 3 GB (about $1)
-    NEW_CHANNEL_BUDGET: 3 * 1024 * 1024 * 1024, // 3 GB
+    // // new channel budget (bootstrap) is 3 GB (about $1)
+    // NEW_CHANNEL_BUDGET: 3 * 1024 * 1024 * 1024, // 3 GB
 
-    // sanity check - set a max at one petabyte (2^50)
+    // sanity check - set a max at one petabyte (2^50) .. at a time
     MAX_BUDGET_TRANSFER: 1024 * 1024 * 1024 * 1024 * 1024, // 1 PB
 
     // see discussion in jslib

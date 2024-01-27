@@ -99,6 +99,13 @@ Follow format from [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/
 
 - added class SBMessageCache. not activated yet.
 
+- all api calls now forced to be binary
+
+- budd() semantics changed
+
+- swept over all api endpoint calls, one change is they
+  are now all in consistent lower camel case
+
 ## [1.1.0] - 2023-03-01
 
 ### Added

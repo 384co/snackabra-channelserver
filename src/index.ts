@@ -22,7 +22,7 @@
 
 */
 
-import { sbCrypto, extractPayload, assemblePayload, ChannelMessage, stripChannelMessage, setDebugLevel, base62ToArrayBuffer, composeMessageKey } from 'snackabra'
+import { sbCrypto, extractPayload, assemblePayload, ChannelMessage, stripChannelMessage, setDebugLevel, base62ToArrayBuffer, composeMessageKey, SBStorageToken, validate_SBStorageToken, SBStorageTokenPrefix } from 'snackabra'
 import type { EnvType } from './env'
 import { VERSION } from './env'
 import { _sb_assert, returnResult, returnResultJson, returnError, returnSuccess, handleErrors, serverConstants, serverApiCosts, _appendBuffer } from './workers'
@@ -34,8 +34,10 @@ var DEBUG = false
 var DEBUG2 = false
 
 import type { SBChannelId, ChannelAdminData, SBUserId, SBChannelData, ChannelApiBody } from 'snackabra';
-import { SB384, arrayBufferToBase64, jsonParseWrapper, 
-  version, validate_ChannelApiBody, validate_ChannelMessage, validate_SBChannelData } from 'snackabra';
+import {
+  SB384, arrayBufferToBase62, jsonParseWrapper,
+  version, validate_ChannelApiBody, validate_ChannelMessage, validate_SBChannelData
+} from 'snackabra';
 import { SBUserPublicKey } from 'snackabra'
 
 const SEP = '='.repeat(60) + '\n'
@@ -84,14 +86,6 @@ async function handleApiRequest(path: Array<string>, request: Request, env: EnvT
         // ToDo: this needs to be modified to receive a userId for each channel requested
         //       as well as limit how many can be queried at once
         return returnError(request, "getLastMessageTimes disabled on this server (see release notes)", 400)
-      // {
-      //   const _rooms: any = await request.json();
-      //   const lastMessageTimes: Array<any> = [];
-      //   for (let i = 0; i < _rooms.length; i++) {
-      //     lastMessageTimes[_rooms[i]] = await lastTimeStamp(_rooms[i], env);
-      //   }
-      //   return returnResult(request, lastMessageTimes, 200);
-      // }
       default:
         return returnError(request, "Not found (this is an API endpoint, the URI was malformed)", 404)
     }
@@ -114,7 +108,7 @@ async function callDurableObject(channelId: SBChannelId, path: Array<string>, re
       "channelId:", channelId, "\n",
       "path:", path, '\n',
       durableObjectId, '\n')
-      // "newUrl:\n", newUrl, SEP) // very wordy
+    // "newUrl:\n", newUrl, SEP) // very wordy
     if (DEBUG2) { console.log(request); console.log(env) }
   }
   // we direct the fetch 'at' the durable object
@@ -144,13 +138,17 @@ function channelServerInfo(request: Request, env: EnvType) {
   var retVal = {
     version: VERSION,
     storageServer: storageUrl,
-    jslibVersion: version
+    jslibVersion: version,
+    apiEndpoints: {
+      visitor: loadedVisitorApiEndpoints,
+      owner: loadedOwnerApiEndpoints
+    },
   }
   return retVal
 }
 
 type ApiCallMap = {
-  [key: string]: ((arg0: Request, arg1: ChannelApiBody) => Promise<Response>) | undefined;
+  [key: string]: ((request: Request, apiBody: ChannelApiBody) => Promise<Response>) | undefined;
 };
 
 type SessionType = {
@@ -164,11 +162,14 @@ type SessionType = {
   receivedUserInfo: boolean
 }
 
+var loadedVisitorApiEndpoints: Array<string> = []
+var loadedOwnerApiEndpoints: Array<string> = []
+
 /**
  *
  * ChannelServer Durable Object Class
  * 
- * One instance per channel/room.
+ * One instance per channel
  */
 export class ChannelServer implements DurableObject {
   channelId?: SBChannelId; // convenience copy of what's in channeldata
@@ -179,7 +180,7 @@ export class ChannelServer implements DurableObject {
   /* 'motherChannel'       */ motherChannel?: SBChannelId
   /* ----- these are updated dynamically      ----- */
   /* 'storageLimit'        */ storageLimit: number = 0;
-  /* 'channelCapacity'     */ channelCapacity: number = 20;
+  /* 'capacity'            */ capacity: number = 20;
   /* 'lastTimestamp'       */ lastTimestamp: number = 0;       // monotonically increasing timestamp
   /* ----- these track access permissions      ----- */
   /* 'locked'              */ locked: boolean = false;
@@ -207,7 +208,7 @@ export class ChannelServer implements DurableObject {
     s += `channelId: ${this.channelData?.channelId}\n`;
     s += `channelData: ${this.channelData}\n`;
     s += `locked: ${this.locked}\n`;
-    s += `channelCapacity: ${this.channelCapacity}\n`;
+    s += `capacity: ${this.capacity}\n`;
     s += `storageLimit: ${this.storageLimit}\n`;
     return s;
   }
@@ -226,26 +227,26 @@ export class ChannelServer implements DurableObject {
     this.storage = state.storage; // per-DO (eg per channel) storage
     this.webNotificationServer = env.WEB_NOTIFICATION_SERVER
     this.visitorCalls = {
-      // there's a 'hidden' "/create" endpoint, see below
-      "/downloadData": this.#downloadAllData.bind(this),
+      "/downloadChannel": this.#downloadChannel.bind(this),
       "/getChannelKeys": this.#getChannelKeys.bind(this),
       "/getMessageKeys": this.#getMessageKeys.bind(this),
       "/getMessages": this.#getMessages.bind(this),
       "/getPubKeys": this.#getPubKeys.bind(this),
       "/getStorageLimit": this.#getStorageLimit.bind(this), // ToDo: should be per-userid basis
-      // "/oldMessages": this.#handleOldMessages.bind(this),
+      "/getStorageToken": this.#getStorageToken.bind(this),
       "/registerDevice": this.#registerDevice.bind(this), // deprecated/notfunctional
-      "/send": this.#handleSend.bind(this),
-      "/storageRequest": this.#handleNewStorage.bind(this),
-      "/uploadChannel": this.#uploadData.bind(this),
+      "/send": this.#send.bind(this),
+      "/uploadChannel": this.#uploadChannel.bind(this),
     }
     this.ownerCalls = {
       "/acceptVisitor": this.#acceptVisitor.bind(this),
-      "/budd": this.#handleBuddRequest.bind(this),
-      "/getAdminData": this.#handleAdminDataRequest.bind(this),
+      "/budd": this.#deposit.bind(this),
+      "/getAdminData": this.#getAdminData.bind(this),
       "/lockChannel": this.#lockChannel.bind(this),
-      "/updateChannelCapacity": this.#handleChannelCapacityChange.bind(this),
+      "/setCapacity": this.#setCapacity.bind(this),
     }
+    loadedVisitorApiEndpoints = Object.keys(this.visitorCalls)
+    loadedOwnerApiEndpoints = Object.keys(this.ownerCalls)
   }
 
   // load channel from storage: either it's been descheduled, or it's a new channel (that has already been created)
@@ -253,10 +254,11 @@ export class ChannelServer implements DurableObject {
     try {
       _sb_assert(channelData && channelData.channelId, "ERROR: no channel data found in parameters (fatal)")
       if (DEBUG) console.log(`==== ChannelServer.initialize() called for channel: ${channelData.channelId} ====`)
+      if (DEBUG) console.log("\n", channelData, "\n", SEP)
 
-      const channelState = await this.storage.get(['channelId', 'channelData', 'motherChannel', 'storageLimit', 'channelCapacity', 'lastTimestamp', 'visitors', 'locked'])
+      const channelState = await this.storage.get(['channelId', 'channelData', 'motherChannel', 'storageLimit', 'capacity', 'lastTimestamp', 'visitors', 'locked'])
       const storedChannelData = jsonParseWrapper(channelState.get('channelData') as string, 'L234') as SBChannelData
-      
+
       if (!channelState || !storedChannelData || !storedChannelData.channelId || storedChannelData.channelId !== channelData.channelId) {
         if (DEBUG) {
           console.log('ERROR: data missing or not matching:')
@@ -268,7 +270,7 @@ export class ChannelServer implements DurableObject {
       }
 
       this.storageLimit = Number(channelState.get('storageLimit')) || 0
-      this.channelCapacity = Number(channelState.get('channelCapacity')) || 20
+      this.capacity = Number(channelState.get('capacity')) || 20
       this.lastTimestamp = Number(channelState.get('lastTimestamp')) || 0;
       this.locked = (channelState.get('locked')) === 'true' ? true : false;
 
@@ -295,7 +297,6 @@ export class ChannelServer implements DurableObject {
     this.lastCacheTimestamp = this.lastTimestamp; // todo: add a check that ts of last key is same
     this.messageKeysCacheMap = new Map(keys.map((key, index) => [key, index]));
   }
-
 
   // this is the fetch picked up by the Durable Object
   async fetch(request: Request) {
@@ -359,18 +360,15 @@ export class ChannelServer implements DurableObject {
       }
 
       if (DEBUG) console.log("222222 ==== ChannelServer.fetch() ==== phase TWO ==== 222222")
-      // phase 'two' - catch 'create' call, it's special
-      
-      if (this.channelId && channelId && (this.channelId !== channelId)) return returnError(request, "Internal Error (L478)");
+      // phase 'two' - catch 'create' call (budding against a new channelId)
 
-      if (apiCall === '/create') {
-        if (this.channelId) return returnError(request, `ERROR: channel already exists (asked to create '${channelId}')`, 400);
-        if (DEBUG) console.log('\n', SEP, '\n', 'NEW CHANNEL ... creating ...')
-        const ret = await this.#createChannel(requestClone, apiBody);
-        if (DEBUG) console.log('.... created\n', SEP)
-        if (ret) return ret; // if there was an error, return it, otherwise it was successful
-        else return returnSuccess(request)
+      if (apiCall === '/budd' && !this.channelId) {
+        if (DEBUG) console.log('\n', SEP, '\n', 'Budding against a new channelId (eg creating/authorizing channel)\n', SEP, apiBody, '\n', SEP)
+        return this.#create(requestClone, apiBody);
       }
+
+      // if (and only if) both are in place, they must be consistent
+      if (this.channelId && channelId && (this.channelId !== channelId)) return returnError(request, "Internal Error (L478)");
 
       if (DEBUG) console.log("333333 ==== ChannelServer.fetch() ==== phase THREE ==== 333333")
       // phase 'three' - check if 'we' just got created, in which case now we self-initialize
@@ -409,7 +407,7 @@ export class ChannelServer implements DurableObject {
         // new visitor
         if (!apiBody.userPublicKey)
           return returnError(request, "Need your userPublicKey on this (or prior) operation/message ...", 401);
-        if (this.visitors.size >= this.channelCapacity) {
+        if (this.visitors.size >= this.capacity) {
           if (DEBUG) console.log(`---- channel ${this.channelId} full, rejecting new visitor ${apiBody.userId}`)
           return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
         }
@@ -433,7 +431,7 @@ export class ChannelServer implements DurableObject {
       const pathAsArrayBuffer = new TextEncoder().encode(apiBody.path).buffer
       const prefixBuf = _appendBuffer(viewBuf, pathAsArrayBuffer)
       const apiPayloadBuf = apiBody.apiPayloadBuf
-      
+
       // verification covers timestamp + path + apiPayload
       const verified = await sbCrypto.verify(sender.signKey, apiBody.sign, apiPayloadBuf ? _appendBuffer(prefixBuf, apiPayloadBuf) : prefixBuf)
       if (!verified) {
@@ -451,7 +449,7 @@ export class ChannelServer implements DurableObject {
       // phase 'six' - we're ready to process the api call!
 
       // ToDo: verify that the 'embeded' path is same as path coming through in request
-    
+
       if (apiCall === "/websocket") {
         console.log("==== ChannelServer.fetch() ==== websocket request ====")
         if (DEBUG) console.log("---- websocket request")
@@ -504,7 +502,7 @@ export class ChannelServer implements DurableObject {
     this.messageKeysCache.push(newKey);
     this.messageKeysCacheMap.set(newKey, this.messageKeysCache.length - 1);
   }
-  
+
   // all messages come through here. they're either through api call or websocket.
   // any issues will throw.
   async #processMessage(msg: any, apiBody: ChannelApiBody): Promise<void> {
@@ -619,12 +617,12 @@ export class ChannelServer implements DurableObject {
 
     // everything looks good. we broadcast to all connected clients (if any)
     this.#broadcast(messagePayload)
-    .catch((error: any) => {
-      throw new Error(`ERROR: failed to broadcast message: ${error.message}`)
-    });
+      .catch((error: any) => {
+        throw new Error(`ERROR: failed to broadcast message: ${error.message}`)
+      });
   }
 
-  async #handleSend(request: Request, apiBody: ChannelApiBody) {
+  async #send(request: Request, apiBody: ChannelApiBody) {
     _sb_assert(apiBody && apiBody.apiPayload, "send(): need payload (the message)")
     if (DEBUG) {
       console.log("==== ChannelServer.handleSend() called ====")
@@ -645,7 +643,7 @@ export class ChannelServer implements DurableObject {
 
     const userKeys = this.visitorKeys.get(apiBody.userId)!
     _sb_assert(userKeys, "Internal Error [L585]")
-    
+
     // Create our session and add it to the sessions list.
     const session: SessionType = {
       userId: apiBody.userId,
@@ -719,7 +717,7 @@ export class ChannelServer implements DurableObject {
           if (DEBUG) console.log("ERROR: failed to send message to session: ", session.userId)
           session.ready = false;
           session.quit = true; // should probably close it
-        } 
+        }
       } else {
         if (DEBUG) console.log(`session not ready, not forwarding message to ${session.userId}`);
       }
@@ -727,43 +725,9 @@ export class ChannelServer implements DurableObject {
     );
   }
 
-  //   // Older API
-  // // fetch most recent messages from local (worker) KV
-  // async #getRecentMessages(howMany: number = 100, cursor = ''): Promise<Map<string, unknown>> {
-  //   const listOptions: DurableObjectListOptions = { limit: howMany, prefix: this.channelId!, reverse: true };
-  //   if (cursor !== '')
-  //     // actually this is suboptimal, but it won't matter in new design
-  //     listOptions.end = cursor; // not '.startAfter'; fetches up to cursor
-
-  //   // gets (lexicographically) latest 'howMany' keys
-  //   const keys = Array.from((await this.storage.list(listOptions)).keys());
-  //   _sb_assert(keys, "Internal Error [L469]")
-
-  //   // we fetch all keys in one go, then fetch all contents
-  //   // see this blog post for details on why we're setting allowConcurrency:
-  //   // https://blog.cloudflare.com/durable-objects-easy-fast-correct-choose-three/
-  //   const getOptions: DurableObjectGetOptions = { allowConcurrency: true };
-  //   const messageList = await this.storage.get(keys, getOptions);
-  //   _sb_assert(messageList, "Internal Error [L475]")
-    
-  //   // update: we now return the raw messageList, and let the caller decide what to do with it
-  //   return messageList
-  // }
-
-  // // Older API
-  // async #handleOldMessages(request: Request) {
-  //   const { searchParams } = new URL(request.url);
-  //   const currentMessagesLength = Number(searchParams.get('currentMessagesLength')) || 100;
-  //   const cursor = searchParams.get('cursor') || '';
-  //   const messageMap = await this.#getRecentMessages(currentMessagesLength, cursor);
-  //   // let messageArray: { [key: string]: any } = {};
-  //   // for (let [key, value] of messageMap)
-  //   //   messageArray[key] = value;
-  //   return returnResult(request, messageMap);
-  // }
-
-  async #getMessageKeys(request: Request) {
+  async #getMessageKeys(request: Request, _apiBody: ChannelApiBody) {
     // ToDo: carry forward these options from handleOldMessages()
+    //       (using abiBody format)
     // const { searchParams } = new URL(request.url);
     // const currentMessagesLength = Number(searchParams.get('currentMessagesLength')) || 100;
     // const cursor = searchParams.get('cursor') || '';
@@ -782,12 +746,12 @@ export class ChannelServer implements DurableObject {
     this.lastL1CacheTimestamp = this.lastTimestamp;
     return returnResult(request, this.recentKeysCache)
   }
-  
+
   // return known set of userId (hash) -> public key
   async #getPubKeys(request: Request, _apiBody: ChannelApiBody) {
     return returnResult(request, this.visitors)
   }
-  
+
   // return messages matching set of keys
   async #getMessages(request: Request, apiBody: ChannelApiBody) {
     _sb_assert(apiBody && apiBody.apiPayload, "getMessages(): need payload (the keys)")
@@ -826,22 +790,22 @@ export class ChannelServer implements DurableObject {
   //   return messages;
   // }
 
-  async #handleChannelCapacityChange(request: Request) {
+  async #setCapacity(request: Request) {
     const { searchParams } = new URL(request.url);
     const newLimit = searchParams.get('capacity');
-    this.channelCapacity = Number(newLimit) || this.channelCapacity;
-    this.storage.put('room_capacity', this.channelCapacity)
+    this.capacity = Number(newLimit) || this.capacity;
+    this.storage.put('capacity', this.capacity)
     return returnResultJson(request, { capacity: newLimit });
   }
-  
+
   async #acceptVisitor(request: Request, apiBody: ChannelApiBody) {
     _sb_assert(apiBody.apiPayload, "[acceptVisitor] need to provide userId")
     // const data = extractPayload(apiBody.apiPayload!).payload
     const data = apiBody.apiPayload
     if (data && data.userId && typeof data.userId === 'string') {
       if (!this.accepted.has(data.userId)) {
-        if (this.accepted.size >= this.channelCapacity)
-          return returnError(request, `This would exceed current channel capacity (${this.channelCapacity}); update that first`, 400)
+        if (this.accepted.size >= this.capacity)
+          return returnError(request, `This would exceed current channel capacity (${this.capacity}); update that first`, 400)
         // add to our accepted list
         this.accepted.add(data.userId)
         // write it back to storage
@@ -875,34 +839,48 @@ export class ChannelServer implements DurableObject {
   }
 
   // channels approve storage by creating storage token out of their budget
-  async #handleNewStorage(request: Request) {
-    // ToDo: per-user storage boundaries
+  async #getStorageToken(request: Request, apiBody: ChannelApiBody) {
+    // TODO: per-user storage boundaries (higher priority now since this will soon support Infinity)
+    _sb_assert(apiBody.apiPayload, "[getStorageToken] needs parameters")
 
-    const { searchParams } = new URL(request.url);
-    const size = this.#roundSize(Number(searchParams.get('size')));
-    const storageLimit = this.storageLimit;
-    if (size > storageLimit) return returnError(request, `Not sufficient storage budget left in channel (${this.channelId})`, 507);
-    if (size > serverConstants.STORAGE_SIZE_MAX)
-      return returnError(request, `Storage size too large (max ${serverConstants.STORAGE_SIZE_MAX} bytes)`, 413);
+    var size = this.#roundSize(Number(apiBody.apiPayload.size)) || 0;
+    if (!size) return returnError(request, "[getStorageToken] size missing in API call, or zero, or can't parse")
+    // get the requested amount, apply various semantics on the budd operation
+    if (size >= 0) {
+      if ((size === Infinity) || (size > serverConstants.MAX_BUDGET_TRANSFER)) {
+        if (DEBUG2) console.log(`this value for transferBudget will be interpreted as stripping (all ${this.storageLimit} bytes):`, size)
+        size = this.storageLimit; // strip it
+      }
+      if (size > this.storageLimit)
+        // if a specific amount is requested that exceeds the budget, we do NOT interpret it as plunder
+        return returnError(request, `[budd()]: Not enough storage budget in mother channel - requested ${size}, ${this.storageLimit} available`, 507);
+    } else {
+      // if it's negative, it's interpreted as how much to leave behind
+      const _leaveBehind = -size;
+      if (_leaveBehind > this.storageLimit)
+        return returnError(request, `[budd()]: Not enough storage budget in mother channel - requested to leave behind ${_leaveBehind}, ${this.storageLimit} available`, 507);
+        size = this.storageLimit - _leaveBehind;
+    }
 
-    this.storageLimit = storageLimit - size;
+    this.storageLimit -= size; // apply reduction
     this.storage.put('storageLimit', this.storageLimit); // here we've consumed it
-    const token = arrayBufferToBase64(crypto.getRandomValues(new Uint8Array(48)).buffer);
-    const tokenData = {
-      token: token,
+
+    const hash = SBStorageTokenPrefix + arrayBufferToBase62(crypto.getRandomValues(new Uint8Array(32)).buffer);
+    const token: SBStorageToken = {
+      hash: hash,
       used: false,
-      size: size,
-      motherChannel: this.channelId,
+      size: size, // note that this is actual size not requested (might be the same)
+      motherChannel: this.channelId!,
       created: Date.now()
     }
-    await this.env.LEDGER_NAMESPACE.put(token, JSON.stringify(tokenData));
+    await this.env.LEDGER_NAMESPACE.put(token.hash, JSON.stringify(validate_SBStorageToken(token)));
     if (DEBUG)
       console.log(`[newStorage()]: Created new storage token for ${size} bytes\n`,
-        SEP, `token: ${token}\n`,
-        SEP, 'tokenData:\n', tokenData, '\n',
+        SEP, `hash: ${token.hash}\n`,
+        SEP, 'token:\n', token, '\n',
         SEP, 'new mother storage limit:', this.storageLimit, '\n',
-        SEP, 'ledger entry:', await this.env.LEDGER_NAMESPACE.get(token), '\n', SEP)
-    return returnResultJson(request, { token: token });
+        SEP, 'ledger entry:', await this.env.LEDGER_NAMESPACE.get(token.hash), '\n', SEP)
+    return returnResult(request, token);
   }
 
   async #getStorageLimit(request: Request) {
@@ -910,90 +888,62 @@ export class ChannelServer implements DurableObject {
     return returnResultJson(request, { storageLimit: this.storageLimit });
   }
 
-  /*
-     Transfer storage budget from one channel to another. Use the target
-     channel's budget, and just get the channel ID from the request
-     and look up and increment it's budget.
-  */
-  async #handleBuddRequest(request: Request): Promise<Response> {
-    // TODO: refactor this, no longer uses SERVER_SECRET etc
-    if (DEBUG)
-      return returnError(request, "budd() needs refactoring", 400)
-    if (DEBUG2) console.log(request)
-    const { searchParams } = new URL(request.url);
-    const targetChannel = searchParams.get('targetChannel');
-
-    if (!targetChannel)
-      return returnError(request, '[budd()]: No target channel specified', 400);
-    if (this.channelId === targetChannel)
-      return returnSuccess(request); // no-op
-    if (!this.storageLimit) {
-      if (DEBUG) console.log("storageLimit missing in mother channel (?)", this.#describe());
-      return returnError(request, `[budd()]: Mother channel (${this.channelId!.slice(0, 12)}...) either does not exist, or has not been initialized, or lacks storage budget`, 400);
+  // fetches the server's point of view on a storage token; any issues an it returns null
+  async #getServerStorageToken(hash: string): Promise<SBStorageToken | null> {
+    if (DEBUG) console.log(`[getServerStorageToken()]: looking up token ${hash} in ledger`)
+    try {
+      const _storage_token = await this.env.LEDGER_NAMESPACE.get(hash);
+      if (DEBUG) console.log(`[getServerStorageToken()]: found token ${hash} in ledger:`, _storage_token)
+      const _ledger_resp = jsonParseWrapper(_storage_token, 'L1090');
+      return validate_SBStorageToken(_ledger_resp)
+    } catch (error: any) {
+      if (DEBUG) console.log(`[getServerStorageToken()]: issues with token ${hash} in ledger:`, error.message)
+      return null;
     }
-
-    // get the requested amount, apply various semantics on the budd operation
-    let transferBudget = this.#roundSize(Number(searchParams.get('transferBudget'))) || 0;
-    if (transferBudget >= 0) {
-      if ((transferBudget === Infinity) || (transferBudget > serverConstants.MAX_BUDGET_TRANSFER)) {
-        if (DEBUG2) console.log(`this value for transferBudget will be interpreted as stripping (all ${this.storageLimit} bytes):`, transferBudget)
-        transferBudget = this.storageLimit; // strip it
-      }
-      if (transferBudget > this.storageLimit)
-        // if a specific amount is requested that exceeds the budget, we do NOT interpret it as plunder
-        return returnError(request, `[budd()]: Not enough storage budget in mother channel - requested ${transferBudget}, ${this.storageLimit} available`, 507);
-    } else {
-      // if it's negative, it's interpreted as how much to leave behind
-      const _leaveBehind = -transferBudget;
-      if (_leaveBehind > this.storageLimit)
-        return returnError(request, `[budd()]: Not enough storage budget in mother channel - requested to leave behind ${_leaveBehind}, ${this.storageLimit} available`, 507);
-      transferBudget = this.storageLimit - _leaveBehind;
-    }
-    if (transferBudget < serverConstants.NEW_CHANNEL_MINIMUM_BUDGET)
-      return returnError(request, `Not enough storage request for a new channel (requested ${transferBudget} but minimum is ${serverConstants.NEW_CHANNEL_MINIMUM_BUDGET} bytes)`, 507);
-
-    const data = await request.arrayBuffer();
-    const jsonString = new TextDecoder().decode(data);
-    let jsonData = jsonString ? jsonParseWrapper(jsonString, 'L1089') : {};
-    if (jsonData.hasOwnProperty("SERVER_SECRET")) return returnError(request, `[budd()]: SERVER_SECRET set? Huh?`, 403);
-
-    // jsonData["SERVER_SECRET"] = this.env.SERVER_SECRET; // authorizing this creation/transfer; ToDo: should not propagate auth in this way
-    jsonData["size"] = transferBudget;
-    jsonData["motherChannel"] = this.channelId; // we leave a birth certificate behind
-
-    const newUrl = new URL(request.url);
-    newUrl.pathname = `/api/channel/${targetChannel}/uploadChannel`;
-    const newRequest = new Request(newUrl.toString(), {
-      method: 'POST',
-      body: JSON.stringify(jsonData),
-      headers: {
-        'Content-Type': 'application/json'
-      }
-    });
-    if (DEBUG) console.log("[budd()]: Converting request to upload request");
-    if (DEBUG2) console.log(newRequest);
-
-    // performing removal of budget - first deduct then kick off creation
-    const newStorageLimit = this.storageLimit - transferBudget;
-    this.storageLimit = newStorageLimit;
-    await this.storage.put('storageLimit', newStorageLimit);
-    if (DEBUG) console.log(`[budd()]: Removed ${transferBudget} bytes from ${this.channelId!.slice(0, 12)}... and forwarding to ${targetChannel.slice(0, 12)}... (new mother storage limit: ${newStorageLimit} bytes)`);
-    // we block on ledger since this will be verified
-    await this.env.LEDGER_NAMESPACE.put(targetChannel, JSON.stringify({ mother: this.channelId, size: transferBudget }));
-    if (DEBUG) console.log('++++ putting budget in ledger ... reading back:', await this.env.LEDGER_NAMESPACE.get(targetChannel))
-
-    // note that if the next operation fails, the ledger entry for the transfer is still there for possible recovery
-    return callDurableObject(targetChannel, ['uploadChannel'], newRequest, this.env)
-
-    // return callDurableObject(targetChannel, [ `budd?targetChannel=${targetChannel}&transferBudget=${size}&serverSecret=${_secret}` ], request, this.env);
   }
 
-  #getAdminData(): ChannelAdminData {
+  // /*
+  //   Transfer storage budget to another channel. Note that this request enters
+  //   the server as 'budd': if the accessed channel does not exist, it is treated
+  //   as this.#create(), otherwise it's treated as this.#deposit().
+  // */
+  // async #deposit(request: Request, apiBody: ChannelApiBody): Promise<Response> {
+  //   _sb_assert(apiBody.apiPayload, "[budd] needs parameters")
+  //   var { targetChannel, transferBudget } = apiBody.apiPayload
+  //   if (!targetChannel) return returnError(request, "[budd] targetChannel missing in API call")
+  //   if (!transferBudget) transferBudget = Infinity // default
+  //   try {
+  //     targetChannel = validate_SBChannelData(apiBody.apiPayload) // will throw if anything wrong
+  //     if (!targetChannel.storageToken) return returnError(request, "[budd] storageToken missing in API call")
+  //     // note that if present, it's already been validated
+  //   } catch (error: any) {
+  //     return returnError(request, "[budd] unable to parse channelData payload", 400);
+  //   }
+  //   if (DEBUG) console.log("++++ deposit() from token: channelData:\n====\n", targetChannel, "\n", "====")
+
+  //   if (this.channelId === targetChannel) return returnResult(request, this.channelData)
+
+  //   // performing removal of budget - first deduct then kick off creation
+  //   const newStorageLimit = this.storageLimit - transferBudget;
+  //   this.storageLimit = newStorageLimit;
+  //   await this.storage.put('storageLimit', newStorageLimit);
+  //   if (DEBUG) console.log(`[budd()]: Removed ${transferBudget} bytes from ${this.channelId!.slice(0, 12)}... and forwarding to ${targetChannel.slice(0, 12)}... (new mother storage limit: ${newStorageLimit} bytes)`);
+  //   // we block on ledger since this will be verified
+  //   await this.env.LEDGER_NAMESPACE.put(targetChannel, JSON.stringify({ mother: this.channelId, size: transferBudget }));
+  //   if (DEBUG) console.log('++++ putting budget in ledger ... reading back:', await this.env.LEDGER_NAMESPACE.get(targetChannel))
+
+  //   // note that if the next operation fails, the ledger entry for the transfer is still there for possible recovery
+  //   return callDurableObject(targetChannel, ['uploadChannel'], newRequest, this.env)
+
+  //   // return callDurableObject(targetChannel, [ `budd?targetChannel=${targetChannel}&transferBudget=${size}&serverSecret=${_secret}` ], request, this.env);
+  // }
+
+  #_getAdminData(): ChannelAdminData {
     const adminData: ChannelAdminData = {
       channelId: this.channelId!,
       channelData: this.channelData!,
       // joinRequests: this.joinRequests,
-      channelCapacity: this.channelCapacity,
+      capacity: this.capacity,
       locked: this.locked,
       accepted: this.accepted,
       storageLimit: this.storageLimit,
@@ -1004,9 +954,9 @@ export class ChannelServer implements DurableObject {
     return adminData
   }
 
-  async #handleAdminDataRequest(request: Request) {
+  async #getAdminData(request: Request) {
     try {
-      const adminData = this.#getAdminData()
+      const adminData = this.#_getAdminData()
       if (DEBUG) console.log("[handleAdminDataRequest] adminData:", adminData)
       return returnResult(request, adminData);
     } catch (err) {
@@ -1065,110 +1015,91 @@ export class ChannelServer implements DurableObject {
     }
   }
 
-  async #downloadAllData(request: Request, apiBody: ChannelApiBody) {
-    const storage = await this.storage.list();
-    const data: any = {
-      channelId: this.channelId,
-      ownerPublicKey: this.channelData!.ownerPublicKey,
-    };
-    storage.forEach((value, key) => {
-      // this gets all messages
-      // TODO: need to filter out admin data and similar and only include messages here
-      data[key] = value;
-    });
-    if (apiBody.isOwner)
-      data.adminData = this.#getAdminData();
-
-    // return returnResult(request, data);
-    if (DEBUG) {
-      console.log("Not returning data .. here is what would have been returned:")
-      console.log(data)
-    }
-    return returnError(request, "downloadAllData is disabled (see TODO in code)", 400)
-
-    // // if (await this.#verifyAuthSign(request).catch((e) => { throw e; })) {
-    //   // additional info for OWNER
-    //   data.adminData = { join_requests: this.joinRequests, capacity: this.channelCapacity };
-    //   data.storageLimit = this.storageLimit;
-    //   // data.accepted_requests = this.acceptedRequests;
-    //   // data.lockedKeys = this.lockedKeys;
-    //   // data.encryptedLockedKeys = this.encryptedLockedKeys;
-    //   data.motherChannel = this.motherChannel;
-    //   // data.pubKeys = this.visitors;
-    //   // data.roomCapacity = this.channelCapacity;
-    // }
-
-    // const dataBlob = new TextEncoder().encode(JSON.stringify(data));
-    // return returnResult(request, dataBlob, 200);
+  async #downloadChannel(request: Request, _apiBody: ChannelApiBody) {
+    return returnError(request, "downloadChannel is disabled", 400)
   }
 
-  async #createChannel(request: Request, apiBody: ChannelApiBody): Promise<Response | null> {
-    // request cloning is done by callee
-    var _cd: SBChannelData | undefined = undefined
+  async #handleBuddRequest(request: Request, apiBody: ChannelApiBody, newChannel: boolean): Promise<Response> {
+    _sb_assert(apiBody.apiPayload, "[budd] needs parameters")
+    var targetChannel: SBChannelData, currentStorageLimit: number = 0;
     try {
-      // var _cd: SBChannelData = extractPayload(apiBody.apiPayload!).payload
-      _cd = validate_SBChannelData(apiBody.apiPayload) // will throw if anything wrong
-      if (!_cd.storageToken) return returnError(request, "[createChannel] storageToken missing in API call")
+      targetChannel = validate_SBChannelData(apiBody.apiPayload) // will throw if anything wrong
+      if (!targetChannel.storageToken) return returnError(request, "[budd] storageToken missing in API call")
     } catch (error: any) {
-      return returnError(request, "[createChannel] unable to parse channelData payload", 400);
+      return returnError(request, "[budd] unable to parse channelData payload", 400);
     }
-    const newChannelId = _cd.channelId
 
-    if (DEBUG) console.log("++++ createChannel() from token: channelData:\n====\n", _cd, "\n", "====")
+    if (newChannel) {
+      if (DEBUG) console.log("[budd] creating new channel\nchannelData:\n====\n", targetChannel, "\n", "====")
+      // sanity check, need to verify channelData is valid (consistent)
+      const targetChannelOwner = await new SB384(targetChannel.ownerPublicKey).ready
+      if (targetChannelOwner.ownerChannelId !== targetChannel.channelId) {
+        // this could be an error, or an attempt to hack
+        console.error("ERROR **** channelData ownerChannelId does not match channelId - possible hack attempt?")
+        return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
+      }  
+    } else {
+      currentStorageLimit = this.storageLimit; // it's a 'deposit' so we are adding to this
+    }
 
-    // note: any issues involving tokens will not be provided detailed client 'debug' info
-    // todo: once this working, simplify the below
-    const _storage_token_hash = await this.env.LEDGER_NAMESPACE.get(_cd.storageToken!);
-    if (!_storage_token_hash) {
-      if(DEBUG) console.log(`ERROR **** Token '${_cd.storageToken}' not found`)
+    const serverToken = await this.#getServerStorageToken(targetChannel.storageToken.hash)
+    if (!serverToken) {
+      console.error(`ERROR **** Having issues processing storage token '${targetChannel.storageToken}'\n`, targetChannel)
       return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
     }
-    const _ledger_resp = _storage_token_hash ? jsonParseWrapper(_storage_token_hash, 'L1307') : null;
-    if (!_ledger_resp) {
-      console.error(`ERROR **** Having issues processing storage token '${_cd.storageToken}'\n`, _storage_token_hash)
+    if (serverToken.used === true) {
+      if (DEBUG) console.log(`ERROR **** Token already used\n`, targetChannel)
       return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
     }
-    if (_ledger_resp.used) {
-      if (DEBUG) console.log(`ERROR **** Token '${_cd.storageToken}' already used\n`, _ledger_resp)
-      return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
-    }
-    if (DEBUG) console.log("++++ createChannel() from token: ledger response: ", _ledger_resp)
+    if (DEBUG) console.log("[budd] consuming this token, ledger side version: ", serverToken)
 
-    const owner = new SB384(_cd.ownerPublicKey)
-    await owner.ready
-    const _ownerPublicKey = owner.userPublicKey
-    _sb_assert(_ownerPublicKey, "ERROR: cannot ingest / process owner public key");
-    if (owner.ownerChannelId !== newChannelId)
-      return returnError(request, "Owner key does not match channel id", 400);
-
-    const storageTokenSize = _ledger_resp.size
-    if (storageTokenSize < serverConstants.NEW_CHANNEL_MINIMUM_BUDGET)
-      return returnError(request, `Not enough for a new channel (minimum is ${serverConstants.NEW_CHANNEL_MINIMUM_BUDGET} bytes)`, 507);
+    if (newChannel && serverToken.size! < serverConstants.NEW_CHANNEL_MINIMUM_BUDGET)
+      return returnError(request, `[budd] Not enough for a new channel (minimum is ${serverConstants.NEW_CHANNEL_MINIMUM_BUDGET} bytes)`, 507);
 
     /*
-     * Above we've parsed and confirmed everything, now we carefully spend
-     * the storage token and initialize the channel. We do this in a way
-     * that we can recover from (most) failures.
+     * Above we've parsed and confirmed everything, now we carefully spend the storage
      */
-    await this.storage.put('channelData', JSON.stringify(_cd)) // now channel exists
-    if (DEBUG) console.log("++++ createChannel() from token, resulting channelData:\n====\n", _cd, "\n", "====")
-    if (_ledger_resp.motherChannel) {
-      await this.storage.put('motherChannel', _ledger_resp.motherChannel); // now we've left breadcrumb
-    } else {
-      await this.storage.put('motherChannel', "<UNKNOWN>");
-      console.warn('No mother channel')
+    if (newChannel) {
+      // initialize new channel ('this')
+      await this.storage.put('channelData', JSON.stringify(targetChannel)) // now channel exists
+      if (serverToken.motherChannel) {
+        await this.storage.put('motherChannel', serverToken.motherChannel); // now we've left breadcrumb
+      } else {
+        await this.storage.put('motherChannel', "<UNKNOWN>");
+        console.error('No mother channel (should no longer happen')
+      }
     }
-    _ledger_resp.used = true;
-    await this.env.LEDGER_NAMESPACE.put(_cd.storageToken!, JSON.stringify(_ledger_resp)) // now token is spent
-    if (DEBUG) console.log(`++++ createChannel() from token: ledger entry (${_cd.storageToken}) updated to:\n`, _ledger_resp)
-    await this.storage.put('storageLimit', storageTokenSize); // and now new channel can spend it
-    if (DEBUG) console.log("++++ createChannel() from token: starting size: ", storageTokenSize)
 
-    await this
-      .#initialize(_cd)
-      .catch(err => { return returnError(request, `Error initializing room [L1385]: ${err}`) });
-    if (DEBUG) console.log("++++ CREATED channel:", this.#describe());
-    return null; // null means no errors
+    // consume token
+    serverToken.used = true;
+    if (DEBUG) console.log("[budd] using token, ledger side updated to: ", serverToken)
+    await this.env.LEDGER_NAMESPACE.put(serverToken.hash, JSON.stringify(serverToken)) // now token is spent
+    // right here tiny chance of any issues, might attempt a transaction in future
+    const newStorageLimit = currentStorageLimit + serverToken.size!;
+    await this.storage.put('storageLimit', newStorageLimit); // and now new channel can spend it
+    if (DEBUG) console.log(`[budd] size at end of transaction: ${newStorageLimit}`)
+
+    if (newChannel) {
+      if (DEBUG) console.log("++++ CALLING #initialize() on new channel")
+      await this
+        .#initialize(targetChannel)
+        .catch(err => { return returnError(request, "ERROR: failed to initialize channel: " + err.message, 400) })
+      if (DEBUG) console.log("++++ CREATED channel:", this.#describe());
+    } else {
+      if (DEBUG) console.log("++++ NOT A NEW CHANNEL - done")
+    }
+    if (DEBUG) console.log("++++ RETURNING channel:", this.#describe());
+    return returnResult(request, this.channelData)
+  }
+
+  
+
+  async #create(request: Request, apiBody: ChannelApiBody) {
+    return this.#handleBuddRequest(request, apiBody, true)
+  }
+
+  async #deposit(request: Request, apiBody: ChannelApiBody) {
+    return this.#handleBuddRequest(request, apiBody, false)
   }
 
   async #getChannelKeys(request: Request) {
@@ -1180,121 +1111,7 @@ export class ChannelServer implements DurableObject {
   }
 
   // used to create channels (from scratch), or upload from backup, or merge
-  async #uploadData(request: Request) {
-    if (DEBUG) console.log("==== uploadData() ====");
-    if (DEBUG) console.log(`current storage limit: ${this.storageLimit} bytes`)
-
-    // if (!this.#channelKeys)
-    //   return returnError(request, "UploadData but not initialized / created", 400);    
-    // const _secret = this.env.SERVER_SECRET;
-
-    const data = await request.arrayBuffer();
-    const jsonString = new TextDecoder().decode(data);
-    const jsonData = jsonParseWrapper(jsonString, 'L1416');
-    if (DEBUG) {
-      console.log("---- uploadData(): jsonData:")
-      console.log(jsonData)
-      console.log('----------------------------')
-    }
-
-    // admin/superuser, eventually this is only dev/local never production
-    // const requestAuthorized = jsonData.hasOwnProperty("SERVER_SECRET") && jsonData["SERVER_SECRET"] === _secret;
-    const storageTokenFunded = (jsonData.hasOwnProperty("storageToken") && this.storageLimit > 0) ? true : false;
-
-    // if (!requestAuthorized) {
-    //   // if not admin, we could be owner, but for now we consume any budget
-    //   const _budget_token_string = jsonData["storageToken"];
-    //   if (_budget_token_string) {
-    //     const _budget_token = JSON.parse(_budget_token_string);
-    //     if (DEBUG) console.log("uploadData(): using budget token: ", _budget_token)
-    //     const _storage_token_hash = await this.env.LEDGER_NAMESPACE.get(_budget_token.token_hash);
-    //     if (!_storage_token_hash) returnError(request, "Invalid budget token", 507);
-    //     const _ledger_resp = jsonParseWrapper(_storage_token_hash, 'L1329');
-    //     if (DEBUG) console.log("uploadData(): _ledger_resp: ", _ledger_resp)
-    //     if (_ledger_resp.used) returnError(request, "Budget token already used", 507);
-    //     // spend it
-    //     _ledger_resp.used = true;
-    //     // we're not too picky on double-using in this case
-    //     await this.env.LEDGER_NAMESPACE.put(_ledger_resp.token_hash, JSON.stringify(_ledger_resp))
-    //     const newOrAddedSize = Number(_ledger_resp.size);
-    //     // we check minimum levels later
-    //     this.storageLimit += newOrAddedSize;
-    //     await this.storage.put("storageLimit", this.storageLimit);
-    //     if (DEBUG) {
-    //       console.log("uploadData(): newOrAddedSize: ", newOrAddedSize)
-    //       console.log("uploadData(): storageLimit: ", this.storageLimit)
-    //     }
-    //   }
-    // }
-
-    const { searchParams } = new URL(request.url);
-    const targetChannel = searchParams.get('targetChannel');
-
-    if (/* (requestAuthorized) && */ (jsonData.hasOwnProperty("size")) && (targetChannel === this.channelId)) {
-      // we take our cue from size, see handleBuddRequest
-      const size = Number(jsonData["size"]);
-      _sb_assert(this.storageLimit !== undefined, "storageLimit undefined");
-      const currentStorage = Number(await this.storage.get("storageLimit"));
-      _sb_assert(currentStorage === this.storageLimit, "storage out of whack");
-      this.storageLimit += size;
-      await this.storage.put("storageLimit", this.storageLimit);
-      if (DEBUG) console.log(`uploadData(): increased budget by ${this.storageLimit} bytes`)
-    }
-
-    // double check minimum budget
-    if (this.storageLimit < serverConstants.NEW_CHANNEL_MINIMUM_BUDGET)
-      return returnError(request, `Channel is left below minimum (minimum is ${serverConstants.NEW_CHANNEL_MINIMUM_BUDGET} bytes)`, 507);
-
-    if ((this.channelData!.ownerPublicKey === jsonData["roomOwner"]) || /* requestAuthorized || */ storageTokenFunded) {
-      if (DEBUG) console.log("==== uploadData() allowed - creating a new channel ====")
-
-      let entriesBuffer: Record<string, string> = {};
-      let i = 0;
-      for (const key in jsonData) {
-        //
-        // TODO:  we want a regex for this, we use it for download and other purposes as well
-        // we only allow imports here of keys that correspond to messages.
-        // in the json they'll look something like: ToDO: no they don't anymore, update this.
-        //
-        // "hvJQMhmhaIQy...ttsu5G6P0110000101110100...110010011": "{\"encrypted_contents\":{\"content\":
-        // \"rZU2T5AYYFwQwHqW0AHW... very long ... zt58AF5MmEv_vLv1jGkU09\",\"iv\":\"IXsC20rryaWx9vU6\"}}",
-        //
-        if (key.length != 106) {
-          if (DEBUG) console.log("uploadData() key skipped on 'upload': ", key)
-        } else if (key.slice(0, 64) === this.channelId) {
-          // the next 42 characters must be combinations of 0 and 1
-          const _key = key.slice(64, 106);
-          if (_key.match(/^[01]+$/)) {
-            // we have a valid key, so we'll store it
-            const newData = jsonData[key];
-            if (newData) {
-              // TODO: deduct from budget
-              // we buffer writes to local object
-              entriesBuffer[key] = newData;
-              // but we can't do that with global
-              this.env.MESSAGES_NAMESPACE.put(key, newData);
-              i += 1;
-              if (i > 100) {
-                this.storage.put(entriesBuffer);
-                entriesBuffer = {};
-                i = 0;
-              }
-            }
-          } else {
-            if (DEBUG) console.log("uploadData() key not allowed (timestamp not valid): ", key)
-          }
-        } else {
-          if (DEBUG) console.log("uploadData() key not allowed (channel id not valid): ", key)
-        }
-      }
-      // we need to store the last batch
-      if (i > 0) {
-        this.storage.put(entriesBuffer);
-      }
-      return returnSuccess(request);
-    } else {
-      if (DEBUG) console.log("uploadData() not allowed (room might be partially created)")
-      return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
-    }
+  async #uploadChannel(request: Request) {
+    return returnError(request, "uploadChannel is disabled", 400)
   }
 }
