@@ -22,10 +22,13 @@
 
 */
 
-import { sbCrypto, extractPayload, assemblePayload, ChannelMessage, stripChannelMessage, setDebugLevel, base62ToArrayBuffer, composeMessageKey, SBStorageToken, validate_SBStorageToken, SBStorageTokenPrefix } from 'snackabra'
+import { sbCrypto, extractPayload, assemblePayload, ChannelMessage, stripChannelMessage, setDebugLevel, composeMessageKey, SBStorageToken, validate_SBStorageToken, SBStorageTokenPrefix } from 'snackabra'
 import type { EnvType } from './env'
 import { VERSION } from './env'
-import { _sb_assert, returnResult, returnResultJson, returnError, returnSuccess, handleErrors, serverConstants, serverApiCosts, _appendBuffer } from './workers'
+import { _sb_assert, returnResult, returnResultJson, returnError, returnSuccess, serverConstants, serverApiCosts, _appendBuffer } from './workers'
+import { processApiBody } from './workers'
+
+import { getServerStorageToken, ANONYMOUS_CANNOT_CONNECT_MSG } from './workers' 
 
 console.log(`\n===============\n[channelserver] Loading version ${VERSION}\n===============\n`)
 
@@ -36,44 +39,43 @@ var DEBUG2 = false
 import type { SBChannelId, ChannelAdminData, SBUserId, SBChannelData, ChannelApiBody } from 'snackabra';
 import {
   SB384, arrayBufferToBase62, jsonParseWrapper,
-  version, validate_ChannelApiBody, validate_ChannelMessage, validate_SBChannelData
+  version, validate_ChannelMessage, validate_SBChannelData
 } from 'snackabra';
 import { SBUserPublicKey } from 'snackabra'
 
 const SEP = '='.repeat(60) + '\n'
 
-// used consistently with delay 50 throughout for any fail conditions to avoid providing any info
-const ANONYMOUS_CANNOT_CONNECT_MSG = "No such channel, or you are not authorized."
+export { default } from './workers'
 
-export default {
-  async fetch(request: Request, env: EnvType) {
-    if (DEBUG) {
-      const msg = `==== [${request.method}] Fetch called: ${request.url}`;
-      console.log(
-        `\n${'='.repeat(Math.max(msg.length, 60))}` +
-        `\n${msg}` +
-        `\n${'='.repeat(Math.max(msg.length, 60))}`
-      );
-      if (DEBUG2) console.log(request.headers);
-    }
-    return await handleErrors(request, async () => {
-      if (request.method == "OPTIONS")
-        return returnResult(request);
-      const path = (new URL(request.url)).pathname.slice(1).split('/');
-      if ((path.length >= 1) && (path[0] === 'api') && (path[1] == 'v2'))
-        return handleApiRequest(path.slice(2), request, env);
-      else
-        return returnError(request, "Not found (must give API endpoint '/api/v2/...')", 404)
-    });
-  }
-}
+// export default {
+//   async fetch(request: Request, env: EnvType) {
+//     if (DEBUG) {
+//       const msg = `==== [${request.method}] Fetch called: ${request.url}`;
+//       console.log(
+//         `\n${'='.repeat(Math.max(msg.length, 60))}` +
+//         `\n${msg}` +
+//         `\n${'='.repeat(Math.max(msg.length, 60))}`
+//       );
+//       if (DEBUG2) console.log(request.headers);
+//     }
+//     return await handleErrors(request, async () => {
+//       if (request.method == "OPTIONS")
+//         return returnResult(request);
+//       const path = (new URL(request.url)).pathname.slice(1).split('/');
+//       if ((path.length >= 1) && (path[0] === 'api') && (path[1] == 'v2'))
+//         return handleApiRequest(path.slice(2), request, env);
+//       else
+//         return returnError(request, "Not found (must give API endpoint '/api/v2/...')", 404)
+//     });
+//   }
+// }
 
 // 'path' is the request path, starting AFTER '/api/v2'
-async function handleApiRequest(path: Array<string>, request: Request, env: EnvType) {
+export async function handleApiRequest(path: Array<string>, request: Request, env: EnvType) {
   try {
     switch (path[0]) {
       case 'info':
-        return returnResultJson(request, channelServerInfo(request, env))
+        return returnResultJson(request, serverInfo(request, env))
       case 'channel':
         if (!path[1]) throw new Error("channel needs more params")
         // todo: currently ALL api calls are routed through the DO, but there are some we could do at the microservice level
@@ -117,7 +119,7 @@ async function callDurableObject(channelId: SBChannelId, path: Array<string>, re
 
 // returns information on the channel server
 // notably the storage server URL that should be used for this channel (from wrangler.toml)
-function channelServerInfo(request: Request, env: EnvType) {
+function serverInfo(request: Request, env: EnvType) {
   const url = new URL(request.url);
   let storageUrl: string | null = null
   if (url.hostname === 'localhost' && url.port === '3845') {
@@ -311,41 +313,12 @@ export class ChannelServer implements DurableObject {
 
       if (DEBUG) console.log("111111 ==== ChannelServer.fetch() ==== phase ONE ==== 111111")
       // phase 'one' - sort out parameters
-      const requestClone = request.clone(); // todo: might not be needed to be fully cloned here
 
-      // if (!(request.method === 'POST' && contentType && request.body)) {
-      //   if (DEBUG) {
-      //     console.log("---- fetch() called, but not 'POST' and/or no body")
-      //     console.log(request.method)
-      //     console.log(contentType)
-      //     console.log(request.body)
-      //   }
-      //   return returnError(request, "Channel API call yet no body content or malformed body", 400)
-      // }
+      // const requestClone = request.clone(); // appears to no longer be needed
+      const requestClone = request;
 
-      // if (contentType.indexOf("application/json") !== -1) {
-      //   _apiBody = jsonParseWrapper(await request.json(), "L289");
-      //   console.warn("WARNING: using JSON for channel API call, soon to be deprecated (use binary)")
-      // }
-
-      const contentType = request.headers.get('content-type');
-      let _apiBody: ChannelApiBody | null = null;
-      if (contentType?.includes("application/octet-stream")) {
-        _apiBody = extractPayload(await request.arrayBuffer()).payload;
-      } else {
-        const apiBodyBuf62 = new URL(request.url).searchParams.get('apiBody');
-        const apiBodyBuf = apiBodyBuf62 ? base62ToArrayBuffer(apiBodyBuf62) : null;
-        _apiBody = apiBodyBuf ? extractPayload(apiBodyBuf).payload : null
-      }
-      if (!_apiBody) return returnError(request, "Channel API - cannot find and/or parse apiBody", 400);
-      const apiBody = validate_ChannelApiBody(_apiBody); // will throw if anything wrong
-
-      // if there's an apiPayloadBuf, we need to extract it
-      if (apiBody.apiPayload) return returnError(request, "[fetch]: do not provide 'apiPayload'", 400)
-      if (apiBody.apiPayloadBuf) {
-        apiBody.apiPayload = extractPayload(apiBody.apiPayloadBuf).payload
-        if (!apiBody.apiPayload) return returnError(request, "[fetch]: cannot extract from provided apiPayloadBuf", 400)
-      }
+      const apiBody = await processApiBody(requestClone) as Response | ChannelApiBody
+      if (apiBody instanceof Response) return apiBody
 
       if (DEBUG) {
         console.log(
@@ -853,7 +826,7 @@ export class ChannelServer implements DurableObject {
       }
       if (size > this.storageLimit)
         // if a specific amount is requested that exceeds the budget, we do NOT interpret it as plunder
-        return returnError(request, `[budd()]: Not enough storage budget in mother channel - requested ${size}, ${this.storageLimit} available`, 507);
+        return returnError(request, `[budd()]: Not enough storage budget in mother channel - requested ${size} from '${this.channelId?.slice(0,8)}...', ${this.storageLimit} available`, 507);
     } else {
       // if it's negative, it's interpreted as how much to leave behind
       const _leaveBehind = -size;
@@ -879,27 +852,16 @@ export class ChannelServer implements DurableObject {
         SEP, `hash: ${token.hash}\n`,
         SEP, 'token:\n', token, '\n',
         SEP, 'new mother storage limit:', this.storageLimit, '\n',
-        SEP, 'ledger entry:', await this.env.LEDGER_NAMESPACE.get(token.hash), '\n', SEP)
+        SEP, 'ledger entry:', await this.env.LEDGER_NAMESPACE.get(token.hash), '\n',
+        SEP, 'separate fetch:', await getServerStorageToken(token.hash, this.env), '\n',
+        SEP, 'this.env:', this.env.LEDGER_NAMESPACE, '\n',
+        SEP)
     return returnResult(request, token);
   }
 
   async #getStorageLimit(request: Request) {
     // ToDo: per-user storage boundaries
     return returnResultJson(request, { storageLimit: this.storageLimit });
-  }
-
-  // fetches the server's point of view on a storage token; any issues an it returns null
-  async #getServerStorageToken(hash: string): Promise<SBStorageToken | null> {
-    if (DEBUG) console.log(`[getServerStorageToken()]: looking up token ${hash} in ledger`)
-    try {
-      const _storage_token = await this.env.LEDGER_NAMESPACE.get(hash);
-      if (DEBUG) console.log(`[getServerStorageToken()]: found token ${hash} in ledger:`, _storage_token)
-      const _ledger_resp = jsonParseWrapper(_storage_token, 'L1090');
-      return validate_SBStorageToken(_ledger_resp)
-    } catch (error: any) {
-      if (DEBUG) console.log(`[getServerStorageToken()]: issues with token ${hash} in ledger:`, error.message)
-      return null;
-    }
   }
 
   // /*
@@ -1042,7 +1004,7 @@ export class ChannelServer implements DurableObject {
       currentStorageLimit = this.storageLimit; // it's a 'deposit' so we are adding to this
     }
 
-    const serverToken = await this.#getServerStorageToken(targetChannel.storageToken.hash)
+    const serverToken = await getServerStorageToken(targetChannel.storageToken.hash, this.env)
     if (!serverToken) {
       console.error(`ERROR **** Having issues processing storage token '${targetChannel.storageToken}'\n`, targetChannel)
       return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
@@ -1077,6 +1039,7 @@ export class ChannelServer implements DurableObject {
     // right here tiny chance of any issues, might attempt a transaction in future
     const newStorageLimit = currentStorageLimit + serverToken.size!;
     await this.storage.put('storageLimit', newStorageLimit); // and now new channel can spend it
+    this.storageLimit = newStorageLimit; // and now new channel can spend it
     if (DEBUG) console.log(`[budd] size at end of transaction: ${newStorageLimit}`)
 
     if (newChannel) {
@@ -1086,13 +1049,13 @@ export class ChannelServer implements DurableObject {
         .catch(err => { return returnError(request, "ERROR: failed to initialize channel: " + err.message, 400) })
       if (DEBUG) console.log("++++ CREATED channel:", this.#describe());
     } else {
-      if (DEBUG) console.log("++++ NOT A NEW CHANNEL - done")
+      if (DEBUG) console.log("++++ NOT A NEW CHANNEL - done, target channelId was", targetChannel.channelId)
     }
     if (DEBUG) console.log("++++ RETURNING channel:", this.#describe());
     return returnResult(request, this.channelData)
   }
 
-  
+
 
   async #create(request: Request, apiBody: ChannelApiBody) {
     return this.#handleBuddRequest(request, apiBody, true)
