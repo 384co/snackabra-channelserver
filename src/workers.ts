@@ -166,6 +166,10 @@ function _corsHeaders(request: Request, contentType: string) {
     return corsHeaders;
 }
 
+/**
+ * Returns a result as a payload. Defaults to 200 (OK) and no delay.
+ * This is the most common return format for API endpoints.
+ */
 export function returnResult(request: Request, contents: any = null, status: ResponseCode = 200, delay = 0) {
     const corsHeaders = _corsHeaders(request, "application/octet-stream");
     return new Promise<Response>((resolve) => {
@@ -177,6 +181,11 @@ export function returnResult(request: Request, contents: any = null, status: Res
     });
 }
 
+/**
+ * Returns a result as a JSON object. Defaults to 200 (OK) and no delay.
+ * Generally only used for API endpoints that might be called from non-SB384
+ * code, such as mirrors or proxy servers (eg calling '/api/v2/info').
+ */
 export function returnResultJson(request: Request, contents: any, status: ResponseCode = 200, delay = 0) {
     const corsHeaders = _corsHeaders(request, "application/json; charset=utf-8");
     return new Promise<Response>((resolve) => {
@@ -191,15 +200,26 @@ export function returnResultJson(request: Request, contents: any, status: Respon
     });
 }
 
+/**
+ * Returns a minimal success result. Defaults to 200 (OK) and no delay.
+ */
 export function returnSuccess(request: Request) {
     return returnResultJson(request, { success: true });
 }
 
+/**
+ * Slightly different from returnResult() in that it does not
+ * assemble the payload but just passes on payload. Defaults to 200 (OK) and no delay.
+ */
 export function returnBinaryResult(request: Request, payload: BodyInit) {
     const corsHeaders = _corsHeaders(request, "application/octet-stream");
     return new Response(payload, { status: 200, headers: corsHeaders });
 }
 
+/**
+ * Simple error response. Defaults to 500 (Internal Server Error) and no delay.
+ * Any auth-related errors (eg 401 and 403) will be delayed by 50ms.
+ */
 export function returnError(_request: Request, errorString: string, status: ResponseCode = 500, delay = 0) {
     if (DEBUG) console.log("**** ERROR: (status: " + status + ")\n" + errorString);
     if (!delay && ((status == 401) || (status == 403))) delay = 50; // delay if auth-related
@@ -261,6 +281,12 @@ export default {
 import { extractPayload, base62ToArrayBuffer, validate_ChannelApiBody, ChannelApiBody } from 'snackabra'
 
 
+/**
+ * Extracts the apiBody from the request. If the request is a binary
+ * request, it will extract the payload and then extract the apiBody
+ * from the payload. If the request is a GET request, it will extract
+ * the apiBody from the query string.
+ */
 export async function processApiBody(request: Request): Promise<Response | ChannelApiBody> {
     const contentType = request.headers.get('content-type');
     let _apiBody: ChannelApiBody | null = null;
