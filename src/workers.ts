@@ -5,8 +5,11 @@
  */
 
 import { assemblePayload } from 'snackabra';
-import { DEBUG, DEBUG2 } from './env'
 import { NEW_CHANNEL_MINIMUM_BUDGET as _NEW_CHANNEL_MINIMUM_BUDGET } from 'snackabra'
+
+// leave these 'false', turn on debugging in the toml file if needed
+let DEBUG = false
+let DEBUG2 = false
 
 /**
  * API calls are in one of two forms:
@@ -117,7 +120,6 @@ export const serverApiCosts = {
     CHANNEL_STORAGE_MULTIPLIER: 8,
 }
 
-
 // internal - handle assertions
 export function _sb_assert(val: unknown, msg: string) {
     if (!(val)) {
@@ -133,7 +135,6 @@ export function _appendBuffer(buffer1: Uint8Array | ArrayBuffer, buffer2: Uint8A
     tmp.set(new Uint8Array(buffer2), buffer1.byteLength);
     return tmp.buffer;
 }
-
 
 // Reminder of response codes we use:
 //
@@ -256,6 +257,9 @@ import { handleApiRequest } from './index'
 
 export default {
     async fetch(request: Request, env: EnvType) {
+        // note: this will only toggle these values in this file
+        DEBUG = env.DEBUG_ON
+        DEBUG2 = env.VERBOSE_ON
         if (DEBUG) {
             const msg = `==== [${request.method}] Fetch called: ${request.url}`;
             console.log(
@@ -318,6 +322,7 @@ function delay(ms: number) {
   }
   
 // fetches the server's point of view on a storage token; any issues an it returns null
+// server token is stored in JSON to facilitate using dashboard view of KV
 export async function getServerStorageToken(hash: string, env: EnvType): Promise<SBStorageToken | null> {
   if (DEBUG) console.log(`[getServerStorageToken()]: looking up token ${hash} in ledger`)
   try {
@@ -342,8 +347,6 @@ export async function getServerStorageToken(hash: string, env: EnvType): Promise
     return null;
   }
 }
-
-
 
 
 // /// <reference types="@cloudflare/workers-types" />

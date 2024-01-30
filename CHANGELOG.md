@@ -1,5 +1,7 @@
 # Changelog
 
+Channel Server changelog.
+
 Follow format from [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
@@ -94,6 +96,8 @@ Follow format from [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/
 - channel identifiers are now a32, meaning base62x43
   (256 bits)
 
+- a32 discontinued and it's all now 'base62'
+
 - standardized "you're not allowed to do that" messages
   to all use the same (ANONYMOUS_CANNOT_CONNECT_MSG)
 
@@ -105,6 +109,18 @@ Follow format from [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/
 
 - swept over all api endpoint calls, one change is they
   are now all in consistent lower camel case
+
+- cloudflare worker name is now 'channel' (dev) or 'c' (prod)
+
+- debug output on/off now in toml file
+
+- KEYS and RECOVERY namespaces no longer needed
+
+- toml file in general simplified and cleaned up
+
+- 'template.wrangler.toml' is (public) reference template
+
+
 
 ## [1.1.0] - 2023-03-01
 

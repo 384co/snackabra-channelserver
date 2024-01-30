@@ -23,18 +23,16 @@
 */
 
 import { sbCrypto, extractPayload, assemblePayload, ChannelMessage, stripChannelMessage, setDebugLevel, composeMessageKey, SBStorageToken, validate_SBStorageToken, SBStorageTokenPrefix } from 'snackabra'
+
 import type { EnvType } from './env'
-import { VERSION } from './env'
+
 import { _sb_assert, returnResult, returnResultJson, returnError, returnSuccess, serverConstants, serverApiCosts, _appendBuffer } from './workers'
 import { processApiBody } from './workers'
-
 import { getServerStorageToken, ANONYMOUS_CANNOT_CONNECT_MSG } from './workers' 
 
-console.log(`\n===============\n[channelserver] Loading version ${VERSION}\n===============\n`)
-
-// these are overriden from wrangler.toml (don't override them here)
-var DEBUG = false
-var DEBUG2 = false
+// leave these 'false', turn on debugging in the toml file if needed
+let DEBUG = false
+let DEBUG2 = false
 
 import type { SBChannelId, ChannelAdminData, SBUserId, SBChannelData, ChannelApiBody } from 'snackabra';
 import {
@@ -47,31 +45,9 @@ const SEP = '='.repeat(60) + '\n'
 
 export { default } from './workers'
 
-// export default {
-//   async fetch(request: Request, env: EnvType) {
-//     if (DEBUG) {
-//       const msg = `==== [${request.method}] Fetch called: ${request.url}`;
-//       console.log(
-//         `\n${'='.repeat(Math.max(msg.length, 60))}` +
-//         `\n${msg}` +
-//         `\n${'='.repeat(Math.max(msg.length, 60))}`
-//       );
-//       if (DEBUG2) console.log(request.headers);
-//     }
-//     return await handleErrors(request, async () => {
-//       if (request.method == "OPTIONS")
-//         return returnResult(request);
-//       const path = (new URL(request.url)).pathname.slice(1).split('/');
-//       if ((path.length >= 1) && (path[0] === 'api') && (path[1] == 'v2'))
-//         return handleApiRequest(path.slice(2), request, env);
-//       else
-//         return returnError(request, "Not found (must give API endpoint '/api/v2/...')", 404)
-//     });
-//   }
-// }
-
 // 'path' is the request path, starting AFTER '/api/v2'
 export async function handleApiRequest(path: Array<string>, request: Request, env: EnvType) {
+  DEBUG = env.DEBUG_ON; DEBUG2 = env.VERBOSE_ON;
   try {
     switch (path[0]) {
       case 'info':
@@ -99,6 +75,7 @@ export async function handleApiRequest(path: Array<string>, request: Request, en
 // calling this switches from 'generic' (anonymous) microservice to a
 // (synchronous) Durable Object (unique per channel)
 async function callDurableObject(channelId: SBChannelId, path: Array<string>, request: Request, env: EnvType) {
+  DEBUG = env.DEBUG_ON; DEBUG2 = env.VERBOSE_ON;
   const durableObjectId = env.channels.idFromName(channelId);
   const durableObject = env.channels.get(durableObjectId);
   const newUrl = new URL(request.url);
@@ -138,7 +115,7 @@ function serverInfo(request: Request, env: EnvType) {
     return { success: false, error: msg }
   }
   var retVal = {
-    version: VERSION,
+    version: env.VERSION,
     storageServer: storageUrl,
     jslibVersion: version,
     apiEndpoints: {
