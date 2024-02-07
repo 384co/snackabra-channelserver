@@ -120,7 +120,11 @@ Follow format from [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/
 
 - 'template.wrangler.toml' is (public) reference template
 
+- adding 'Pages' feature. includes direct access to IMAGES
 
+- refactored into new function consumeStorage(); prepared for API budget usage
+
+- added 'return304' as helper, added Etag support for Pages
 
 ## [1.1.0] - 2023-03-01
 

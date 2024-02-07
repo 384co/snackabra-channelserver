@@ -22,30 +22,44 @@
 
 */
 
-import { sbCrypto, extractPayload, assemblePayload, ChannelMessage, stripChannelMessage, setDebugLevel, composeMessageKey, SBStorageToken, validate_SBStorageToken, SBStorageTokenPrefix } from 'snackabra'
+import {
+  sbCrypto, extractPayload, assemblePayload, ChannelMessage,
+  stripChannelMessage, setDebugLevel, composeMessageKey, SBStorageToken,
+  validate_SBStorageToken, SBStorageTokenPrefix,
+  SB384, arrayBufferToBase62, jsonParseWrapper,
+  version, validate_ChannelMessage, validate_SBChannelData,
+  SBUserPublicKey,
+  SBError
+} from 'snackabra';
+
+import type { SBChannelId, ChannelAdminData, SBUserId, SBChannelData, ChannelApiBody } from 'snackabra';
 
 import type { EnvType } from './env'
 
-import { _sb_assert, returnResult, returnResultJson, returnError, returnSuccess, serverConstants, serverApiCosts, _appendBuffer } from './workers'
-import { processApiBody } from './workers'
-import { getServerStorageToken, ANONYMOUS_CANNOT_CONNECT_MSG } from './workers' 
+import {
+  _sb_assert, returnResult, returnResultJson, returnError, returnSuccess, serverConstants, serverApiCosts, _appendBuffer,
+  processApiBody,
+  getServerStorageToken, ANONYMOUS_CANNOT_CONNECT_MSG,
+  genKey, genKeyPrefix,
+  return304,
+} from './workers' 
 
 // leave these 'false', turn on debugging in the toml file if needed
 let DEBUG = false
 let DEBUG2 = false
 
-import type { SBChannelId, ChannelAdminData, SBUserId, SBChannelData, ChannelApiBody } from 'snackabra';
-import {
-  SB384, arrayBufferToBase62, jsonParseWrapper,
-  version, validate_ChannelMessage, validate_SBChannelData
-} from 'snackabra';
-import { SBUserPublicKey } from 'snackabra'
 
 const SEP = '='.repeat(60) + '\n'
 
+const base62mi = "0123456789ADMRTxQjrEywcLBdHpNufk" // "v05.05" (strongpinVersion ^0.6.0)
+const base62Regex = new RegExp(`[${base62mi}]`);
+
 export { default } from './workers'
 
-// 'path' is the request path, starting AFTER '/api/v2'
+// todo (below): most things go through DO only, but there are probably more API
+// endpoints we can handle before callDurableObject(), at which point we go from
+// stateless (scalable) servlets to a singleton.
+
 export async function handleApiRequest(path: Array<string>, request: Request, env: EnvType) {
   DEBUG = env.DEBUG_ON; DEBUG2 = env.VERBOSE_ON;
   try {
@@ -53,11 +67,49 @@ export async function handleApiRequest(path: Array<string>, request: Request, en
       case 'info':
         return returnResultJson(request, serverInfo(request, env))
       case 'channel':
-        if (!path[1]) throw new Error("channel needs more params")
-        // todo: currently ALL api calls are routed through the DO, but there are some we could do at the microservice level
-        // TODO: actually we can move apiBody initial processing to here, and pass it to the DO;
-        //       that allows us to do some processing here (eg. verify signature) and not in the DO.
+        if (!path[1]) return returnError(request, "ERROR: invalid API (should be '/api/v2/channel/<channelId>/<api>')", 400);
         return callDurableObject(path[1], path.slice(2), request, env);
+      case 'page':
+          // todo: if the pages view is 'locked', we need to proceed to the DO,
+          // but we need to construct how to call the DO (eg, we need to know
+          // the channel id from the api payload etc)
+          if (DEBUG) console.log("==== Page Fetch ====")
+          // make sure there is a page key
+          if (!path[1]) return returnError(request, "ERROR: invalid API (should be '/api/v2/channel/page/<pageKey>')", 400);
+          const pageKey = path[1]
+          // some sanity checks: pageKey must be regex b32, and at least 6 characters long, and no more than 48 characters long
+          if (!base62Regex.test(pageKey) || pageKey.length < 6 || pageKey.length > 48)
+            return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
+          const pageKeyKVprefix = genKeyPrefix(pageKey, 'G')
+          // we now use 'list' to get all prefix matching this
+          const listOptions: DurableObjectListOptions = { limit: 4, prefix: pageKeyKVprefix, reverse: true };
+          const resultList = await env.PAGES_NAMESPACE.list(listOptions)
+          if (DEBUG) console.log("Got this LIST of matches from KV: ", resultList)
+          // there must only be ONE entry
+          if (resultList.keys.length !== 1) return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
+          // now we grab it's full key and fetch the object
+          const pageKeyKV = resultList.keys[0]!.name
+          // now read from the PAGES namespace
+          const { value, metadata } = await env.PAGES_NAMESPACE.getWithMetadata(pageKeyKV, { type: "arrayBuffer" });
+          const pageMetaData = metadata as PageMetaData
+          if (DEBUG) console.log("Got this SPECIFIC entry from KV: ", value, metadata)
+          if (!value) return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
+          // some meta data sanity checks
+          // unless otherwise requested, we default to shortest permitted
+          const shortestPrefix = pageMetaData.shortestPrefix || 6
+          if (pageKey.length < shortestPrefix) return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
+          // todo: improve cache headers, including stale-while-revalidate cache policy
+          // for now at least we handle Etags
+          const clientEtag = request.headers.get("If-None-Match");
+          if (clientEtag === pageMetaData.hash) {
+            if (DEBUG) console.log("Returning 304 (not modified)")
+            return return304(request, clientEtag); // mirror it back, it hasn't changed
+          }
+          console.log(SEP, SEP, SEP, SEP)
+          console.log("RETURNING VALUE with returnResult")
+          console.log(value)
+          console.log(SEP, SEP, SEP, SEP)
+          return returnResult(request, value, { headers: { "Etag": pageMetaData.hash }})
       case "notifications":
         return returnError(request, "Device (Apple) notifications are disabled (use web notifications)", 400);
       case "getLastMessageTimes":
@@ -144,6 +196,14 @@ type SessionType = {
 var loadedVisitorApiEndpoints: Array<string> = []
 var loadedOwnerApiEndpoints: Array<string> = []
 
+interface PageMetaData {
+  owner: SBUserId,
+  size: number,
+  lastModified: number,
+  shortestPrefix: number,
+  hash: string, // base62 string of sha256 hash of contents
+}
+
 /**
  *
  * ChannelServer Durable Object Class
@@ -206,16 +266,18 @@ export class ChannelServer implements DurableObject {
     this.storage = state.storage; // per-DO (eg per channel) storage
     this.webNotificationServer = env.WEB_NOTIFICATION_SERVER
     this.visitorCalls = {
-      "/downloadChannel": this.#downloadChannel.bind(this),
       "/getChannelKeys": this.#getChannelKeys.bind(this),
       "/getMessageKeys": this.#getMessageKeys.bind(this),
       "/getMessages": this.#getMessages.bind(this),
       "/getPubKeys": this.#getPubKeys.bind(this),
       "/getStorageLimit": this.#getStorageLimit.bind(this), // ToDo: should be per-userid basis
       "/getStorageToken": this.#getStorageToken.bind(this),
-      "/registerDevice": this.#registerDevice.bind(this), // deprecated/notfunctional
       "/send": this.#send.bind(this),
+      // upload/download are disabled, but we provide feedback for now
+      "/downloadChannel": this.#downloadChannel.bind(this),
       "/uploadChannel": this.#uploadChannel.bind(this),
+      // deprecated/notfunctional
+      "/registerDevice": this.#registerDevice.bind(this), 
     }
     this.ownerCalls = {
       "/acceptVisitor": this.#acceptVisitor.bind(this),
@@ -223,12 +285,14 @@ export class ChannelServer implements DurableObject {
       "/getAdminData": this.#getAdminData.bind(this),
       "/lockChannel": this.#lockChannel.bind(this),
       "/setCapacity": this.#setCapacity.bind(this),
+      "/setPage": this.#setPage.bind(this),
     }
     loadedVisitorApiEndpoints = Object.keys(this.visitorCalls)
     loadedOwnerApiEndpoints = Object.keys(this.ownerCalls)
   }
 
-  // load channel from storage: either it's been descheduled, or it's a new channel (that has already been created)
+  // load channel from storage: either it's been descheduled, or it's a new
+  // channel (that has already been created)
   async #initialize(channelData: SBChannelData) {
     try {
       _sb_assert(channelData && channelData.channelId, "ERROR: no channel data found in parameters (fatal)")
@@ -281,11 +345,10 @@ export class ChannelServer implements DurableObject {
   async fetch(request: Request) {
     const url = new URL(request.url);
     const path = url.pathname.slice(1).split('/');
-    // sanity check, this should always be the channel ID
-    if (!path || path.length < 2)
-      return returnError(request, "ERROR: invalid API (should be '/api/v2/channel/<channelId>/<api>')", 400);
+    if (!path || path.length < 2) return returnError(request, "Internal Error (L293", 400);
     const channelId = path[0]
     const apiCall = '/' + path[1]
+    
     try {
 
       if (DEBUG) console.log("111111 ==== ChannelServer.fetch() ==== phase ONE ==== 111111")
@@ -586,6 +649,63 @@ export class ChannelServer implements DurableObject {
     }
   }
 
+  async #setPage(request: Request, apiBody: ChannelApiBody) {
+    _sb_assert(apiBody && apiBody.apiPayloadBuf, "[setPage] need payload (the page, dude)")
+    const ownerKeys = this.visitorKeys.get(apiBody.userId)!
+    _sb_assert(ownerKeys, "Internal Error [L615]")
+    if (DEBUG) {
+      console.log(SEP, SEP, SEP, SEP)
+      console.log("==== ChannelServer.setPage() called ====")
+      console.log(apiBody)
+      console.log(apiBody.apiPayload)
+      console.log(apiBody.apiPayloadBuf)
+      console.log(SEP, SEP, SEP, SEP)
+    }
+    try {
+      // const size = await this.#consumeStorage(apiBody.apiPayload.byteLength)
+      const size = await this.#consumeStorage(
+        apiBody.apiPayloadBuf?.byteLength! * serverApiCosts.CHANNEL_STORAGE_MULTIPLIER
+      );
+
+      const pageKey = ownerKeys.hashB32
+      const pageKeyKV = genKey(pageKey, 'G')
+
+      // // first we sanity check that this does not exist or, if it does, it's the
+      // // same owner (channel) as 'us)
+      // const { value, metadata } = await this.env.PAGES_NAMESPACE.getWithMetadata(pageKeyKV, { type: "arrayBuffer" });
+      // if (DEBUG) console.log("Got this from KV: ", value, metadata)
+
+      // if (value) {
+      //   const existingOwner = metadata.get("owner")
+      //   if (existingOwner !== apiBody.userId) {
+      //     if (DEBUG) console.error("ERROR: page already exists and is owned by someone else")
+      //     throw new SBError("Page already exists and is owned by someone else", 400)
+      //   }
+      // }
+
+      // we want to generate a hash of apiBody.apiPayloadBuf for use with Etag
+      // we want to use the subtle crypto standard api with sha-256 hashing
+      const hashBuffer = await crypto.subtle.digest('SHA-256', apiBody.apiPayloadBuf!)
+      const hashBufferString = arrayBufferToBase62(hashBuffer)      
+
+      const pageMetaData: PageMetaData = {
+        owner: ownerKeys.userPublicKey,
+        size: size,
+        lastModified: Date.now(), // this refers to the Page, not contents
+        hash: hashBufferString,
+        shortestPrefix: apiBody.apiPayload.shortestPrefix || 6 // defaults to shortest
+      }
+      // todo/consider: do we want to inject any of server-side meta data into the page payload?
+      await this.env.PAGES_NAMESPACE.put(pageKeyKV, apiBody.apiPayloadBuf!, { metadata: pageMetaData });
+      if (DEBUG) console.log("Putting this object onto this Page key: ", pageMetaData, pageKeyKV, apiBody.apiPayloadBuf)
+      return returnResult(request, { success: true, pageKey: pageKey, size: size })
+    } catch (error: any) {
+      if (error instanceof SBError)
+        return returnError(request, '[setPage] ' + error.message, 400);
+      return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
+    }
+  }
+
   async #setUpNewSession(webSocket: WebSocket, _ip: string | null, apiBody: ChannelApiBody) {
     _sb_assert(webSocket && (webSocket as any).accept, "ERROR: webSocket does not have accept() method (fatal)");
     (webSocket as any).accept(); // typing override (old issue with CF types)
@@ -709,13 +829,23 @@ export class ChannelServer implements DurableObject {
     try {
       if (!(apiBody.apiPayload instanceof Set)) throw new Error("[getMessages] payload needs to be a set of keys")
       const clientKeys = apiBody.apiPayload as Set<string>
+      if (clientKeys.size === 0) return returnError(request, "[getMessages] No keys provided", 400)
       const validKeys = [];
       for (const key of clientKeys) {
         if (this.messageKeysCacheMap.has(key)) {
           validKeys.push(key);
         }
       }
-      if (validKeys.length === 0) return returnError(request, "[getMessages] No valid keys found", 400)
+      if (validKeys.length === 0) {
+        if (DEBUG) {
+          console.log('\n', SEP, "And here are the keys that were requested", "\n", SEP)
+          console.log(apiBody.apiPayload)
+          console.log(clientKeys)
+          console.log('\n', SEP, "==== ChannelServer.getMessages() returning ====\n", "No valid keys found", "\n", SEP)
+          console.log(this.messageKeysCacheMap)
+        }
+        return returnError(request, "[getMessages] No valid keys found", 400)
+      }
       const getOptions: DurableObjectGetOptions = { allowConcurrency: true };
       const messages = await this.storage.get(validKeys, getOptions);
       _sb_assert(messages, "Internal Error [L777]");
@@ -788,13 +918,16 @@ export class ChannelServer implements DurableObject {
     else return result;
   }
 
-  // channels approve storage by creating storage token out of their budget
-  async #getStorageToken(request: Request, apiBody: ChannelApiBody) {
-    // TODO: per-user storage boundaries (higher priority now since this will soon support Infinity)
-    _sb_assert(apiBody.apiPayload, "[getStorageToken] needs parameters")
-
-    var size = this.#roundSize(Number(apiBody.apiPayload.size)) || 0;
-    if (!size) return returnError(request, "[getStorageToken] size missing in API call, or zero, or can't parse")
+  // will 'spend' this amount; if there are any issues, we throw, otherwise the
+  // amount actually (which can differ from the request in many ways). if
+  // 'round' is set (default), will apply rounding semantics (such as for
+  // storage). otherwise it accepts any positive integer (eg set to 'false' for
+  // API charges)
+  async #consumeStorage(size: number, round = true): Promise<number> {
+    if (round)
+      size = this.#roundSize(size) || 0;
+    if (!size || !Number.isInteger(size) || size <= 0)
+      throw new SBError("'size' missing in API call or internally, or zero, or can't parse")
     // get the requested amount, apply various semantics on the budd operation
     if (size >= 0) {
       if ((size === Infinity) || (size > serverConstants.MAX_BUDGET_TRANSFER)) {
@@ -803,37 +936,49 @@ export class ChannelServer implements DurableObject {
       }
       if (size > this.storageLimit)
         // if a specific amount is requested that exceeds the budget, we do NOT interpret it as plunder
-        return returnError(request, `[budd()]: Not enough storage budget in mother channel - requested ${size} from '${this.channelId?.slice(0,8)}...', ${this.storageLimit} available`, 507);
+        throw new SBError(`Not enough storage budget in mother channel - requested ${size} from '${this.channelId?.slice(0,8)}...', ${this.storageLimit} available`);
     } else {
       // if it's negative, it's interpreted as how much to leave behind
       const _leaveBehind = -size;
       if (_leaveBehind > this.storageLimit)
-        return returnError(request, `[budd()]: Not enough storage budget in mother channel - requested to leave behind ${_leaveBehind}, ${this.storageLimit} available`, 507);
+        throw new SBError(`Not enough storage budget in mother channel - requested to leave behind ${_leaveBehind}, ${this.storageLimit} available`);
         size = this.storageLimit - _leaveBehind;
     }
-
     this.storageLimit -= size; // apply reduction
-    this.storage.put('storageLimit', this.storageLimit); // here we've consumed it
+    await this.storage.put('storageLimit', this.storageLimit); // here we've consumed it
+    return size // return what was actually consumed
+  }
 
-    const hash = SBStorageTokenPrefix + arrayBufferToBase62(crypto.getRandomValues(new Uint8Array(32)).buffer);
-    const token: SBStorageToken = {
-      hash: hash,
-      used: false,
-      size: size, // note that this is actual size not requested (might be the same)
-      motherChannel: this.channelId!,
-      created: Date.now()
+  // channels approve storage by creating storage token out of their budget
+  async #getStorageToken(request: Request, apiBody: ChannelApiBody) {
+    // TODO: per-user storage boundaries (higher priority now since this will soon support Infinity)
+    _sb_assert(apiBody.apiPayload, "[getStorageToken] needs parameters")
+    try {
+      const size = await this.#consumeStorage(Number(apiBody.apiPayload.size)); // will throw if there are issues, otherwise quietly return
+      // the channel was good for the charge, so create the token
+      const hash = SBStorageTokenPrefix + arrayBufferToBase62(crypto.getRandomValues(new Uint8Array(32)).buffer);
+      const token: SBStorageToken = {
+        hash: hash,
+        used: false,
+        size: size, // note that this is actual size, not requested (might be the same)
+        motherChannel: this.channelId!,
+        created: Date.now()
+      }
+      await this.env.LEDGER_NAMESPACE.put(token.hash, JSON.stringify(validate_SBStorageToken(token)));
+      if (DEBUG)
+        console.log(`[newStorage()]: Created new storage token for ${size} bytes\n`,
+          SEP, `hash: ${token.hash}\n`,
+          SEP, 'token:\n', token, '\n',
+          SEP, 'new mother storage limit:', this.storageLimit, '\n',
+          SEP, 'ledger entry:', await this.env.LEDGER_NAMESPACE.get(token.hash), '\n',
+          SEP, 'separate fetch:', await getServerStorageToken(token.hash, this.env), '\n',
+          SEP, 'this.env:', this.env.LEDGER_NAMESPACE, '\n',
+          SEP)
+      return returnResult(request, token);
+    } catch (error: any) {
+      if (error instanceof SBError) return returnError(request, '[getStorageToken] ' + error.message, 507);
+      else return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
     }
-    await this.env.LEDGER_NAMESPACE.put(token.hash, JSON.stringify(validate_SBStorageToken(token)));
-    if (DEBUG)
-      console.log(`[newStorage()]: Created new storage token for ${size} bytes\n`,
-        SEP, `hash: ${token.hash}\n`,
-        SEP, 'token:\n', token, '\n',
-        SEP, 'new mother storage limit:', this.storageLimit, '\n',
-        SEP, 'ledger entry:', await this.env.LEDGER_NAMESPACE.get(token.hash), '\n',
-        SEP, 'separate fetch:', await getServerStorageToken(token.hash, this.env), '\n',
-        SEP, 'this.env:', this.env.LEDGER_NAMESPACE, '\n',
-        SEP)
-    return returnResult(request, token);
   }
 
   async #getStorageLimit(request: Request) {
@@ -954,10 +1099,8 @@ export class ChannelServer implements DurableObject {
     }
   }
 
-  async #downloadChannel(request: Request, _apiBody: ChannelApiBody) {
-    return returnError(request, "downloadChannel is disabled", 400)
-  }
-
+  // used for 'growth' - applyng a storage token either to top up a channel's
+  // budget, or to create a new channel
   async #handleBuddRequest(request: Request, apiBody: ChannelApiBody, newChannel: boolean): Promise<Response> {
     _sb_assert(apiBody.apiPayload, "[budd] needs parameters")
     var targetChannel: SBChannelData, currentStorageLimit: number = 0;
@@ -1032,8 +1175,6 @@ export class ChannelServer implements DurableObject {
     return returnResult(request, this.channelData)
   }
 
-
-
   async #create(request: Request, apiBody: ChannelApiBody) {
     return this.#handleBuddRequest(request, apiBody, true)
   }
@@ -1048,6 +1189,10 @@ export class ChannelServer implements DurableObject {
       return returnError(request, "Channel keys ('ChannelData') not initialized");
     else
       return returnResultJson(request, this.channelData);
+  }
+
+  async #downloadChannel(request: Request, _apiBody: ChannelApiBody) {
+    return returnError(request, "downloadChannel is disabled", 400)
   }
 
   // used to create channels (from scratch), or upload from backup, or merge

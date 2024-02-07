@@ -4,7 +4,7 @@
  * this file should be the same between channel and storage server
  */
 
-import { assemblePayload } from 'snackabra';
+import { assemblePayload, SBError } from 'snackabra';
 import { NEW_CHANNEL_MINIMUM_BUDGET as _NEW_CHANNEL_MINIMUM_BUDGET } from 'snackabra'
 
 // leave these 'false', turn on debugging in the toml file if needed
@@ -115,8 +115,29 @@ export const serverConstants = {
     MAX_SB_BODY_SIZE: 64 * 1024
 }
 
+// used by both storage and channel servers to create 'key' into IMAGES KV
+// comment: 'Pages' are stored from channel server, and have type 'G'
+export function genKey(id: string, type: string = '_') {
+    _sb_assert(type.length === 1, "genKey() called with type length != 1")
+    const key = "____" + type + "__" + id + "______"
+    if (DEBUG2) console.log(`genKey(): '${key}'`)
+    return key
+}
+
+// same but only constructs prefix, eg, skips tail "_" stuff
+export function genKeyPrefix(prefix: string, type: string = '_') {
+    _sb_assert(type.length === 1, "genKeyPrefix() called with type length != 1")
+    const key = "____" + type + "__" + prefix
+    if (DEBUG2) console.log(`genKey(): '${key}'`)
+    // we safeguard here by never even constructing from anything shorter than six characters
+    // (eg even with base32 we do not go below 30 bits of identification)
+    if (key.length < 6) throw new SBError("genKeyPrefix() called with prefix length < 6")
+    return key
+}
+
 export const serverApiCosts = {
     // multiplier of cost of storage on channel vs. storage server
+    // (this includes Pages)
     CHANNEL_STORAGE_MULTIPLIER: 8,
 }
 
@@ -155,29 +176,42 @@ export function _appendBuffer(buffer1: Uint8Array | ArrayBuffer, buffer2: Uint8A
 export type ResponseCode = 101 | 200 | 400 | 401 | 403 | 404 | 405 | 413 | 418 | 429 | 500 | 501 | 507;
 const SEP = '='.repeat(60) + '\n'
 
-function _corsHeaders(request: Request, contentType: string) {
-    const corsHeaders = {
+function _headers(request: Request, contentType: string | null, immutable: boolean = false): HeadersInit {
+    let corsHeaders: HeadersInit = {
         "Access-Control-Allow-Methods": "POST, OPTIONS, GET",
         "Access-Control-Allow-Headers": "Content-Type, authorization",
         "Access-Control-Allow-Credentials": "true",
         "Access-Control-Allow-Origin": request.headers.get("Origin") ?? "*",
-        "Content-Type": contentType,
+    };
+    if (contentType)
+        corsHeaders = { ...corsHeaders, "Content-Type": contentType };
+    if (immutable) {
+        corsHeaders = { ...corsHeaders, "Cache-Control": "public, max-age=31536000, immutable" };
     }
-    if (DEBUG2) console.log('++++++++++++ HEADERS +++++++++++++\n\n', corsHeaders)
+    if (DEBUG2) console.log('++++++++++++ HEADERS +++++++++++++\n\n', corsHeaders);
     return corsHeaders;
+}
+
+export interface ReturnOptions {
+    status?: ResponseCode,
+    delay?: number,
+    headers?: HeadersInit
 }
 
 /**
  * Returns a result as a payload. Defaults to 200 (OK) and no delay.
  * This is the most common return format for API endpoints.
  */
-export function returnResult(request: Request, contents: any = null, status: ResponseCode = 200, delay = 0) {
-    const corsHeaders = _corsHeaders(request, "application/octet-stream");
+export function returnResult(request: Request, contents: any = null, options: ReturnOptions = {}) {
+    const status = options.status || 200;
+    const delay = options.delay || 0;
+    let headers = _headers(request, "application/octet-stream");
+    if (options.headers) headers = { ...headers, ...options.headers };
     return new Promise<Response>((resolve) => {
         setTimeout(() => {
             if (DEBUG2) console.log("++++ returnResult() contents:", contents, "status:", status)
             if (contents) contents = assemblePayload(contents);
-            resolve(new Response(contents, { status: status, headers: corsHeaders }));
+            resolve(new Response(contents, { status: status, headers: headers }));
         }, delay);
     });
 }
@@ -188,7 +222,7 @@ export function returnResult(request: Request, contents: any = null, status: Res
  * code, such as mirrors or proxy servers (eg calling '/api/v2/info').
  */
 export function returnResultJson(request: Request, contents: any, status: ResponseCode = 200, delay = 0) {
-    const corsHeaders = _corsHeaders(request, "application/json; charset=utf-8");
+    const corsHeaders = _headers(request, "application/json; charset=utf-8");
     return new Promise<Response>((resolve) => {
         setTimeout(() => {
             const json = JSON.stringify(contents);
@@ -208,12 +242,24 @@ export function returnSuccess(request: Request) {
     return returnResultJson(request, { success: true });
 }
 
+// if there's an Etag match for a requested resource, return 304
+export function return304(request: Request, hash: string) {
+    let corsHeaders = _headers(request, null); // no content type
+    // add hash as Etag
+    corsHeaders = { ...corsHeaders, "Etag": hash };
+    return new Response(null, { status: 304 });
+}
+
 /**
- * Slightly different from returnResult() in that it does not
- * assemble the payload but just passes on payload. Defaults to 200 (OK) and no delay.
+ * Slightly different from returnResult() in that it does not assemble the
+ * payload but just passes on payload. Defaults to 200 (OK) and no delay.
  */
-export function returnBinaryResult(request: Request, payload: BodyInit) {
-    const corsHeaders = _corsHeaders(request, "application/octet-stream");
+export function returnBinaryResult(request: Request, payload: BodyInit, headers?: HeadersInit) {
+    let corsHeaders = _headers(request, "application/octet-stream");
+    // if we have a list of headers, then we merge with corsHeaders
+    if (headers) {
+        corsHeaders = { ...corsHeaders, ...headers };
+    }
     return new Response(payload, { status: 200, headers: corsHeaders });
 }
 
@@ -242,9 +288,9 @@ export async function handleErrors(request: Request, func: () => Promise<Respons
                     server.close(1011, "Uncaught exception during session setup");
                     console.log("webSocket close (error)")
                 }
-                return returnResult(request, null, 101);
+                return returnResult(request, null, { status: 101 });
             } else {
-                return returnResult(request, err.stack, 500)
+                return returnResult(request, err.stack, { status: 500 })
             }
         } else {
             return returnError(request, "Unknown error type (?) in top level", 500);

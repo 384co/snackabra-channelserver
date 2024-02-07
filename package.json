@@ -16,13 +16,11 @@
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20231218.0",
     "miniflare": "^3.0.1",
+    "snackabra": "^2.0.0-alpha.4",
     "ts-loader": "^9.4.2",
     "typescript": "^5.0.4",
     "webpack": "^5.84.1",
     "worker-loader": "^3.0.8",
     "wrangler": "^3.0.0"
-  },
-  "dependencies": {
-    "snackabra": "^2.0.0-alpha.4"
   }
 }
