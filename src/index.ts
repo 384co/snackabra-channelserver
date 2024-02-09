@@ -44,10 +44,13 @@ import {
   return304,
 } from './workers' 
 
-// leave these 'false', turn on debugging in the toml file if needed
+// debug output on errors; 'DEBUG' will force this true in particular this is to
+// provide information on errors where nothing in detail is returned
+let LOG_ERRORS = true
+
+// leave these 'false', turn on debugging in the toml file if needed, or .dev.vars
 let DEBUG = false
 let DEBUG2 = false
-
 
 const SEP = '='.repeat(60) + '\n'
 
@@ -61,7 +64,7 @@ export { default } from './workers'
 // stateless (scalable) servlets to a singleton.
 
 export async function handleApiRequest(path: Array<string>, request: Request, env: EnvType) {
-  DEBUG = env.DEBUG_ON; DEBUG2 = env.VERBOSE_ON;
+  DEBUG = env.DEBUG_ON; DEBUG2 = env.VERBOSE_ON; if (DEBUG) LOG_ERRORS = true
   try {
     switch (path[0]) {
       case 'info':
@@ -78,26 +81,41 @@ export async function handleApiRequest(path: Array<string>, request: Request, en
           if (!path[1]) return returnError(request, "ERROR: invalid API (should be '/api/v2/channel/page/<pageKey>')", 400);
           const pageKey = path[1]
           // some sanity checks: pageKey must be regex b32, and at least 6 characters long, and no more than 48 characters long
-          if (!base62Regex.test(pageKey) || pageKey.length < 6 || pageKey.length > 48)
+          if (!base62Regex.test(pageKey) || pageKey.length < 6 || pageKey.length > 48) {
+            if (LOG_ERRORS) console.error("ERROR: invalid page key [L085]")
             return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
+          }
           const pageKeyKVprefix = genKeyPrefix(pageKey, 'G')
           // we now use 'list' to get all prefix matching this
           const listOptions: DurableObjectListOptions = { limit: 4, prefix: pageKeyKVprefix, reverse: true };
           const resultList = await env.PAGES_NAMESPACE.list(listOptions)
-          if (DEBUG) console.log("Got this LIST of matches from KV: ", resultList)
-          // there must only be ONE entry
-          if (resultList.keys.length !== 1) return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
+          if (resultList.keys.length === 0) {
+            // if there are no entries, well, there's no such Page
+            if (LOG_ERRORS) console.error(`ERROR: no entry found for page key ${pageKey} [L093]`)
+            return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
+          }
+          if (resultList.keys.length !== 1) {
+            // if there is an entry, then there must only be one
+            if (LOG_ERRORS) console.error("ERROR: found multiple entries, should not happen [L095]", resultList)
+            return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
+          }
           // now we grab it's full key and fetch the object
           const pageKeyKV = resultList.keys[0]!.name
           // now read from the PAGES namespace
           const { value, metadata } = await env.PAGES_NAMESPACE.getWithMetadata(pageKeyKV, { type: "arrayBuffer" });
           const pageMetaData = metadata as PageMetaData
           if (DEBUG) console.log("Got this SPECIFIC entry from KV: ", value, metadata)
-          if (!value) return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
+          if (!value) {
+            if (LOG_ERRORS) console.error("ERROR: no value found for page key [L105]")
+            return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
+          }
           // some meta data sanity checks
           // unless otherwise requested, we default to shortest permitted
           const shortestPrefix = pageMetaData.shortestPrefix || 6
-          if (pageKey.length < shortestPrefix) return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
+          if (pageKey.length < shortestPrefix) {
+            if (LOG_ERRORS) console.error("ERROR: page key too short [L112]")
+            return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
+          }
           // todo: improve cache headers, including stale-while-revalidate cache policy
           // for now at least we handle Etags
           const clientEtag = request.headers.get("If-None-Match");
@@ -105,10 +123,6 @@ export async function handleApiRequest(path: Array<string>, request: Request, en
             if (DEBUG) console.log("Returning 304 (not modified)")
             return return304(request, clientEtag); // mirror it back, it hasn't changed
           }
-          console.log(SEP, SEP, SEP, SEP)
-          console.log("RETURNING VALUE with returnResult")
-          console.log(value)
-          console.log(SEP, SEP, SEP, SEP)
           return returnResult(request, value, { headers: { "Etag": pageMetaData.hash }})
       case "notifications":
         return returnError(request, "Device (Apple) notifications are disabled (use web notifications)", 400);
@@ -127,7 +141,7 @@ export async function handleApiRequest(path: Array<string>, request: Request, en
 // calling this switches from 'generic' (anonymous) microservice to a
 // (synchronous) Durable Object (unique per channel)
 async function callDurableObject(channelId: SBChannelId, path: Array<string>, request: Request, env: EnvType) {
-  DEBUG = env.DEBUG_ON; DEBUG2 = env.VERBOSE_ON;
+  DEBUG = env.DEBUG_ON; DEBUG2 = env.VERBOSE_ON; if (DEBUG) LOG_ERRORS = true;
   const durableObjectId = env.channels.idFromName(channelId);
   const durableObject = env.channels.get(durableObjectId);
   const newUrl = new URL(request.url);
@@ -254,8 +268,7 @@ export class ChannelServer implements DurableObject {
 
   constructor(state: DurableObjectState, public env: EnvType) {
     // load from wrangler.toml (don't override here or in env.ts)
-    DEBUG = env.DEBUG_ON
-    DEBUG2 = env.VERBOSE_ON
+    DEBUG = env.DEBUG_ON; DEBUG2 = env.VERBOSE_ON; if (DEBUG) LOG_ERRORS = true;
     if (DEBUG) console.log("++++ channel server code loaded ++++ DEBUG is enabled ++++")
     if (DEBUG2) console.log("++++ DEBUG2 (verbose) enabled ++++")
     // if we're on verbose mode, then we poke jslib to be on basic debug mode
@@ -391,7 +404,7 @@ export class ChannelServer implements DurableObject {
         const channelData = jsonParseWrapper(await (this.storage.get('channelData') as Promise<string>), 'L495') as SBChannelData
         if (!channelData || !channelData.channelId) {
           // no channel, no object, no upload, no dice
-          if (DEBUG) console.error('Not initialized, but channelData is not in KV (?). Here is what we know:\n', channelId, '\n', channelData, '\n', SEP, '\n', this.#describe(), '\n', SEP)
+          if (LOG_ERRORS) console.error('Not initialized, but channelData is not in KV (?). Here is what we know:\n', channelId, '\n', channelData, '\n', SEP, '\n', this.#describe(), '\n', SEP)
           return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
         }
         // channel exists but object needs reloading
@@ -412,8 +425,10 @@ export class ChannelServer implements DurableObject {
         return returnError(request, "ERROR: channelId mismatch (?) [L454]");
 
       // if we're locked, and this is not an owner call, then we need to check if the visitor is accepted
-      if (this.locked && !apiBody.isOwner && !this.accepted.has(apiBody.userId))
+      if (this.locked && !apiBody.isOwner && !this.accepted.has(apiBody.userId)) {
+        if (LOG_ERRORS) console.error("ERROR: channel locked, visitor not accepted")
         return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
+      }
 
       // and if it's not locked, then we keep track of visitors, up to capacity level
       if (!this.locked && !this.visitors.has(apiBody.userId)) {
@@ -421,7 +436,7 @@ export class ChannelServer implements DurableObject {
         if (!apiBody.userPublicKey)
           return returnError(request, "Need your userPublicKey on this (or prior) operation/message ...", 401);
         if (this.visitors.size >= this.capacity) {
-          if (DEBUG) console.log(`---- channel ${this.channelId} full, rejecting new visitor ${apiBody.userId}`)
+          if (LOG_ERRORS) console.log(`---- channel ${this.channelId} full, rejecting new visitor ${apiBody.userId}`)
           return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
         }
         this.visitors.set(apiBody.userId, apiBody.userPublicKey)
@@ -448,7 +463,7 @@ export class ChannelServer implements DurableObject {
       // verification covers timestamp + path + apiPayload
       const verified = await sbCrypto.verify(sender.signKey, apiBody.sign, apiPayloadBuf ? _appendBuffer(prefixBuf, apiPayloadBuf) : prefixBuf)
       if (!verified) {
-        if (DEBUG) {
+        if (LOG_ERRORS) {
           console.error("ERROR: signature verification failed")
           console.log("apiBody:\n", apiBody)
         }
@@ -464,7 +479,7 @@ export class ChannelServer implements DurableObject {
       // ToDo: verify that the 'embeded' path is same as path coming through in request
 
       if (apiCall === "/websocket") {
-        console.log("==== ChannelServer.fetch() ==== websocket request ====")
+        if (DEBUG) console.log("==== ChannelServer.fetch() ==== websocket request ====")
         if (DEBUG) console.log("---- websocket request")
         if (request.headers.get("Upgrade") != "websocket") {
           if (DEBUG) console.log("---- websocket request, but not websocket (error)")
@@ -477,9 +492,9 @@ export class ChannelServer implements DurableObject {
         if (DEBUG) console.log("---- websocket request, returning session")
         return new Response(null, { status: 101, webSocket: pair[0] }); // we return the other to the client
       } else if (this.ownerCalls[apiCall]) {
-        console.log("==== ChannelServer.fetch() ==== owner call ====")
+        if (DEBUG) console.log("==== ChannelServer.fetch() ==== owner call ====")
         if (!apiBody.isOwner) {
-          if (DEBUG) console.log("---- owner call, but not owner (error)");
+          if (LOG_ERRORS) console.log("---- owner call, but not owner (error)");
           return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
         }
         try {
@@ -492,7 +507,7 @@ export class ChannelServer implements DurableObject {
           return returnError(request, `API ERROR [L410] [${apiCall}]: ${error.message} \n ${error.stack}`);
         }
       } else if (this.visitorCalls[apiCall]) {
-        console.log("==== ChannelServer.fetch() ==== visitor call ====")
+        if (DEBUG) console.log("==== ChannelServer.fetch() ==== visitor call ====")
         return await this.visitorCalls[apiCall]!(request, apiBody);
       } else {
         return returnError(request, "API endpoint not found: " + apiCall, 404)
@@ -702,6 +717,7 @@ export class ChannelServer implements DurableObject {
     } catch (error: any) {
       if (error instanceof SBError)
         return returnError(request, '[setPage] ' + error.message, 400);
+      if (LOG_ERRORS) console.error("ERROR: failed to set page: ", error.message)
       return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
     }
   }
@@ -976,6 +992,7 @@ export class ChannelServer implements DurableObject {
           SEP)
       return returnResult(request, token);
     } catch (error: any) {
+      if (LOG_ERRORS) console.error(`[getStorageToken] ${error.message}`)
       if (error instanceof SBError) return returnError(request, '[getStorageToken] ' + error.message, 507);
       else return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
     }
@@ -1116,7 +1133,7 @@ export class ChannelServer implements DurableObject {
       // sanity check, need to verify channelData is valid (consistent)
       const targetChannelOwner = await new SB384(targetChannel.ownerPublicKey).ready
       if (targetChannelOwner.ownerChannelId !== targetChannel.channelId) {
-        // this could be an error, or an attempt to hack
+        // this could be an error, or an attempt to hack; always log
         console.error("ERROR **** channelData ownerChannelId does not match channelId - possible hack attempt?")
         return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
       }  
@@ -1126,11 +1143,11 @@ export class ChannelServer implements DurableObject {
 
     const serverToken = await getServerStorageToken(targetChannel.storageToken.hash, this.env)
     if (!serverToken) {
-      console.error(`ERROR **** Having issues processing storage token '${targetChannel.storageToken}'\n`, targetChannel)
+      if (LOG_ERRORS) console.error(`ERROR **** Having issues processing storage token '${targetChannel.storageToken}'\n`, targetChannel)
       return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
     }
     if (serverToken.used === true) {
-      if (DEBUG) console.log(`ERROR **** Token already used\n`, targetChannel)
+      if (LOG_ERRORS) console.log(`ERROR **** Token already used\n`, targetChannel)
       return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
     }
     if (DEBUG) console.log("[budd] consuming this token, ledger side version: ", serverToken)
