@@ -184,10 +184,13 @@ function serverInfo(request: Request, env: EnvType) {
     version: env.VERSION,
     storageServer: storageUrl,
     jslibVersion: version,
-    apiEndpoints: {
-      visitor: loadedVisitorApiEndpoints,
-      owner: loadedOwnerApiEndpoints
-    },
+
+    // ... we would have to go to DO for this info, and we don't want to
+    // apiEndpoints: {
+    //   visitor: loadedVisitorApiEndpoints,
+    //   owner: loadedOwnerApiEndpoints
+    // },
+
   }
   return retVal
 }
@@ -207,8 +210,8 @@ type SessionType = {
   receivedUserInfo: boolean
 }
 
-var loadedVisitorApiEndpoints: Array<string> = []
-var loadedOwnerApiEndpoints: Array<string> = []
+// var loadedVisitorApiEndpoints: Array<string> = []
+// var loadedOwnerApiEndpoints: Array<string> = []
 
 interface PageMetaData {
   owner: SBUserId,
@@ -300,8 +303,8 @@ export class ChannelServer implements DurableObject {
       "/setCapacity": this.#setCapacity.bind(this),
       "/setPage": this.#setPage.bind(this),
     }
-    loadedVisitorApiEndpoints = Object.keys(this.visitorCalls)
-    loadedOwnerApiEndpoints = Object.keys(this.ownerCalls)
+    // loadedVisitorApiEndpoints = Object.keys(this.visitorCalls)
+    // loadedOwnerApiEndpoints = Object.keys(this.ownerCalls)
   }
 
   // load channel from storage: either it's been descheduled, or it's a new
