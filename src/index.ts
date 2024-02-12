@@ -709,8 +709,13 @@ export class ChannelServer implements DurableObject {
     } else if (page instanceof ArrayBuffer) {
       pageSize = page.byteLength
       hashBufferSource = page
+    } else if (page instanceof Uint8Array) {
+      page = page.buffer
+      pageSize = page.byteLength
+      hashBufferSource = page
     } else {
-      return returnError(request, "Page type/contents not supported");
+      if (DEBUG) console.error("Got contents we can't process: ", page)
+      return returnError(request, `Contents provided for Page not supported (needs to be string or ArrayBuffer)`);
     }
 
     if (DEBUG) console.log(page, type, '\n', SEP)
