@@ -157,6 +157,40 @@ export function _appendBuffer(buffer1: Uint8Array | ArrayBuffer, buffer2: Uint8A
     return tmp.buffer;
 }
 
+// list of MIME types that are considered "text-like", which a Page retrieval
+// will attempt to decode as text
+export const textLikeMimeTypes: Set<string> = new Set([
+    // Textual Data
+    "text/plain",
+    "text/html",
+    "text/css",
+    "text/javascript", // Note: application/javascript is more correct for JS
+    "text/xml",
+    "text/csv",
+
+    // Application Data (often textual in nature)
+    "application/json",
+    "application/javascript", // More correct MIME type for JavaScript
+    "application/xml",
+    "application/xhtml+xml",
+    "application/rss+xml",
+    "application/atom+xml",
+
+    // Markup Languages
+    "image/svg+xml",
+]);
+
+// Example function to check if a MIME type is considered "text-like"
+function isTextLikeMimeType(mimeType: string): boolean {
+    return textLikeMimeTypes.has(mimeType);
+}
+
+// Example usage
+console.log(isTextLikeMimeType("text/html")); // true
+console.log(isTextLikeMimeType("application/json")); // true
+console.log(isTextLikeMimeType("image/jpeg")); // false
+
+
 // Reminder of response codes we use:
 //
 // 101: Switching Protocols (downgrade error)
@@ -195,22 +229,24 @@ function _headers(request: Request, contentType: string | null, immutable: boole
 export interface ReturnOptions {
     status?: ResponseCode,
     delay?: number,
-    headers?: HeadersInit
+    headers?: HeadersInit,
+    type?: string // MIME type, if omitted defaults to 'sb384payloadV3' eg payload/octet-stream
 }
 
 /**
- * Returns a result as a payload. Defaults to 200 (OK) and no delay.
- * This is the most common return format for API endpoints.
+ * General return result function. Defaults to 200 (OK) and no delay. Contents
+ * are packaged as a payload, unless type indicates otherwise.
  */
 export function returnResult(request: Request, contents: any = null, options: ReturnOptions = {}) {
-    const status = options.status || 200;
-    const delay = options.delay || 0;
-    let headers = _headers(request, "application/octet-stream");
+    const status = options.status || 200, delay = options.delay || 0;
+    if (!options.type || options.type === 'sb384payloadV3') contents = assemblePayload(contents);
+    let type = options.type || "application/octet-stream";
+    if (type === 'sb384payloadV3') type = "application/octet-stream";
+    let headers = _headers(request, type);
     if (options.headers) headers = { ...headers, ...options.headers };
     return new Promise<Response>((resolve) => {
         setTimeout(() => {
             if (DEBUG2) console.log("++++ returnResult() contents:", contents, "status:", status)
-            if (contents) contents = assemblePayload(contents);
             resolve(new Response(contents, { status: status, headers: headers }));
         }, delay);
     });

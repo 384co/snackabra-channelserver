@@ -42,7 +42,13 @@ import {
   getServerStorageToken, ANONYMOUS_CANNOT_CONNECT_MSG,
   genKey, genKeyPrefix,
   return304,
+  textLikeMimeTypes,
 } from './workers' 
+
+function arrayBufferToText(buf: ArrayBuffer) {
+  const decoder = new TextDecoder('utf-8'); // Create a new TextDecoder instance for UTF-8 encoded text
+  return decoder.decode(new Uint8Array(buf)); // Decode an ArrayBuffer to text
+}
 
 // debug output on errors; 'DEBUG' will force this true in particular this is to
 // provide information on errors where nothing in detail is returned
@@ -78,7 +84,7 @@ export async function handleApiRequest(path: Array<string>, request: Request, en
           // the channel id from the api payload etc)
           if (DEBUG) console.log("==== Page Fetch ====")
           // make sure there is a page key
-          if (!path[1]) return returnError(request, "ERROR: invalid API (should be '/api/v2/channel/page/<pageKey>')", 400);
+          if (!path[1]) return returnError(request, "ERROR: invalid API (should be '/api/v2/page/<pageKey>')", 400);
           const pageKey = path[1]
           // some sanity checks: pageKey must be regex b32, and at least 6 characters long, and no more than 48 characters long
           if (!base62Regex.test(pageKey) || pageKey.length < 6 || pageKey.length > 48) {
@@ -123,7 +129,14 @@ export async function handleApiRequest(path: Array<string>, request: Request, en
             if (DEBUG) console.log("Returning 304 (not modified)")
             return return304(request, clientEtag); // mirror it back, it hasn't changed
           }
-          return returnResult(request, value, { headers: { "Etag": pageMetaData.hash }})
+          let returnValue: ArrayBuffer | string = value
+          if (pageMetaData.type && textLikeMimeTypes.has(pageMetaData.type)) {
+            if (DEBUG) console.log("It was stored explicit text-like type, recoding to text")
+            returnValue = arrayBufferToText(value)
+          } else {
+            if (DEBUG) console.log("Not recoding return result.")
+          }
+          return returnResult(request, returnValue, { type: pageMetaData.type, headers: { "Etag": pageMetaData.hash }})
       case "notifications":
         return returnError(request, "Device (Apple) notifications are disabled (use web notifications)", 400);
       case "getLastMessageTimes":
@@ -214,12 +227,17 @@ type SessionType = {
 // var loadedOwnerApiEndpoints: Array<string> = []
 
 interface PageMetaData {
+  id: string,
   owner: SBUserId,
   size: number,
   lastModified: number,
   shortestPrefix: number,
   hash: string, // base62 string of sha256 hash of contents
+  type: string, // MIME type, if present then pre-process and 'type' the response
 }
+
+// in a comment section, list the most common MIME types on the Internet
+// https://developer.mozilla.org/en-US/docs/Web/HTTP/Basics_of_HTTP/MIME_types/Common_types
 
 /**
  *
@@ -668,54 +686,73 @@ export class ChannelServer implements DurableObject {
   }
 
   async #setPage(request: Request, apiBody: ChannelApiBody) {
-    _sb_assert(apiBody && apiBody.apiPayloadBuf, "[setPage] need payload (the page, dude)")
-    const ownerKeys = this.visitorKeys.get(apiBody.userId)!
-    _sb_assert(ownerKeys, "Internal Error [L615]")
     if (DEBUG) {
-      console.log(SEP, SEP, SEP, SEP)
-      console.log("==== ChannelServer.setPage() called ====")
+      console.log('\n', "==== ChannelServer.setPage() called ====")
       console.log(apiBody)
       console.log(apiBody.apiPayload)
-      console.log(apiBody.apiPayloadBuf)
-      console.log(SEP, SEP, SEP, SEP)
     }
-    try {
-      // const size = await this.#consumeStorage(apiBody.apiPayload.byteLength)
-      const size = await this.#consumeStorage(
-        apiBody.apiPayloadBuf?.byteLength! * serverApiCosts.CHANNEL_STORAGE_MULTIPLIER
-      );
+    const ownerKeys = this.visitorKeys.get(apiBody.userId)!
+    _sb_assert(ownerKeys, "Internal Error [L615]")
+    let { page, type } = apiBody.apiPayload as { page: any, type: string }
+    _sb_assert(apiBody && apiBody.apiPayload && page, "[setPage] parameters missing or invalid (fatal)")
+    if (!type) type = 'sb384payloadV3' // magical default
+    if (type === 'sb384payloadV3')
+      page = assemblePayload(page) // we need to package it
 
+    // de facto, at this point 'page' is either a string or ArrayBuffer
+    // if needed we can add support for some other types (eg Blog)
+    let pageSize = 0
+    let hashBufferSource: ArrayBuffer
+    if (typeof page === 'string') {
+      pageSize = page.length
+      hashBufferSource = new TextEncoder().encode(page).buffer
+    } else if (page instanceof ArrayBuffer) {
+      pageSize = page.byteLength
+      hashBufferSource = page
+    } else {
+      return returnError(request, "Page type/contents not supported");
+    }
+
+    if (DEBUG) console.log(page, type, '\n', SEP)
+    try {
+      const size = await this.#consumeStorage(pageSize! * serverApiCosts.CHANNEL_STORAGE_MULTIPLIER);
       const pageKey = ownerKeys.hashB32
       const pageKeyKV = genKey(pageKey, 'G')
+      // first we sanity check that this does not exist or, if it does, it's the
+      // same owner (channel) as 'us)
+      const { value, metadata } = await this.env.PAGES_NAMESPACE.getWithMetadata(pageKeyKV, { type: "arrayBuffer" });
+      if (value) {
+        if (DEBUG) console.log("Checked for existing entry, got this: ", value, metadata)
+        const existingOwner = (metadata as PageMetaData).owner
+        if (existingOwner !== ownerKeys.userPublicKey) {
+          if (DEBUG) {
+            console.error("ERROR: page already exists and is owned by someone else")
+            console.log("ERROR: existing owner: ", existingOwner)
+            console.log("ERROR: callee        : ", ownerKeys.userPublicKey)
+          }
+          throw new SBError("Page already exists and is owned by someone else")
+        } else {
+          if (DEBUG) console.log("Page already exists and is owned by us, overwriting current page")
+        }
+      }
 
-      // // first we sanity check that this does not exist or, if it does, it's the
-      // // same owner (channel) as 'us)
-      // const { value, metadata } = await this.env.PAGES_NAMESPACE.getWithMetadata(pageKeyKV, { type: "arrayBuffer" });
-      // if (DEBUG) console.log("Got this from KV: ", value, metadata)
-
-      // if (value) {
-      //   const existingOwner = metadata.get("owner")
-      //   if (existingOwner !== apiBody.userId) {
-      //     if (DEBUG) console.error("ERROR: page already exists and is owned by someone else")
-      //     throw new SBError("Page already exists and is owned by someone else", 400)
-      //   }
-      // }
-
-      // we want to generate a hash of apiBody.apiPayloadBuf for use with Etag
+      // we want to generate a hash of page for use with Etag
       // we want to use the subtle crypto standard api with sha-256 hashing
-      const hashBuffer = await crypto.subtle.digest('SHA-256', apiBody.apiPayloadBuf!)
+      const hashBuffer = await crypto.subtle.digest('SHA-256', hashBufferSource)
       const hashBufferString = arrayBufferToBase62(hashBuffer)      
 
       const pageMetaData: PageMetaData = {
+        id: pageKey,
         owner: ownerKeys.userPublicKey,
         size: size,
         lastModified: Date.now(), // this refers to the Page, not contents
         hash: hashBufferString,
-        shortestPrefix: apiBody.apiPayload.shortestPrefix || 6 // defaults to shortest
+        shortestPrefix: apiBody.apiPayload.shortestPrefix || 6, // defaults to shortest
+        type: type, // MIME type, if present then pre-process and 'type' the response
       }
       // todo/consider: do we want to inject any of server-side meta data into the page payload?
-      await this.env.PAGES_NAMESPACE.put(pageKeyKV, apiBody.apiPayloadBuf!, { metadata: pageMetaData });
-      if (DEBUG) console.log("Putting this object onto this Page key: ", pageMetaData, pageKeyKV, apiBody.apiPayloadBuf)
+      await this.env.PAGES_NAMESPACE.put(pageKeyKV, page, { metadata: pageMetaData });
+      if (DEBUG) console.log("Putting this object onto this Page key: ", pageMetaData, pageKeyKV, page)
       return returnResult(request, { success: true, pageKey: pageKey, size: size })
     } catch (error: any) {
       if (error instanceof SBError)
