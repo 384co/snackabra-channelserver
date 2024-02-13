@@ -7,6 +7,15 @@
 import { assemblePayload, SBError } from 'snackabra';
 import { NEW_CHANNEL_MINIMUM_BUDGET as _NEW_CHANNEL_MINIMUM_BUDGET } from 'snackabra'
 
+
+// also exported to 'workers.ts'
+export var dbg = {
+    DEBUG: false,
+    DEBUG2: false,
+    LOG_ERRORS: true
+  }
+
+
 /**
  * API calls are in one of two forms:
  * 
@@ -331,12 +340,12 @@ export async function handleErrors(request: Request, func: () => Promise<Respons
 }
 
 import type { EnvType } from './env'
-import { handleApiRequest, dbg } from './index'
+import { handleApiRequest } from './index'
 
 export default {
     async fetch(request: Request, env: EnvType) {
         // note: this will only toggle these values in this file
-        dbg.DEBUG = env.dbg.DEBUG_ON
+        dbg.DEBUG = env.DEBUG_ON
         dbg.DEBUG2 = env.VERBOSE_ON
         if (dbg.DEBUG) {
             const msg = `==== [${request.method}] Fetch called: ${request.url}`;

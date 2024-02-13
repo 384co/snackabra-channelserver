@@ -43,18 +43,12 @@ import {
   genKey, genKeyPrefix,
   return304,
   textLikeMimeTypes,
+  dbg,
 } from './workers' 
 
 function arrayBufferToText(buf: ArrayBuffer) {
   const decoder = new TextDecoder('utf-8'); // Create a new TextDecoder instance for UTF-8 encoded text
   return decoder.decode(new Uint8Array(buf)); // Decode an ArrayBuffer to text
-}
-
-// also exported to 'workers.ts'
-export var dbg = {
-  DEBUG: false,
-  DEBUG2: false,
-  LOG_ERRORS: true
 }
 
 const SEP = '='.repeat(60) + '\n'
