@@ -50,13 +50,12 @@ function arrayBufferToText(buf: ArrayBuffer) {
   return decoder.decode(new Uint8Array(buf)); // Decode an ArrayBuffer to text
 }
 
-// debug output on errors; 'DEBUG' will force this true in particular this is to
-// provide information on errors where nothing in detail is returned
-let LOG_ERRORS = true
-
-// leave these 'false', turn on debugging in the toml file if needed, or .dev.vars
-let DEBUG = false
-let DEBUG2 = false
+// also exported to 'workers.ts'
+export var dbg = {
+  DEBUG: false,
+  DEBUG2: false,
+  LOG_ERRORS: true
+}
 
 const SEP = '='.repeat(60) + '\n'
 
@@ -70,7 +69,7 @@ export { default } from './workers'
 // stateless (scalable) servlets to a singleton.
 
 export async function handleApiRequest(path: Array<string>, request: Request, env: EnvType) {
-  DEBUG = env.DEBUG_ON; DEBUG2 = env.VERBOSE_ON; if (DEBUG) LOG_ERRORS = true
+  dbg.DEBUG = env.DEBUG_ON; dbg.DEBUG2 = env.VERBOSE_ON; if (dbg.DEBUG) dbg.LOG_ERRORS = true
   try {
     switch (path[0]) {
       case 'info':
@@ -82,13 +81,13 @@ export async function handleApiRequest(path: Array<string>, request: Request, en
           // todo: if the pages view is 'locked', we need to proceed to the DO,
           // but we need to construct how to call the DO (eg, we need to know
           // the channel id from the api payload etc)
-          if (DEBUG) console.log("==== Page Fetch ====")
+          if (dbg.DEBUG) console.log("==== Page Fetch ====")
           // make sure there is a page key
           if (!path[1]) return returnError(request, "ERROR: invalid API (should be '/api/v2/page/<pageKey>')", 400);
           const pageKey = path[1]
           // some sanity checks: pageKey must be regex b32, and at least 6 characters long, and no more than 48 characters long
           if (!base62Regex.test(pageKey) || pageKey.length < 6 || pageKey.length > 48) {
-            if (LOG_ERRORS) console.error("ERROR: invalid page key [L085]")
+            if (dbg.LOG_ERRORS) console.error("ERROR: invalid page key [L085]")
             return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
           }
           const pageKeyKVprefix = genKeyPrefix(pageKey, 'G')
@@ -97,12 +96,12 @@ export async function handleApiRequest(path: Array<string>, request: Request, en
           const resultList = await env.PAGES_NAMESPACE.list(listOptions)
           if (resultList.keys.length === 0) {
             // if there are no entries, well, there's no such Page
-            if (LOG_ERRORS) console.error(`ERROR: no entry found for page key ${pageKey} [L093]`)
+            if (dbg.LOG_ERRORS) console.error(`ERROR: no entry found for page key ${pageKey} [L093]`)
             return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
           }
           if (resultList.keys.length !== 1) {
             // if there is an entry, then there must only be one
-            if (LOG_ERRORS) console.error("ERROR: found multiple entries, should not happen [L095]", resultList)
+            if (dbg.LOG_ERRORS) console.error("ERROR: found multiple entries, should not happen [L095]", resultList)
             return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
           }
           // now we grab it's full key and fetch the object
@@ -110,31 +109,31 @@ export async function handleApiRequest(path: Array<string>, request: Request, en
           // now read from the PAGES namespace
           const { value, metadata } = await env.PAGES_NAMESPACE.getWithMetadata(pageKeyKV, { type: "arrayBuffer" });
           const pageMetaData = metadata as PageMetaData
-          if (DEBUG) console.log("Got this SPECIFIC entry from KV: ", value, metadata)
+          if (dbg.DEBUG) console.log("Got this SPECIFIC entry from KV: ", value, metadata)
           if (!value) {
-            if (LOG_ERRORS) console.error("ERROR: no value found for page key [L105]")
+            if (dbg.LOG_ERRORS) console.error("ERROR: no value found for page key [L105]")
             return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
           }
           // some meta data sanity checks
           // unless otherwise requested, we default to shortest permitted
           const shortestPrefix = pageMetaData.shortestPrefix || 6
           if (pageKey.length < shortestPrefix) {
-            if (LOG_ERRORS) console.error("ERROR: page key too short [L112]")
+            if (dbg.LOG_ERRORS) console.error("ERROR: page key too short [L112]")
             return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
           }
           // todo: improve cache headers, including stale-while-revalidate cache policy
           // for now at least we handle Etags
           const clientEtag = request.headers.get("If-None-Match");
           if (clientEtag === pageMetaData.hash) {
-            if (DEBUG) console.log("Returning 304 (not modified)")
+            if (dbg.DEBUG) console.log("Returning 304 (not modified)")
             return return304(request, clientEtag); // mirror it back, it hasn't changed
           }
           let returnValue: ArrayBuffer | string = value
           if (pageMetaData.type && textLikeMimeTypes.has(pageMetaData.type)) {
-            if (DEBUG) console.log("It was stored explicit text-like type, recoding to text")
+            if (dbg.DEBUG) console.log("It was stored explicit text-like type, recoding to text")
             returnValue = arrayBufferToText(value)
           } else {
-            if (DEBUG) console.log("Not recoding return result.")
+            if (dbg.DEBUG) console.log("Not recoding return result.")
           }
           return returnResult(request, returnValue, { type: pageMetaData.type, headers: { "Etag": pageMetaData.hash }})
       case "notifications":
@@ -154,20 +153,20 @@ export async function handleApiRequest(path: Array<string>, request: Request, en
 // calling this switches from 'generic' (anonymous) microservice to a
 // (synchronous) Durable Object (unique per channel)
 async function callDurableObject(channelId: SBChannelId, path: Array<string>, request: Request, env: EnvType) {
-  DEBUG = env.DEBUG_ON; DEBUG2 = env.VERBOSE_ON; if (DEBUG) LOG_ERRORS = true;
+  dbg.DEBUG = env.DEBUG_ON; dbg.DEBUG2 = env.VERBOSE_ON; if (dbg.DEBUG) dbg.LOG_ERRORS = true;
   const durableObjectId = env.channels.idFromName(channelId);
   const durableObject = env.channels.get(durableObjectId);
   const newUrl = new URL(request.url);
   newUrl.pathname = "/" + channelId + "/" + path.join("/");
   const newRequest = new Request(newUrl.toString(), request);
-  if (DEBUG) {
+  if (dbg.DEBUG) {
     console.log(
       "==== callDurableObject():\n",
       "channelId:", channelId, "\n",
       "path:", path, '\n',
       durableObjectId, '\n')
     // "newUrl:\n", newUrl, SEP) // very wordy
-    if (DEBUG2) { console.log(request); console.log(env) }
+    if (dbg.DEBUG2) { console.log(request); console.log(env) }
   }
   // we direct the fetch 'at' the durable object
   return durableObject.fetch(newRequest);
@@ -276,7 +275,7 @@ export class ChannelServer implements DurableObject {
   private recentKeysCache: Set<string> = new Set(); // L1 cache
   private lastL1CacheTimestamp: number = 0; // similar but tracks the 'set'
 
-  // DEBUG helper function to produce a string explainer of the current state
+  // dbg.DEBUG helper function to produce a string explainer of the current state
   #describe(): string {
     let s = 'CHANNEL STATE:\n';
     s += `channelId: ${this.channelData?.channelId}\n`;
@@ -289,11 +288,11 @@ export class ChannelServer implements DurableObject {
 
   constructor(state: DurableObjectState, public env: EnvType) {
     // load from wrangler.toml (don't override here or in env.ts)
-    DEBUG = env.DEBUG_ON; DEBUG2 = env.VERBOSE_ON; if (DEBUG) LOG_ERRORS = true;
-    if (DEBUG) console.log("++++ channel server code loaded ++++ DEBUG is enabled ++++")
-    if (DEBUG2) console.log("++++ DEBUG2 (verbose) enabled ++++")
-    // if we're on verbose mode, then we poke jslib to be on basic debug mode
-    if (DEBUG2) setDebugLevel(DEBUG)
+    dbg.DEBUG = env.DEBUG_ON; dbg.DEBUG2 = env.VERBOSE_ON; if (dbg.DEBUG) dbg.LOG_ERRORS = true;
+    if (dbg.DEBUG) console.log("++++ channel server code loaded ++++ dbg.DEBUG is enabled ++++")
+    if (dbg.DEBUG2) console.log("++++ dbg.DEBUG2 (verbose) enabled ++++")
+    // if we're on verbose mode, then we poke jslib to be on basic dbg.DEBUG mode
+    if (dbg.DEBUG2) setDebugLevel(dbg.DEBUG)
 
     // durObj storage has a different API than global KV, see:
     // https://developers.cloudflare.com/workers/runtime-apis/durable-objects/#transactional-storage-api
@@ -330,14 +329,14 @@ export class ChannelServer implements DurableObject {
   async #initialize(channelData: SBChannelData) {
     try {
       _sb_assert(channelData && channelData.channelId, "ERROR: no channel data found in parameters (fatal)")
-      if (DEBUG) console.log(`==== ChannelServer.initialize() called for channel: ${channelData.channelId} ====`)
-      if (DEBUG) console.log("\n", channelData, "\n", SEP)
+      if (dbg.DEBUG) console.log(`==== ChannelServer.initialize() called for channel: ${channelData.channelId} ====`)
+      if (dbg.DEBUG) console.log("\n", channelData, "\n", SEP)
 
       const channelState = await this.storage.get(['channelId', 'channelData', 'motherChannel', 'storageLimit', 'capacity', 'lastTimestamp', 'visitors', 'locked'])
       const storedChannelData = jsonParseWrapper(channelState.get('channelData') as string, 'L234') as SBChannelData
 
       if (!channelState || !storedChannelData || !storedChannelData.channelId || storedChannelData.channelId !== channelData.channelId) {
-        if (DEBUG) {
+        if (dbg.DEBUG) {
           console.log('ERROR: data missing or not matching:')
           console.log('channelState:\n', channelState)
           console.log('storedChannelData:\n', storedChannelData)
@@ -357,11 +356,11 @@ export class ChannelServer implements DurableObject {
 
       this.refreshCache() // see below
 
-      if (DEBUG) console.log("++++ Done initializing channel:\n", this.channelId, '\n', this.channelData)
-      if (DEBUG2) console.log(SEP, 'Full DO info\n', this, '\n', SEP)
+      if (dbg.DEBUG) console.log("++++ Done initializing channel:\n", this.channelId, '\n', this.channelData)
+      if (dbg.DEBUG2) console.log(SEP, 'Full DO info\n', this, '\n', SEP)
     } catch (error: any) {
       const msg = `ERROR failed to initialize channel [L250]: ${error.message}`
-      if (DEBUG) console.error(msg)
+      if (dbg.DEBUG) console.error(msg)
       throw new Error(msg)
     }
   }
@@ -385,7 +384,7 @@ export class ChannelServer implements DurableObject {
     
     try {
 
-      if (DEBUG) console.log("111111 ==== ChannelServer.fetch() ==== phase ONE ==== 111111")
+      if (dbg.DEBUG) console.log("111111 ==== ChannelServer.fetch() ==== phase ONE ==== 111111")
       // phase 'one' - sort out parameters
 
       // const requestClone = request.clone(); // appears to no longer be needed
@@ -394,7 +393,7 @@ export class ChannelServer implements DurableObject {
       const apiBody = await processApiBody(requestClone) as Response | ChannelApiBody
       if (apiBody instanceof Response) return apiBody
 
-      if (DEBUG) {
+      if (dbg.DEBUG) {
         console.log(
           SEP,
           '[Durable Object] fetch() called:\n',
@@ -403,34 +402,34 @@ export class ChannelServer implements DurableObject {
           '  full path:', path, '\n',
           SEP, request.url, '\n', SEP,
           '    apiBody: \n', apiBody, '\n', SEP)
-        if (DEBUG2) console.log(request.headers, '\n', SEP)
+        if (dbg.DEBUG2) console.log(request.headers, '\n', SEP)
       }
 
-      if (DEBUG) console.log("222222 ==== ChannelServer.fetch() ==== phase TWO ==== 222222")
+      if (dbg.DEBUG) console.log("222222 ==== ChannelServer.fetch() ==== phase TWO ==== 222222")
       // phase 'two' - catch 'create' call (budding against a new channelId)
 
       if (apiCall === '/budd' && !this.channelId) {
-        if (DEBUG) console.log('\n', SEP, '\n', 'Budding against a new channelId (eg creating/authorizing channel)\n', SEP, apiBody, '\n', SEP)
+        if (dbg.DEBUG) console.log('\n', SEP, '\n', 'Budding against a new channelId (eg creating/authorizing channel)\n', SEP, apiBody, '\n', SEP)
         return this.#create(requestClone, apiBody);
       }
 
       // if (and only if) both are in place, they must be consistent
       if (this.channelId && channelId && (this.channelId !== channelId)) return returnError(request, "Internal Error (L478)");
 
-      if (DEBUG) console.log("333333 ==== ChannelServer.fetch() ==== phase THREE ==== 333333")
+      if (dbg.DEBUG) console.log("333333 ==== ChannelServer.fetch() ==== phase THREE ==== 333333")
       // phase 'three' - check if 'we' just got created, in which case now we self-initialize
       // (we've been created but not initialized if there's no channelId, yet api call is not 'create')
       if (!this.channelId) {
-        if (DEBUG) console.log("**** channel object not initialized ...")
+        if (dbg.DEBUG) console.log("**** channel object not initialized ...")
         const channelData = jsonParseWrapper(await (this.storage.get('channelData') as Promise<string>), 'L495') as SBChannelData
         if (!channelData || !channelData.channelId) {
           // no channel, no object, no upload, no dice
-          if (LOG_ERRORS) console.error('Not initialized, but channelData is not in KV (?). Here is what we know:\n', channelId, '\n', channelData, '\n', SEP, '\n', this.#describe(), '\n', SEP)
+          if (dbg.LOG_ERRORS) console.error('Not initialized, but channelData is not in KV (?). Here is what we know:\n', channelId, '\n', channelData, '\n', SEP, '\n', this.#describe(), '\n', SEP)
           return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
         }
         // channel exists but object needs reloading
         if (channelId !== channelData.channelId) {
-          if (DEBUG) console.log("**** channelId mismatch:\n", channelId, "\n", channelData);
+          if (dbg.DEBUG) console.log("**** channelId mismatch:\n", channelId, "\n", channelData);
           return returnError(request, "Internal Error (L327)");
         }
         // bootstrap from storage
@@ -439,7 +438,7 @@ export class ChannelServer implements DurableObject {
           .catch(() => { return returnError(request, `Internal Error (L332)`); });
       }
 
-      if (DEBUG) console.log("444444 ==== ChannelServer.fetch() ==== phase FOUR ==== 444444")
+      if (dbg.DEBUG) console.log("444444 ==== ChannelServer.fetch() ==== phase FOUR ==== 444444")
       // phase 'four' - if we're locked, then only accepted visitors can do anything at all
 
       if (this.channelId !== path[0])
@@ -447,7 +446,7 @@ export class ChannelServer implements DurableObject {
 
       // if we're locked, and this is not an owner call, then we need to check if the visitor is accepted
       if (this.locked && !apiBody.isOwner && !this.accepted.has(apiBody.userId)) {
-        if (LOG_ERRORS) console.error("ERROR: channel locked, visitor not accepted")
+        if (dbg.LOG_ERRORS) console.error("ERROR: channel locked, visitor not accepted")
         return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
       }
 
@@ -457,7 +456,7 @@ export class ChannelServer implements DurableObject {
         if (!apiBody.userPublicKey)
           return returnError(request, "Need your userPublicKey on this (or prior) operation/message ...", 401);
         if (this.visitors.size >= this.capacity) {
-          if (LOG_ERRORS) console.log(`---- channel ${this.channelId} full, rejecting new visitor ${apiBody.userId}`)
+          if (dbg.LOG_ERRORS) console.log(`---- channel ${this.channelId} full, rejecting new visitor ${apiBody.userId}`)
           return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
         }
         this.visitors.set(apiBody.userId, apiBody.userPublicKey)
@@ -465,7 +464,7 @@ export class ChannelServer implements DurableObject {
         this.visitorKeys.set(apiBody.userId, await (new SB384(apiBody.userPublicKey).ready))
       }
 
-      if (DEBUG) console.log("555555 ==== ChannelServer.fetch() ==== phase FIVE ==== 555555")
+      if (dbg.DEBUG) console.log("555555 ==== ChannelServer.fetch() ==== phase FIVE ==== 555555")
       // phase 'five' - every single api call is separately verified with provided visitor public key
 
       // check signature, check for owner status
@@ -484,7 +483,7 @@ export class ChannelServer implements DurableObject {
       // verification covers timestamp + path + apiPayload
       const verified = await sbCrypto.verify(sender.signKey, apiBody.sign, apiPayloadBuf ? _appendBuffer(prefixBuf, apiPayloadBuf) : prefixBuf)
       if (!verified) {
-        if (LOG_ERRORS) {
+        if (dbg.LOG_ERRORS) {
           console.error("ERROR: signature verification failed")
           console.log("apiBody:\n", apiBody)
         }
@@ -494,33 +493,33 @@ export class ChannelServer implements DurableObject {
       // form our own opinion if this is the Owner
       apiBody.isOwner = this.channelId === sender.ownerChannelId
 
-      if (DEBUG) console.log("666666 ==== ChannelServer.fetch() ==== phase SIX ==== 666666")
+      if (dbg.DEBUG) console.log("666666 ==== ChannelServer.fetch() ==== phase SIX ==== 666666")
       // phase 'six' - we're ready to process the api call!
 
       // ToDo: verify that the 'embeded' path is same as path coming through in request
 
       if (apiCall === "/websocket") {
-        if (DEBUG) console.log("==== ChannelServer.fetch() ==== websocket request ====")
-        if (DEBUG) console.log("---- websocket request")
+        if (dbg.DEBUG) console.log("==== ChannelServer.fetch() ==== websocket request ====")
+        if (dbg.DEBUG) console.log("---- websocket request")
         if (request.headers.get("Upgrade") != "websocket") {
-          if (DEBUG) console.log("---- websocket request, but not websocket (error)")
+          if (dbg.DEBUG) console.log("---- websocket request, but not websocket (error)")
           return returnError(request, "Expected websocket", 400);
         }
         const ip = request.headers.get("CF-Connecting-IP");
         const pair = new WebSocketPair(); // that's CF websocket pair
-        if (DEBUG) console.log("---- websocket request, creating session")
+        if (dbg.DEBUG) console.log("---- websocket request, creating session")
         await this.#setUpNewSession(pair[1], ip, apiBody); // we use one ourselves
-        if (DEBUG) console.log("---- websocket request, returning session")
+        if (dbg.DEBUG) console.log("---- websocket request, returning session")
         return new Response(null, { status: 101, webSocket: pair[0] }); // we return the other to the client
       } else if (this.ownerCalls[apiCall]) {
-        if (DEBUG) console.log("==== ChannelServer.fetch() ==== owner call ====")
+        if (dbg.DEBUG) console.log("==== ChannelServer.fetch() ==== owner call ====")
         if (!apiBody.isOwner) {
-          if (LOG_ERRORS) console.log("---- owner call, but not owner (error)");
+          if (dbg.LOG_ERRORS) console.log("---- owner call, but not owner (error)");
           return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
         }
         try {
           const result = await this.ownerCalls[apiCall]!(request, apiBody);
-          if (DEBUG) console.log("owner call succeeded")
+          if (dbg.DEBUG) console.log("owner call succeeded")
           return result
         } catch (error: any) {
           console.log("ERROR: owner call failed: ", error)
@@ -528,7 +527,7 @@ export class ChannelServer implements DurableObject {
           return returnError(request, `API ERROR [L410] [${apiCall}]: ${error.message} \n ${error.stack}`);
         }
       } else if (this.visitorCalls[apiCall]) {
-        if (DEBUG) console.log("==== ChannelServer.fetch() ==== visitor call ====")
+        if (dbg.DEBUG) console.log("==== ChannelServer.fetch() ==== visitor call ====")
         return await this.visitorCalls[apiCall]!(request, apiBody);
       } else {
         return returnError(request, "API endpoint not found: " + apiCall, 404)
@@ -565,14 +564,14 @@ export class ChannelServer implements DurableObject {
     //   throw new Error("Cannot parse contents type (not json nor arraybuffer)")
     // }
 
-    if (DEBUG) console.log(
+    if (dbg.DEBUG) console.log(
       "------------ getting message from client (pre validation) ------------",
       "\n", msg, "\n",
       "-------------------------------------------------")
 
     if (msg.ready) {
       // the client sends a "ready" message when it can start receiving; reception means websocket is all set up
-      if (DEBUG) console.log("got 'ready' message from client")
+      if (dbg.DEBUG) console.log("got 'ready' message from client")
       const session = this.sessions.get(apiBody.userId)
       if (!session) throw new Error("Internal Error [L526]")
       else session.ready = true;
@@ -589,12 +588,12 @@ export class ChannelServer implements DurableObject {
 
     if (typeof message.c === 'string') {
       const msg = "[processMessage]: Contents ('c') sent as string. Discarding message."
-      if (DEBUG) console.error(msg)
+      if (dbg.DEBUG) console.error(msg)
       throw new Error(msg);
     }
 
     if (message.i2 && !apiBody.isOwner) {
-      if (DEBUG) console.error("ERROR: non-owner message setting subchannel")
+      if (dbg.DEBUG) console.error("ERROR: non-owner message setting subchannel")
       throw new Error("Only Owner can set subchannel. Discarding message.");
     } else if (!message.i2) {
       message.i2 = '____' // default; use to keep track of where we're at in processing
@@ -615,7 +614,7 @@ export class ChannelServer implements DurableObject {
       // these are the cases where messages are also stored under a TTL subchannel
       if (message.i2[3] === '_') {
         // if there's a TTL, you can't have a subchannel using last character, this is an error
-        if (DEBUG) console.error("ERROR: subchannel cannot be used with TTL")
+        if (dbg.DEBUG) console.error("ERROR: subchannel cannot be used with TTL")
         throw new Error("Subchannel cannot be used with TTL. Discarding message.")
       } else {
         // ttl is a digit 1-9, we append that to the i2 centerpiece (eg encoded in subchannel)
@@ -636,11 +635,11 @@ export class ChannelServer implements DurableObject {
     // final, final, we enforce storage limit
     const messagePayloadSize = messagePayload.byteLength
     if (messagePayloadSize > serverConstants.MAX_SB_BODY_SIZE) {
-      if (DEBUG) console.error(`ERROR: message too large (${messagePayloadSize} bytes)`)
+      if (dbg.DEBUG) console.error(`ERROR: message too large (${messagePayloadSize} bytes)`)
       throw new Error("Message too large. Discarding message.");
     }
 
-    if (DEBUG && messagePayloadSize <= 1024)
+    if (dbg.DEBUG && messagePayloadSize <= 1024)
       console.log("[info] this message could be stored as metadata (size <= 1KB)")
 
     // consume storage budget
@@ -673,7 +672,7 @@ export class ChannelServer implements DurableObject {
 
   async #send(request: Request, apiBody: ChannelApiBody) {
     _sb_assert(apiBody && apiBody.apiPayload, "send(): need payload (the message)")
-    if (DEBUG) {
+    if (dbg.DEBUG) {
       console.log("==== ChannelServer.handleSend() called ====")
       console.log(apiBody)
     }
@@ -686,7 +685,7 @@ export class ChannelServer implements DurableObject {
   }
 
   async #setPage(request: Request, apiBody: ChannelApiBody) {
-    if (DEBUG) {
+    if (dbg.DEBUG) {
       console.log('\n', "==== ChannelServer.setPage() called ====")
       console.log(apiBody)
       console.log(apiBody.apiPayload)
@@ -714,11 +713,11 @@ export class ChannelServer implements DurableObject {
       pageSize = page.byteLength
       hashBufferSource = page
     } else {
-      if (DEBUG) console.error("Got contents we can't process: ", page)
+      if (dbg.DEBUG) console.error("Got contents we can't process: ", page)
       return returnError(request, `Contents provided for Page not supported (needs to be string or ArrayBuffer)`);
     }
 
-    if (DEBUG) console.log(page, type, '\n', SEP)
+    if (dbg.DEBUG) console.log(page, type, '\n', SEP)
     try {
       const size = await this.#consumeStorage(pageSize! * serverApiCosts.CHANNEL_STORAGE_MULTIPLIER);
       const pageKey = ownerKeys.hashB32
@@ -727,17 +726,17 @@ export class ChannelServer implements DurableObject {
       // same owner (channel) as 'us)
       const { value, metadata } = await this.env.PAGES_NAMESPACE.getWithMetadata(pageKeyKV, { type: "arrayBuffer" });
       if (value) {
-        if (DEBUG) console.log("Checked for existing entry, got this: ", value, metadata)
+        if (dbg.DEBUG) console.log("Checked for existing entry, got this: ", value, metadata)
         const existingOwner = (metadata as PageMetaData).owner
         if (existingOwner !== ownerKeys.userPublicKey) {
-          if (DEBUG) {
+          if (dbg.DEBUG) {
             console.error("ERROR: page already exists and is owned by someone else")
             console.log("ERROR: existing owner: ", existingOwner)
             console.log("ERROR: callee        : ", ownerKeys.userPublicKey)
           }
           throw new SBError("Page already exists and is owned by someone else")
         } else {
-          if (DEBUG) console.log("Page already exists and is owned by us, overwriting current page")
+          if (dbg.DEBUG) console.log("Page already exists and is owned by us, overwriting current page")
         }
       }
 
@@ -757,12 +756,12 @@ export class ChannelServer implements DurableObject {
       }
       // todo/consider: do we want to inject any of server-side meta data into the page payload?
       await this.env.PAGES_NAMESPACE.put(pageKeyKV, page, { metadata: pageMetaData });
-      if (DEBUG) console.log("Putting this object onto this Page key: ", pageMetaData, pageKeyKV, page)
+      if (dbg.DEBUG) console.log("Putting this object onto this Page key: ", pageMetaData, pageKeyKV, page)
       return returnResult(request, { success: true, pageKey: pageKey, size: size })
     } catch (error: any) {
       if (error instanceof SBError)
         return returnError(request, '[setPage] ' + error.message, 400);
-      if (LOG_ERRORS) console.error("ERROR: failed to set page: ", error.message)
+      if (dbg.LOG_ERRORS) console.error("ERROR: failed to set page: ", error.message)
       return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
     }
   }
@@ -808,7 +807,7 @@ export class ChannelServer implements DurableObject {
       } catch (error: any) {
         // Report any exceptions directly back to the client
         const err_msg = '[handleSession()] ' + error.message + '\n' + error.stack + '\n';
-        if (DEBUG2) console.log(err_msg);
+        if (dbg.DEBUG2) console.log(err_msg);
         try {
           webSocket.send(JSON.stringify({ error: err_msg }));
         } catch {
@@ -836,21 +835,21 @@ export class ChannelServer implements DurableObject {
   async #broadcast(messagePayload: ArrayBuffer) {
     if (this.sessions.size === 0) return; // nothing to do
     // MTG ToDo: we don't send notifications for everything? for example locked-out messages?
-    if (DEBUG2) console.log("calling sendWebNotifications()", messagePayload);
+    if (dbg.DEBUG2) console.log("calling sendWebNotifications()", messagePayload);
     await this.#sendWebNotifications(); // ping anybody subscribing to channel
     // Iterate over all the sessions sending them messages.
     this.sessions.forEach((session, _userId) => {
       if (session.ready) {
         try {
-          if (DEBUG) console.log("sending message to session (user): ", session.userId)
+          if (dbg.DEBUG) console.log("sending message to session (user): ", session.userId)
           session.webSocket.send(messagePayload);
         } catch (err) {
-          if (DEBUG) console.log("ERROR: failed to send message to session: ", session.userId)
+          if (dbg.DEBUG) console.log("ERROR: failed to send message to session: ", session.userId)
           session.ready = false;
           session.quit = true; // should probably close it
         }
       } else {
-        if (DEBUG) console.log(`session not ready, not forwarding message to ${session.userId}`);
+        if (dbg.DEBUG) console.log(`session not ready, not forwarding message to ${session.userId}`);
       }
     }
     );
@@ -866,7 +865,7 @@ export class ChannelServer implements DurableObject {
     // main cache should always be in sync
     // _sb_assert(this.lastCacheTimestamp === this.lastTimestamp, "Internal Error [L735]")
     if (this.lastCacheTimestamp !== this.lastTimestamp) {
-      if (DEBUG) console.log("**** message cache is out of sync, reloading it ...")
+      if (dbg.DEBUG) console.log("**** message cache is out of sync, reloading it ...")
       this.refreshCache()
     }
 
@@ -886,7 +885,7 @@ export class ChannelServer implements DurableObject {
   // return messages matching set of keys
   async #getMessages(request: Request, apiBody: ChannelApiBody) {
     _sb_assert(apiBody && apiBody.apiPayload, "getMessages(): need payload (the keys)")
-    if (DEBUG) console.log("==== ChannelServer.getMessages() called ====")
+    if (dbg.DEBUG) console.log("==== ChannelServer.getMessages() called ====")
     try {
       if (!(apiBody.apiPayload instanceof Set)) throw new Error("[getMessages] payload needs to be a set of keys")
       const clientKeys = apiBody.apiPayload as Set<string>
@@ -898,7 +897,7 @@ export class ChannelServer implements DurableObject {
         }
       }
       if (validKeys.length === 0) {
-        if (DEBUG) {
+        if (dbg.DEBUG) {
           console.log('\n', SEP, "And here are the keys that were requested", "\n", SEP)
           console.log(apiBody.apiPayload)
           console.log(clientKeys)
@@ -910,7 +909,7 @@ export class ChannelServer implements DurableObject {
       const getOptions: DurableObjectGetOptions = { allowConcurrency: true };
       const messages = await this.storage.get(validKeys, getOptions);
       _sb_assert(messages, "Internal Error [L777]");
-      // if (DEBUG) console.log(SEP, "==== ChannelServer.getMessages() returning ====\n", messages, "\n", SEP)
+      // if (dbg.DEBUG) console.log(SEP, "==== ChannelServer.getMessages() returning ====\n", messages, "\n", SEP)
       return returnResult(request, messages);
     } catch (error: any) {
       return returnError(request, error.message, 400);
@@ -992,7 +991,7 @@ export class ChannelServer implements DurableObject {
     // get the requested amount, apply various semantics on the budd operation
     if (size >= 0) {
       if ((size === Infinity) || (size > serverConstants.MAX_BUDGET_TRANSFER)) {
-        if (DEBUG2) console.log(`this value for transferBudget will be interpreted as stripping (all ${this.storageLimit} bytes):`, size)
+        if (dbg.DEBUG2) console.log(`this value for transferBudget will be interpreted as stripping (all ${this.storageLimit} bytes):`, size)
         size = this.storageLimit; // strip it
       }
       if (size > this.storageLimit)
@@ -1026,7 +1025,7 @@ export class ChannelServer implements DurableObject {
         created: Date.now()
       }
       await this.env.LEDGER_NAMESPACE.put(token.hash, JSON.stringify(validate_SBStorageToken(token)));
-      if (DEBUG)
+      if (dbg.DEBUG)
         console.log(`[newStorage()]: Created new storage token for ${size} bytes\n`,
           SEP, `hash: ${token.hash}\n`,
           SEP, 'token:\n', token, '\n',
@@ -1037,7 +1036,7 @@ export class ChannelServer implements DurableObject {
           SEP)
       return returnResult(request, token);
     } catch (error: any) {
-      if (LOG_ERRORS) console.error(`[getStorageToken] ${error.message}`)
+      if (dbg.LOG_ERRORS) console.error(`[getStorageToken] ${error.message}`)
       if (error instanceof SBError) return returnError(request, '[getStorageToken] ' + error.message, 507);
       else return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
     }
@@ -1065,7 +1064,7 @@ export class ChannelServer implements DurableObject {
   //   } catch (error: any) {
   //     return returnError(request, "[budd] unable to parse channelData payload", 400);
   //   }
-  //   if (DEBUG) console.log("++++ deposit() from token: channelData:\n====\n", targetChannel, "\n", "====")
+  //   if (dbg.DEBUG) console.log("++++ deposit() from token: channelData:\n====\n", targetChannel, "\n", "====")
 
   //   if (this.channelId === targetChannel) return returnResult(request, this.channelData)
 
@@ -1073,10 +1072,10 @@ export class ChannelServer implements DurableObject {
   //   const newStorageLimit = this.storageLimit - transferBudget;
   //   this.storageLimit = newStorageLimit;
   //   await this.storage.put('storageLimit', newStorageLimit);
-  //   if (DEBUG) console.log(`[budd()]: Removed ${transferBudget} bytes from ${this.channelId!.slice(0, 12)}... and forwarding to ${targetChannel.slice(0, 12)}... (new mother storage limit: ${newStorageLimit} bytes)`);
+  //   if (dbg.DEBUG) console.log(`[budd()]: Removed ${transferBudget} bytes from ${this.channelId!.slice(0, 12)}... and forwarding to ${targetChannel.slice(0, 12)}... (new mother storage limit: ${newStorageLimit} bytes)`);
   //   // we block on ledger since this will be verified
   //   await this.env.LEDGER_NAMESPACE.put(targetChannel, JSON.stringify({ mother: this.channelId, size: transferBudget }));
-  //   if (DEBUG) console.log('++++ putting budget in ledger ... reading back:', await this.env.LEDGER_NAMESPACE.get(targetChannel))
+  //   if (dbg.DEBUG) console.log('++++ putting budget in ledger ... reading back:', await this.env.LEDGER_NAMESPACE.get(targetChannel))
 
   //   // note that if the next operation fails, the ledger entry for the transfer is still there for possible recovery
   //   return callDurableObject(targetChannel, ['uploadChannel'], newRequest, this.env)
@@ -1103,10 +1102,10 @@ export class ChannelServer implements DurableObject {
   async #getAdminData(request: Request) {
     try {
       const adminData = this.#_getAdminData()
-      if (DEBUG) console.log("[handleAdminDataRequest] adminData:", adminData)
+      if (dbg.DEBUG) console.log("[handleAdminDataRequest] adminData:", adminData)
       return returnResult(request, adminData);
     } catch (err) {
-      if (DEBUG) console.log("[#handleAdminDataRequest] Error:", err)
+      if (dbg.DEBUG) console.log("[#handleAdminDataRequest] Error:", err)
       throw err
     }
   }
@@ -1121,10 +1120,10 @@ export class ChannelServer implements DurableObject {
   async #sendWebNotifications() {
     const envNotifications = this.env.notifications
     if (!envNotifications) {
-      if (DEBUG) console.log("Cannot send web notifications (expected behavior if you're running locally")
+      if (dbg.DEBUG) console.log("Cannot send web notifications (expected behavior if you're running locally")
       return;
     }
-    if (DEBUG) console.log("Sending web notification")
+    if (dbg.DEBUG) console.log("Sending web notification")
 
     // message = jsonParseWrapper(message, 'L999')
     // if (message?.type === 'ack') return
@@ -1174,7 +1173,7 @@ export class ChannelServer implements DurableObject {
     }
 
     if (newChannel) {
-      if (DEBUG) console.log("[budd] creating new channel\nchannelData:\n====\n", targetChannel, "\n", "====")
+      if (dbg.DEBUG) console.log("[budd] creating new channel\nchannelData:\n====\n", targetChannel, "\n", "====")
       // sanity check, need to verify channelData is valid (consistent)
       const targetChannelOwner = await new SB384(targetChannel.ownerPublicKey).ready
       if (targetChannelOwner.ownerChannelId !== targetChannel.channelId) {
@@ -1188,14 +1187,16 @@ export class ChannelServer implements DurableObject {
 
     const serverToken = await getServerStorageToken(targetChannel.storageToken.hash, this.env)
     if (!serverToken) {
-      if (LOG_ERRORS) console.error(`ERROR **** Having issues processing storage token '${targetChannel.storageToken}'\n`, targetChannel)
+      if (dbg.LOG_ERRORS) {
+        console.error(`ERROR **** Cannot find storage token with hash '${targetChannel.storageToken.hash}'\nTarget channel:\n`, targetChannel)
+      }
       return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
     }
     if (serverToken.used === true) {
-      if (LOG_ERRORS) console.log(`ERROR **** Token already used\n`, targetChannel)
+      if (dbg.LOG_ERRORS) console.log(`ERROR **** Token already used\n`, targetChannel)
       return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
     }
-    if (DEBUG) console.log("[budd] consuming this token, ledger side version: ", serverToken)
+    if (dbg.DEBUG) console.log("[budd] consuming this token, ledger side version: ", serverToken)
 
     if (newChannel && serverToken.size! < serverConstants.NEW_CHANNEL_MINIMUM_BUDGET)
       return returnError(request, `[budd] Not enough for a new channel (minimum is ${serverConstants.NEW_CHANNEL_MINIMUM_BUDGET} bytes)`, 507);
@@ -1216,24 +1217,24 @@ export class ChannelServer implements DurableObject {
 
     // consume token
     serverToken.used = true;
-    if (DEBUG) console.log("[budd] using token, ledger side updated to: ", serverToken)
+    if (dbg.DEBUG) console.log("[budd] using token, ledger side updated to: ", serverToken)
     await this.env.LEDGER_NAMESPACE.put(serverToken.hash, JSON.stringify(serverToken)) // now token is spent
     // right here tiny chance of any issues, might attempt a transaction in future
     const newStorageLimit = currentStorageLimit + serverToken.size!;
     await this.storage.put('storageLimit', newStorageLimit); // and now new channel can spend it
     this.storageLimit = newStorageLimit; // and now new channel can spend it
-    if (DEBUG) console.log(`[budd] size at end of transaction: ${newStorageLimit}`)
+    if (dbg.DEBUG) console.log(`[budd] size at end of transaction: ${newStorageLimit}`)
 
     if (newChannel) {
-      if (DEBUG) console.log("++++ CALLING #initialize() on new channel")
+      if (dbg.DEBUG) console.log("++++ CALLING #initialize() on new channel")
       await this
         .#initialize(targetChannel)
         .catch(err => { return returnError(request, "ERROR: failed to initialize channel: " + err.message, 400) })
-      if (DEBUG) console.log("++++ CREATED channel:", this.#describe());
+      if (dbg.DEBUG) console.log("++++ CREATED channel:", this.#describe());
     } else {
-      if (DEBUG) console.log("++++ NOT A NEW CHANNEL - done, target channelId was", targetChannel.channelId)
+      if (dbg.DEBUG) console.log("++++ NOT A NEW CHANNEL - done, target channelId was", targetChannel.channelId)
     }
-    if (DEBUG) console.log("++++ RETURNING channel:", this.#describe());
+    if (dbg.DEBUG) console.log("++++ RETURNING channel:", this.#describe());
     return returnResult(request, this.channelData)
   }
 
