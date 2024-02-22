@@ -6,6 +6,9 @@
 		"experimentalDecorators": true,
 		"jsx": "react",
 		"target": "es2022",
+		// we need to be explicit, so 'dom' doesn't get pulled in
+		"lib": ["ESNext"],
+		"types": ["@cloudflare/workers-types"],
 		"useDefineForClassFields": true,
 		// MODULE specifiers
 		"esModuleInterop": true,

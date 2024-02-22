@@ -29,10 +29,13 @@ import {
   SB384, arrayBufferToBase62, jsonParseWrapper,
   version, validate_ChannelMessage, validate_SBChannelData,
   SBUserPublicKey,
-  SBError
+  SBError,
+  Snackabra, // stringify_SBObjectHandle,
+  timestampToBase4String,
+  deComposeMessageKey, base4StringToDate, // arrayBufferToBase64url,
 } from 'snackabra';
 
-import type { SBChannelId, ChannelAdminData, SBUserId, SBChannelData, ChannelApiBody } from 'snackabra';
+import type { SBChannelId, ChannelAdminData, SBUserId, SBChannelData, ChannelApiBody, SBObjectHandle } from 'snackabra';
 
 import type { EnvType } from './env'
 
@@ -44,14 +47,17 @@ import {
   return304,
   textLikeMimeTypes,
   dbg,
-} from './workers' 
+  serverFetch,
+} from './workers'
 
 function arrayBufferToText(buf: ArrayBuffer) {
   const decoder = new TextDecoder('utf-8'); // Create a new TextDecoder instance for UTF-8 encoded text
   return decoder.decode(new Uint8Array(buf)); // Decode an ArrayBuffer to text
 }
 
-const SEP = '='.repeat(60) + '\n'
+const SEPx = '='.repeat(76)
+const SEP = '\n' + SEPx + '\n'
+const SEPxStar = '\n' + '*'.repeat(76) + '\n'
 
 const base62mi = "0123456789ADMRTxQjrEywcLBdHpNufk" // "v05.05" (strongpinVersion ^0.6.0)
 const base62Regex = new RegExp(`[${base62mi}]`);
@@ -62,8 +68,14 @@ export { default } from './workers'
 // endpoints we can handle before callDurableObject(), at which point we go from
 // stateless (scalable) servlets to a singleton.
 
+// simple way to track what our origin is
+var myOrigin: string = '';
+
 export async function handleApiRequest(path: Array<string>, request: Request, env: EnvType) {
-  dbg.DEBUG = env.DEBUG_ON; dbg.DEBUG2 = env.VERBOSE_ON; if (dbg.DEBUG) dbg.LOG_ERRORS = true
+  dbg.DEBUG = env.DEBUG_ON; dbg.DEBUG2 = env.VERBOSE_ON; if (dbg.DEBUG) dbg.LOG_ERRORS = true;
+
+  if (!myOrigin) myOrigin = new URL(request.url).origin;
+
   try {
     switch (path[0]) {
       case 'info':
@@ -174,10 +186,10 @@ function serverInfo(request: Request, env: EnvType) {
   if (url.hostname === 'localhost' && url.port === '3845') {
     storageUrl = 'http://localhost:3843';
   } else if (url.protocol === 'https:' && url.hostname.split('.').length >= 2) {
-    const storageServer = env.STORAGE_SERVER; // Replace with your environment variable
+    const storageServer = env.STORAGE_SERVER_NAME; // Replace with your environment variable
     const domainParts = url.hostname.split('.');
     if (storageServer && domainParts.length >= 2) {
-      domainParts[0] = storageServer; // Replace the top-level domain with STORAGE_SERVER
+      domainParts[0] = storageServer; // Replace the top-level domain with STORAGE_SERVER_NAME
       storageUrl = `https://${domainParts.join('.')}`;
     }
   } // and if nothing matches then storageUrl is null:
@@ -229,13 +241,17 @@ interface PageMetaData {
   type: string, // MIME type, if present then pre-process and 'type' the response
 }
 
+let storageFetchFunction: ((input: RequestInfo | URL, init?: RequestInit) => Promise<Response>) | null = null;
+let storageServerBinding: any = null;
+
+
 // in a comment section, list the most common MIME types on the Internet
 // https://developer.mozilla.org/en-US/docs/Web/HTTP/Basics_of_HTTP/MIME_types/Common_types
 
 /**
  *
  * ChannelServer Durable Object Class
- * 
+ *
  * One instance per channel
  */
 export class ChannelServer implements DurableObject {
@@ -246,13 +262,17 @@ export class ChannelServer implements DurableObject {
   /* 'channelData'         */ channelData?: SBChannelData
   /* 'motherChannel'       */ motherChannel?: SBChannelId
   /* ----- these are updated dynamically      ----- */
-  /* 'storageLimit'        */ storageLimit: number = 0;
-  /* 'capacity'            */ capacity: number = 20;
+  /* 'storageLimit'        */ storageLimit: number = 0;        // current storage budget
+  /* 'capacity'            */ capacity: number = 20;           // max number of (accepted) visitors
   /* 'lastTimestamp'       */ lastTimestamp: number = 0;       // monotonically increasing timestamp
   /* ----- these track access permissions      ----- */
   /* 'locked'              */ locked: boolean = false;
   /* 'visitors'            */ visitors: Map<SBUserId, SBUserPublicKey> = new Map();
   /* 'accepted'            */ accepted: Set<SBUserId> = new Set();
+  /* ----- these track message history         ----- */
+  /* 'messageCount'        */ messageCount: number = 0;        // total non-ephemeral messages in DO KV
+  /* 'allMessagesCount'    */ allMessageCount: number = 0;     // total number of all messages
+  /* 'historyShard'        */ historyShard: SBObjectHandle | null = null;
 
   /* the rest are for run time and are not backed up as such to KVs  */
   visitorKeys: Map<SBUserId, SB384> = new Map();    // convenience caching of SB384 objects for any visitors
@@ -262,12 +282,25 @@ export class ChannelServer implements DurableObject {
   ownerCalls: ApiCallMap;   // API endpoints that require ownership
   webNotificationServer: string;
 
-  // used for caching message keys
-  private messageKeysCache: string[] = []; // L2 cache
-  messageKeysCacheMap: Map<string, number> = new Map(); // 'indexes' into messageKeysCache
-  private lastCacheTimestamp: number = 0; // mirrors lastTimestamp (should be the same)
-  private recentKeysCache: Set<string> = new Set(); // L1 cache
-  private lastL1CacheTimestamp: number = 0; // similar but tracks the 'set'
+  // ToDo: this caching was essentially working; disabling for now to focus on
+  // feature completeness and correctness of new 'stream' design. It makes sense
+  // to re-introduce this later: we have particular semantics on messages that a
+  // general-purpose KV can't know. In particular, perma-messages (non-TTL) are
+  // by defined immutable after creation, including timestamp; timestamps are
+  // unique and monotonically increasing, and we can use all this to our
+  // advantage to cache message keys and their indexes. The rough idea is to
+  // cache in DO memory the last 1000 keys, and the last 100 messages. Keys
+  // beyond this should automatically flow into shardified format. Another
+  // advantage with disabling this now and adding it later, is that we can then
+  // do some performance testing to see how much difference it makes, both in
+  // terms of cost and latency.
+
+  // // used for caching message keys
+  // private messageKeysCache: string[] = []; // L2 cache
+  // messageKeysCacheMap: Map<string, number> = new Map(); // 'indexes' into messageKeysCache
+  // private lastCacheTimestamp: number = 0; // mirrors lastTimestamp (should be the same)
+  // private recentKeysCache: Set<string> = new Set(); // L1 cache
+  // private lastL1CacheTimestamp: number = 0; // similar but tracks the 'set'
 
   // dbg.DEBUG helper function to produce a string explainer of the current state
   #describe(): string {
@@ -280,7 +313,7 @@ export class ChannelServer implements DurableObject {
     return s;
   }
 
-  constructor(state: DurableObjectState, public env: EnvType) {
+  constructor(public state: DurableObjectState, public env: EnvType) {
     // load from wrangler.toml (don't override here or in env.ts)
     dbg.DEBUG = env.DEBUG_ON; dbg.DEBUG2 = env.VERBOSE_ON; if (dbg.DEBUG) dbg.LOG_ERRORS = true;
     if (dbg.DEBUG) console.log("++++ channel server code loaded ++++ dbg.DEBUG is enabled ++++")
@@ -292,8 +325,10 @@ export class ChannelServer implements DurableObject {
     // https://developers.cloudflare.com/workers/runtime-apis/durable-objects/#transactional-storage-api
     this.storage = state.storage; // per-DO (eg per channel) storage
     this.webNotificationServer = env.WEB_NOTIFICATION_SERVER
+
     this.visitorCalls = {
       "/getChannelKeys": this.#getChannelKeys.bind(this),
+      "/getHistory": this.#getHistory.bind(this),
       "/getMessageKeys": this.#getMessageKeys.bind(this),
       "/getMessages": this.#getMessages.bind(this),
       "/getPubKeys": this.#getPubKeys.bind(this),
@@ -304,7 +339,7 @@ export class ChannelServer implements DurableObject {
       "/downloadChannel": this.#downloadChannel.bind(this),
       "/uploadChannel": this.#uploadChannel.bind(this),
       // deprecated/notfunctional
-      "/registerDevice": this.#registerDevice.bind(this), 
+      "/registerDevice": this.#registerDevice.bind(this),
     }
     this.ownerCalls = {
       "/acceptVisitor": this.#acceptVisitor.bind(this),
@@ -316,6 +351,110 @@ export class ChannelServer implements DurableObject {
     }
     // loadedVisitorApiEndpoints = Object.keys(this.visitorCalls)
     // loadedOwnerApiEndpoints = Object.keys(this.ownerCalls)
+
+    // todo: presumed to be a good idea to limit this
+    this.state.setHibernatableWebSocketEventTimeout(10 * 1000) // milliseconds
+    console.log("++++ setting websocket handler timeout to (seconds):", this.state.getHibernatableWebSocketEventTimeout()! / 1000)
+
+    console.log("++++ setting autoresponse to timestamp ++++")
+    this.state.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', timestampToBase4String(this.lastTimestamp)))
+
+    console.log("++++ ChannelServer constructor done ++++")
+  }
+
+  // called after a DO channel is initialized, if DEBUG is on. kitchen sink for
+  // a variety of tests, debug operations, measurements, and so on
+  async #startupDebugOrTest() {
+    _sb_assert(this.channelId, "ERROR: channelId is not set (fatal)")
+    if (dbg.DEBUG2) console.log(SEP, 'Full DO info\n', this, '\n', SEP)
+    const _currentMessageKeys = await this.storage.list({ limit: 1000, prefix: this.channelId!, reverse: true });
+    if (dbg.DEBUG2) console.log(_currentMessageKeys)
+    // these keys are returned as a Map(); we iterate to find lowest and highest (lex) key
+    let lowest = '', highest = '';
+    // while we are at it, lets accumulate size of the 'values', they're all arraybuffers
+    let totalSize = 0, i = 0, metaDataSized = 0 // biggestSoFar = 0
+    let foundErrors = false;
+    for (const [key, _value] of _currentMessageKeys) {
+      i++;
+      const value = _value as unknown as ArrayBuffer;
+      if (!key) {
+        console.error(`ERROR: key for entry ${i} is empty (fatal) (???) `)
+        foundErrors = true;
+        continue
+      }
+      if (!lowest || key < lowest) lowest = key;
+      if (!highest || key > highest) highest = key;
+      if (!value) {
+        console.error("ERROR: value is empty (fatal) for key ", key)
+        foundErrors = true;
+        continue
+      }
+      if (!((value as any) instanceof ArrayBuffer)) {
+        console.error("ERROR: value is not an ArrayBuffer (fatal) for key (?) ", key)
+        foundErrors = true;
+        continue
+      }
+
+      // hard to escape some of the basic components:
+      // - iv (12 bytes)
+      // - salt (16 bytes)
+      // - signature (96 bytes)
+      // - two timestamps (string encoded, 13 chars each)
+      // - the 'from' identifier (43 chars)
+
+      // comparing a 185-byte message content with 260 bytes, resulting
+      // difference in b62 is 976 vs 1077, resulting difference of 101 chars
+      // comes from 75 bytes, so 'basic overhead' is about 725 chars, so message
+      // can be about 220 bytes. but the 700+ overhead comes from the above 200
+      // bytes/char info, so, ToDo: can that be reduced?  if core message can be
+      // up to another +100 or 200 bytes more, that will make a major
+      // difference. for now we're leaving this be, but it's a future possible
+      // improvement: fetching values is limited to 100 (since they can be 32KiB
+      // each eg that's 3.2MB), whereas metadata is limited to 1024 characters
+      // and ergo 1000 listed values is ~1MB but can be fetched in one go.
+
+      //   const payloadAsMetaData = arrayBufferToBase62(value)
+      //   if (payloadAsMetaData.length <= 1000) { // some margin
+      //     metaDataSized ++;
+      //   }
+      //   console.log("Meta data size:", payloadAsMetaData.length, "chars")
+      //   if (value.byteLength > biggestSoFar) {
+      //   biggestSoFar = value.byteLength;
+      //   console.log(SEPx)
+      //   // console.log("Biggest so far: ", value.byteLength, "bytes")
+      //   const contents = extractPayload(value).payload
+      //   console.log(`Biggest so far: ${value.byteLength} bytes (b62 ${payloadAsMetaData.length} chars) (contents ${contents.c.byteLength} bytes)`)
+      //   console.log(contents)
+      // }
+
+      totalSize += value.byteLength;
+    }
+    console.log(SEPx)
+
+    // extract the timestamp from 'lowest' and 'highest' keys
+    let [_channelId, _i2, lowestTimeStampString] = deComposeMessageKey(lowest)
+    const lowDate = base4StringToDate(lowestTimeStampString);
+    [_channelId, _i2, lowestTimeStampString] = deComposeMessageKey(highest)
+    const highDate = base4StringToDate(lowestTimeStampString);
+
+
+
+    console.log(SEPx)
+    console.log(SEPx)
+    console.log("Summary information about DO KV entries (all): ")
+    console.log("           Map size: ", _currentMessageKeys.size)
+    console.log("    Counted entries: ", i)
+    console.log("   (metadata-sized): ", metaDataSized)
+    console.log("         Lowest key: ", lowest)
+    console.log("         (low date): ", lowDate)
+    console.log("        Highest key: ", highest)
+    console.log("        (high date): ", highDate)
+    console.log(" Total size of data: ", totalSize)
+    if (foundErrors) console.log(SEPxStar)
+    console.log("       Found errors: ", foundErrors)
+    if (foundErrors) console.log(SEPxStar)
+    console.log(SEPx, SEP)
+
   }
 
   // load channel from storage: either it's been descheduled, or it's a new
@@ -326,7 +465,10 @@ export class ChannelServer implements DurableObject {
       if (dbg.DEBUG) console.log(`==== ChannelServer.initialize() called for channel: ${channelData.channelId} ====`)
       if (dbg.DEBUG) console.log("\n", channelData, "\n", SEP)
 
-      const channelState = await this.storage.get(['channelId', 'channelData', 'motherChannel', 'storageLimit', 'capacity', 'lastTimestamp', 'visitors', 'locked'])
+      const channelState = await this.storage.get(
+        ['channelId', 'channelData', 'motherChannel', 'storageLimit', 'capacity', 'lastTimestamp', 'visitors',
+          'locked', 'messageCount', 'allMessageCount', 'historyShard']
+      )
       const storedChannelData = jsonParseWrapper(channelState.get('channelData') as string, 'L234') as SBChannelData
 
       if (!channelState || !storedChannelData || !storedChannelData.channelId || storedChannelData.channelId !== channelData.channelId) {
@@ -348,10 +490,14 @@ export class ChannelServer implements DurableObject {
       this.channelId = channelData.channelId;
       this.channelData = channelData
 
-      this.refreshCache() // see below
+      this.messageCount = Number(channelState.get('messageCount')) || 0
+      this.allMessageCount = Number(channelState.get('allMessageCount')) || 0
+
+      // this.refreshCache() // see below
 
       if (dbg.DEBUG) console.log("++++ Done initializing channel:\n", this.channelId, '\n', this.channelData)
-      if (dbg.DEBUG2) console.log(SEP, 'Full DO info\n', this, '\n', SEP)
+      if (dbg.DEBUG) await this.#startupDebugOrTest()
+
     } catch (error: any) {
       const msg = `ERROR failed to initialize channel [L250]: ${error.message}`
       if (dbg.DEBUG) console.error(msg)
@@ -359,14 +505,15 @@ export class ChannelServer implements DurableObject {
     }
   }
 
-  async refreshCache() {
-    // we prefetch message keys; 1000 is max.  we only prefetch/cache non-subchannel messages for now
-    const listOptions: DurableObjectListOptions = { limit: 1000, prefix: this.channelId! + '______', reverse: true };
-    const keys = Array.from((await this.storage.list(listOptions)).keys());
-    if (keys) this.messageKeysCache = keys // else leave it empty
-    this.lastCacheTimestamp = this.lastTimestamp; // todo: add a check that ts of last key is same
-    this.messageKeysCacheMap = new Map(keys.map((key, index) => [key, index]));
-  }
+  // async refreshCache() {
+  //   // we prefetch message keys.  we only prefetch/cache perma
+  //   // messages for now (eg not subchannels or TTL messages)
+  //   const listOptions: DurableObjectListOptions = { limit: serverConstants.MAX_MESSAGE_SET_SIZE, prefix: this.channelId! + '______', reverse: true };
+  //   const keys = Array.from((await this.storage.list(listOptions)).keys());
+  //   if (keys) this.messageKeysCache = keys // else leave it empty
+  //   this.lastCacheTimestamp = this.lastTimestamp; // todo: add a check that ts of last key is same
+  //   this.messageKeysCacheMap = new Map(keys.map((key, index) => [key, index]));
+  // }
 
   // this is the fetch picked up by the Durable Object
   async fetch(request: Request) {
@@ -375,7 +522,7 @@ export class ChannelServer implements DurableObject {
     if (!path || path.length < 2) return returnError(request, "Internal Error (L293", 400);
     const channelId = path[0]
     const apiCall = '/' + path[1]
-    
+
     try {
 
       if (dbg.DEBUG) console.log("111111 ==== ChannelServer.fetch() ==== phase ONE ==== 111111")
@@ -533,17 +680,17 @@ export class ChannelServer implements DurableObject {
     }
   }
 
-  #appendMessageKeyToCache(newKey: string): void {
-    if (this.messageKeysCache.length > 5000) {
-      // kludgy limiting of state size
-      const keys = this.messageKeysCache.slice(-500);
-      // recreate the array and map
-      this.messageKeysCache = keys
-      this.messageKeysCacheMap = new Map(keys.map((key, index) => [key, index]));
-    }
-    this.messageKeysCache.push(newKey);
-    this.messageKeysCacheMap.set(newKey, this.messageKeysCache.length - 1);
-  }
+  // #appendMessageKeyToCache(newKey: string): void {
+  //   if (this.messageKeysCache.length > 5000) {
+  //     // kludgy limiting of state size
+  //     const keys = this.messageKeysCache.slice(-500);
+  //     // recreate the array and map
+  //     this.messageKeysCache = keys
+  //     this.messageKeysCacheMap = new Map(keys.map((key, index) => [key, index]));
+  //   }
+  //   this.messageKeysCache.push(newKey);
+  //   this.messageKeysCacheMap.set(newKey, this.messageKeysCache.length - 1);
+  // }
 
   // all messages come through here. they're either through api call or websocket.
   // any issues will throw.
@@ -558,20 +705,24 @@ export class ChannelServer implements DurableObject {
     //   throw new Error("Cannot parse contents type (not json nor arraybuffer)")
     // }
 
-    if (dbg.DEBUG) console.log(
+    if (dbg.DEBUG2) console.log(
       "------------ getting message from client (pre validation) ------------",
       "\n", msg, "\n",
       "-------------------------------------------------")
 
     if (msg.ready) {
       // the client sends a "ready" message when it can start receiving; reception means websocket is all set up
-      if (dbg.DEBUG) console.log("got 'ready' message from client")
+      if (dbg.DEBUG2) console.log("got 'ready' message from client")
       const session = this.sessions.get(apiBody.userId)
-      if (!session) throw new Error("Internal Error [L526]")
-      else session.ready = true;
-      // ToDo: we used to send latest 100 right away; we don't do that anymore.
-      // const latest100 = assemblePayload(await this.#getRecentMessages())!; _sb_assert(latest100, "Internal Error [L548]");
-      // webSocket.send(latest100);
+      if (!session) {
+        // if client sends a ready api call, or the socket has closed, we ignore
+        if (dbg.DEBUG) console.warn("[processMessage]: session not found for 'ready' message, discarding")
+        return;
+      }
+      // if there's a session, we mark it as ready and mirror the ready message
+      session.ready = true;
+      if (dbg.DEBUG2) console.log("sending 'ready' response to client")
+      session!.webSocket.send(this.readyMessage());
       return; // all good
     }
 
@@ -604,6 +755,7 @@ export class ChannelServer implements DurableObject {
 
     // TODO: sync TTL with 'i2'
     var i2Key: string | null = null
+
     if (message.ttl && message.ttl > 0 && message.ttl < 0xF) {
       // these are the cases where messages are also stored under a TTL subchannel
       if (message.i2[3] === '_') {
@@ -617,7 +769,7 @@ export class ChannelServer implements DurableObject {
       }
     }
 
-    // messages with destinations are not allowed to have a long-term TTL
+    // messages with destinations must be short-lived
     if (!message.ttl || message.ttl > 0x8) { // max currently defined message age, 10 days
       if (message.t)
         throw new Error("ERROR: any 'to' (routed) message must have a short TTL")
@@ -633,8 +785,15 @@ export class ChannelServer implements DurableObject {
       throw new Error("Message too large. Discarding message.");
     }
 
-    if (dbg.DEBUG && messagePayloadSize <= 1024)
-      console.log("[info] this message could be stored as metadata (size <= 1KB)")
+    if (dbg.DEBUG) {
+      const payloadAsMetaData = arrayBufferToBase62(messagePayload)
+      if (payloadAsMetaData.length <= 1000) { // some margin
+        console.log(SEPx)
+        console.log(`[info] this message could be stored as metadata (size would be ${messagePayloadSize} chars)`)
+        console.log(payloadAsMetaData.slice(0, 200) + "..." + payloadAsMetaData.slice(-50))
+        console.log(SEPx)
+      }
+    }
 
     // consume storage budget
     if ((messagePayloadSize * serverApiCosts.CHANNEL_STORAGE_MULTIPLIER) > this.storageLimit)
@@ -642,19 +801,20 @@ export class ChannelServer implements DurableObject {
     this.storageLimit -= (messagePayloadSize * serverApiCosts.CHANNEL_STORAGE_MULTIPLIER);
     await this.storage.put('storageLimit', this.storageLimit)
 
-    // todo: add per-user budget limits; also adjust down cost for TTL
+    // todo: add per-user budget limits; also adjust down cost for TTL, especially '0'
 
-    // and store it for posterity both local and global KV, before we broadcast
-    await this.storage.put(key, messagePayload); // we wait for local to succeed before global
-    await this.env.MESSAGES_NAMESPACE.put(key, messagePayload); // now make sure it's in global
-
-    if (i2Key) {
-      // we don't block on these (TTLs have slightly lower expected SLA)
-      this.storage.put(i2Key, messagePayload);
-      this.env.MESSAGES_NAMESPACE.put(i2Key, messagePayload);
-    } else {
-      // and currently it's only non-subchannel messages that we cache
-      this.#appendMessageKeyToCache(key);
+    if (message.ttl !== 0) {
+      // TTL zero is pure ephmeral, not stored; all others are stored
+      await this.storage.put(key, messagePayload); // we wait for local to succeed before global
+      await this.env.MESSAGES_NAMESPACE.put(key, messagePayload); // now make sure it's in global
+      if (i2Key) {
+        // we don't block on these (messages with TTLs have slightly lower SLA)
+        this.storage.put(i2Key, messagePayload);
+        this.env.MESSAGES_NAMESPACE.put(i2Key, messagePayload);
+      } else {
+        // // and currently it's only non-subchannel messages that we cache
+        // this.#appendMessageKeyToCache(key);
+      }
     }
 
     // everything looks good. we broadcast to all connected clients (if any)
@@ -662,6 +822,12 @@ export class ChannelServer implements DurableObject {
       .catch((error: any) => {
         throw new Error(`ERROR: failed to broadcast message: ${error.message}`)
       });
+
+    // after broadcast, we update the message count
+    if (!message.ttl || message.ttl === 0xF) this.messageCount++; // permanent messages
+    this.allMessageCount++; // all messages
+    // ... and finally update our auto response
+    this.state.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', timestampToBase4String(this.lastTimestamp)))
   }
 
   async #send(request: Request, apiBody: ChannelApiBody) {
@@ -737,7 +903,7 @@ export class ChannelServer implements DurableObject {
       // we want to generate a hash of page for use with Etag
       // we want to use the subtle crypto standard api with sha-256 hashing
       const hashBuffer = await crypto.subtle.digest('SHA-256', hashBufferSource)
-      const hashBufferString = arrayBufferToBase62(hashBuffer)      
+      const hashBufferString = arrayBufferToBase62(hashBuffer)
 
       const pageMetaData: PageMetaData = {
         id: pageKey,
@@ -760,10 +926,80 @@ export class ChannelServer implements DurableObject {
     }
   }
 
+  async webSocketMessage(ws: WebSocket, msg: string | ArrayBuffer) {
+    if (dbg.DEBUG) console.log("==== ChannelServer.webSocketMessage() called ====")
+    if (dbg.DEBUG) console.log(msg)
+
+    // webSocket.addEventListener("message", async msg => {
+    const userId = this.state.getTags(ws)[0]!;
+    const session = this.sessions.get(userId)
+
+    if (!session || session.quit) {
+      ws.close(1011, "WebSocket broken (got a quit).");
+      return;
+    }
+
+    try {
+      if (typeof msg === "string") {
+        if (msg === undefined) {
+          if (dbg.DEBUG) console.log("Got 'undefined' message from client, discarding")
+          ws.send(JSON.stringify({ error: "Received 'undefined' as message, discarding" }));
+          return;
+        } else if (msg === 'ping') {
+          // mimic ping/pong semantics of hibernatable websockets (todo: is this is ever needed?)
+          if (dbg.DEBUG) console.log("Sending ping response to client")
+          ws.send(timestampToBase4String(this.lastTimestamp))
+          return;
+        } else {
+          if (dbg.DEBUG) console.log("Got string message from client, but not recognized: ", msg)
+          ws.send(JSON.stringify({ error: "Message not recognized (fatal): " + msg }));
+          return;
+        }
+      } else if (!(msg instanceof ArrayBuffer)) {
+        ws.send(JSON.stringify({ error: "Message neither string nor an ArrayBuffer (fatal)"}));
+        return;
+      }
+      // const message = extractPayload(msg.data).payload
+      const message = extractPayload(msg as ArrayBuffer).payload
+      if (!message) throw new SBError("ERROR: could not process message payload")
+      const apiBody = ws.deserializeAttachment()
+      await this.#processMessage(message, apiBody); // apiBody from original setup
+    } catch (error: any) {
+      console.error(`[channel server websocket listener] error: <<${error.message}>>`)
+      console.log(msg)
+      ws.send(JSON.stringify({ error: `ERROR: failed to process message: ${error.message}` }));
+    }
+
+    // } catch (error: any) {
+    //   // Report any exceptions directly back to the client
+    //   const err_msg = '[handleSession()] ' + error.message + '\n' + error.stack + '\n';
+    //   if (dbg.DEBUG2) console.log(err_msg);
+    //   try {
+    //     webSocket.send(JSON.stringify({ error: err_msg }));
+    //   } catch {
+    //     console.error(`ERROR: was unable to propagate error to client: ${err_msg}`);
+    //   }
+    // }
+  }
+
+  readyMessage() {
+    return JSON.stringify({
+      ready: true,
+      messageCount: this.messageCount,
+      historyShard: this.historyShard,
+     });
+  }
+
   async #setUpNewSession(webSocket: WebSocket, _ip: string | null, apiBody: ChannelApiBody) {
     _sb_assert(webSocket && (webSocket as any).accept, "ERROR: webSocket does not have accept() method (fatal)");
-    (webSocket as any).accept(); // typing override (old issue with CF types)
-    webSocket.binaryType = "arraybuffer"; // otherwise default is 'blob'
+
+    // (webSocket as any).accept(); // typing override (old issue with CF types)
+
+    this.state.acceptWebSocket(webSocket, [apiBody.userId])
+    webSocket.serializeAttachment(apiBody) // we attach the apiBody to the websocket
+
+    // not applicable to CF 'webSocket' object
+    // webSocket.binaryType = "arraybuffer"; // otherwise default is 'blob'
 
     const userKeys = this.visitorKeys.get(apiBody.userId)!
     _sb_assert(userKeys, "Internal Error [L585]")
@@ -779,50 +1015,75 @@ export class ChannelServer implements DurableObject {
       receivedUserInfo: false,
     };
 
+    // if same listener is already active, we close it; note we try to follow
+    // https://www.rfc-editor.org/rfc/rfc6455.html#section-7.4.1
+    if (this.sessions.has(apiBody.userId)) {
+      if (dbg.DEBUG) console.log("closing previous session for same user")
+      this.sessions.get(apiBody.userId)!.webSocket.close(1011, "Same user/key has opened a new session; closing this one.");
+    }
+
     // track active connections
     this.sessions.set(apiBody.userId, session)
 
-    webSocket.addEventListener("message", async msg => {
-      try {
-        if (session.quit) {
-          webSocket.close(1011, "WebSocket broken (got a quit).");
-          return;
-        }
-        try {
-          const message = extractPayload(msg.data).payload
-          if (!message) throw new Error("ERROR: could not process message payload")
-          await this.#processMessage(message, apiBody); // apiBody from original setup
-        } catch (error: any) {
-          console.error(`[channel server websocket listener] error: <<${error.message}>>`)
-          // console.log(msg)
-          console.log(msg.data)
-          webSocket.send(JSON.stringify({ error: `ERROR: failed to process message: ${error.message}` }));
-        }
-      } catch (error: any) {
-        // Report any exceptions directly back to the client
-        const err_msg = '[handleSession()] ' + error.message + '\n' + error.stack + '\n';
-        if (dbg.DEBUG2) console.log(err_msg);
-        try {
-          webSocket.send(JSON.stringify({ error: err_msg }));
-        } catch {
-          console.error(`ERROR: was unable to propagate error to client: ${err_msg}`);
-        }
-      }
-    });
+    // webSocket.addEventListener("message", async msg => {
+    //   try {
+    //     if (session.quit) {
+    //       webSocket.close(1011, "WebSocket broken (got a quit).");
+    //       return;
+    //     }
+    //     try {
+    //       const message = extractPayload(msg.data).payload
+    //       if (!message) throw new Error("ERROR: could not process message payload")
+    //       await this.#processMessage(message, apiBody); // apiBody from original setup
+    //     } catch (error: any) {
+    //       console.error(`[channel server websocket listener] error: <<${error.message}>>`)
+    //       // console.log(msg)
+    //       console.log(msg.data)
+    //       webSocket.send(JSON.stringify({ error: `ERROR: failed to process message: ${error.message}` }));
+    //     }
+    //   } catch (error: any) {
+    //     // Report any exceptions directly back to the client
+    //     const err_msg = '[handleSession()] ' + error.message + '\n' + error.stack + '\n';
+    //     if (dbg.DEBUG2) console.log(err_msg);
+    //     try {
+    //       webSocket.send(JSON.stringify({ error: err_msg }));
+    //     } catch {
+    //       console.error(`ERROR: was unable to propagate error to client: ${err_msg}`);
+    //     }
+    //   }
+    // });
 
-    // On "close" and "error" events, remove matching sessions
-    const closeOrErrorHandler = () => {
-      session.quit = true; // tells any closure to go away
-      // this.sessions = this.sessions.filter(member => member !== session);
-      this.sessions.delete(apiBody.userId)
-    };
-    webSocket.addEventListener("close", closeOrErrorHandler);
-    webSocket.addEventListener("error", closeOrErrorHandler);
+    // // On "close" and "error" events, remove matching sessions
+    // const closeOrErrorHandler = () => {
+    //   session.quit = true; // tells any closure to go away
+    //   // this.sessions = this.sessions.filter(member => member !== session);
+    //   this.sessions.delete(apiBody.userId)
+    // };
+
+    // webSocket.addEventListener("close", closeOrErrorHandler);
+    // webSocket.addEventListener("error", closeOrErrorHandler);
 
     // just a little ping that we're up and running
-    webSocket.send(JSON.stringify({
-      ready: true,
-    }));
+    webSocket.send(this.readyMessage());
+  }
+
+  async webSocketClose(ws: WebSocket /*, code: number, reason: string, wasClean: boolean */) {
+    const userId = this.state.getTags(ws)[0]!;
+    const session = this.sessions.get(userId)
+    if (session) {
+      session.quit = true;
+      this.sessions.delete(userId)
+    }
+  }
+
+  async webSocketError(ws: WebSocket, error: Error) {
+    console.error("WebSocket error:", error.message);
+    const userId = this.state.getTags(ws)[0]!;
+    const session = this.sessions.get(userId)
+    if (session) {
+      session.quit = true;
+      this.sessions.delete(userId)
+    }
   }
 
   // broadcasts a message to all clients.
@@ -849,31 +1110,254 @@ export class ChannelServer implements DurableObject {
     );
   }
 
-  async #getMessageKeys(request: Request, _apiBody: ChannelApiBody) {
+  timestampRegex = /^[0-3]*$/;
+
+  async #_getMessageKeys(prefix: string) {
+    const listOptions: DurableObjectListOptions = {
+      limit: serverConstants.MAX_MESSAGE_SET_SIZE,
+      prefix: this.channelId! + '______' + prefix,
+      reverse: true,
+      allowConcurrency: true,
+    };
+    return await this.storage.list(listOptions)
+  }
+
+  async #getMessageKeys(request: Request, apiBody: ChannelApiBody) {
     // ToDo: carry forward these options from handleOldMessages()
     //       (using abiBody format)
     // const { searchParams } = new URL(request.url);
     // const currentMessagesLength = Number(searchParams.get('currentMessagesLength')) || 100;
     // const cursor = searchParams.get('cursor') || '';
 
-    // main cache should always be in sync
-    // _sb_assert(this.lastCacheTimestamp === this.lastTimestamp, "Internal Error [L735]")
-    if (this.lastCacheTimestamp !== this.lastTimestamp) {
-      if (dbg.DEBUG) console.log("**** message cache is out of sync, reloading it ...")
-      this.refreshCache()
+    // // main cache should always be in sync
+    // if (this.lastCacheTimestamp !== this.lastTimestamp) {
+    //   if (dbg.LOG_ERRORS) console.log("**** message cache is out of sync, reloading it ...")
+    //   this.refreshCache()
+    // }
+
+    // if (this.lastL1CacheTimestamp !== this.lastTimestamp) {
+    //   // L1 cache is not up-to-date, update it from the L2 cache
+    //   this.recentKeysCache = new Set(this.messageKeysCache.slice(-100));
+    // }
+    // this.lastL1CacheTimestamp = this.lastTimestamp;
+    // return returnResult(request, this.recentKeysCache)
+
+    // 2024.02.20 yet another redesign ...
+
+    const prefix = apiBody.apiPayload?.prefix || ''
+    if (prefix && !this.timestampRegex.test(prefix))
+      return returnError(request, "Invalid timestamp prefix (must be [0-3]*)", 400);
+
+    const listQuery = await this.#_getMessageKeys(prefix)
+
+    if (listQuery.size > serverConstants.MAX_MESSAGE_SET_SIZE) {
+      if (dbg.LOG_ERRORS) console.error("ERROR: message set too large")
+      return returnError(request, "Message set too large (need to add pagination)", 400);
     }
 
-    if (this.lastL1CacheTimestamp !== this.lastTimestamp) {
-      // L1 cache is not up-to-date, update it from the L2 cache
-      this.recentKeysCache = new Set(this.messageKeysCache.slice(-100));
+    if (listQuery && listQuery.size > 0) {
+      // const keys = Array.from(listQuery.keys)
+      // we get a Map, but we want to return a Set using the keys
+      const keys = new Set(listQuery.keys())
+      return returnResult(request,
+        {
+          keys: keys,
+          historyShard: this.historyShard,
+        })
+    } else {
+      // ToDo: during testing etc, there may be overlapping history shards etc
+      // _sb_assert(!this.historyShard, "Internal Error [L1045]") // if no keys, there should be no history shard
+      return returnResult(request, { keys: new Set(), historyShard: this.historyShard })
     }
-    this.lastL1CacheTimestamp = this.lastTimestamp;
-    return returnResult(request, this.recentKeysCache)
+
+    // if (keys) this.messageKeysCache = keys // else leave it empty
+    // this.lastCacheTimestamp = this.lastTimestamp; // todo: add a check that ts of last key is same
+    // this.messageKeysCacheMap = new Map(keys.map((key, index) => [key, index]));
+
   }
 
   // return known set of userId (hash) -> public key
   async #getPubKeys(request: Request, _apiBody: ChannelApiBody) {
     return returnResult(request, this.visitors)
+  }
+
+
+
+
+  // async function storageFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response>{
+  //   console.log("Fetching from storage server: ", input)
+  //   // if the input has "<CHANNEL_SERVER_REDIRECT>" in it, then it's meant for *this* worker
+  //   // and we redirect it to ourselves; we do that by first stripping that string,
+  //   // and then calling 'serferFetch' with the new URL
+  //   if (typeof input === 'string') {
+  //     if (input.includes("<CHANNEL_SERVER_REDIRECT>")) {
+  //       input = input.replace("<CHANNEL_SERVER_REDIRECT>", "")
+  //       return serverFetch(input, init)
+  //     }
+  //   }
+  //   const response = await storageServerBinding.fetch(input, init)
+  //   console.log("Got response from storage server: ", response)
+  //   return response
+  // }
+
+
+  createCustomFetch(env: EnvType) {
+    // This function returns a new function that is "fetch-like"
+    return async function (input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+      console.log("Custom fetch called with: ", input);
+      if (typeof input === 'string' && input.includes("<CHANNEL_SERVER_REDIRECT>")) {
+        input = myOrigin + input.replace("<CHANNEL_SERVER_REDIRECT>", "");
+        const request = new Request(input, init);
+        const result = await serverFetch(request, env); // closure over env
+        console.log("Got response from ourselves: ", result);
+        return result;
+      }
+      // ToDo: confirm it's to the storage server
+      if (env.ENVIRONMENT === 'development') {
+        console.log("We just relay the fetch ('development'): ", input)
+        return fetch(input, init);
+      } else {
+        console.log("We redirect storage API calls to service binding: ", input)
+        const response = await storageServerBinding.fetch(input, init);
+        console.log("Got response from storage server (non-dev): ", response);
+        return response;
+      }
+    };
+  }
+
+  // for testing - WORKS!
+  // async getStorageServerInfo(env: EnvType): Promise<any> {
+  //   if (!storageFetchFunction) storageFetchFunction = this.createCustomFetch(env);
+  //   if (!storageServerBinding) storageServerBinding = env.STORAGE_SERVER_BINDING
+  //   // const response = await env.STORAGE_SERVER_BINDING.fetch(env.STORAGE_SERVER_NAME + "/info")
+  //   console.log("Getting storage server info")
+  //   try {
+  //     const sb = new Snackabra("<CHANNEL_SERVER_REDIRECT>", { sbFetch: storageFetchFunction })
+  //     const storageServer = await sb.storage.getStorageServer()
+  //     console.log("Got response from storage server: ", storageServer)
+  //     return storageServer
+  //   } catch (error: any) {
+  //     console.error("ERROR: failed to get storage server info: ", error)
+  //     return ({ error: error.message })
+  //   }
+  // }
+
+  // // for testing - WORKS!
+  // async storeRandomBuffer(env: EnvType): Promise<SBObjectHandle | void> {
+  //   if (!storageFetchFunction) storageFetchFunction = this.createCustomFetch(env);
+  //   if (!storageServerBinding) storageServerBinding = env.STORAGE_SERVER_BINDING
+  //   // const response = await env.STORAGE_SERVER_BINDING.fetch(env.STORAGE_SERVER_NAME + "/info")
+  //   console.log("Getting storage server info")
+  //   try {
+  //     const sb = new Snackabra("<CHANNEL_SERVER_REDIRECT>", { sbFetch: storageFetchFunction, DEBUG: true })
+
+  //     const testSize = 63 * 1024
+  //     const token = this.#generateStorageToken(testSize) // note: we do *not* charge for this
+  //     await this.env.LEDGER_NAMESPACE.put(token.hash, JSON.stringify(token))
+  //     const testBlock = crypto.getRandomValues(new Uint8Array(testSize))
+  //     const shardHandle = await sb.storage.storeData(testBlock, token)
+
+  //     await shardHandle.verification
+  //     console.log('\n', SEP, "Reply from 'SB.storage.storeData()': \n", shardHandle, '\n', SEP)
+
+  //     return shardHandle
+  //   } catch (error: any) {
+  //     console.error("ERROR: failed to get storage server info: ", error)
+  //   }
+  // }
+
+  // // for testing - WORKS!  (this is just with KEYS)
+  // async storeMessageCache(env: EnvType): Promise<SBObjectHandle | void> {
+  //   if (!storageFetchFunction) storageFetchFunction = this.createCustomFetch(env);
+  //   if (!storageServerBinding) storageServerBinding = env.STORAGE_SERVER_BINDING
+  //   try {
+  //     const sb = new Snackabra("<CHANNEL_SERVER_REDIRECT>", { sbFetch: storageFetchFunction, DEBUG: true })
+
+  //     const cache = assemblePayload(this.messageKeysCache)
+  //     const token = this.#generateStorageToken(cache!.byteLength)
+  //     await this.env.LEDGER_NAMESPACE.put(token.hash, JSON.stringify(token))
+  //     const shardHandle = await sb.storage.storeData(cache, token)
+
+  //     await shardHandle.verification
+  //     console.log('\n', SEP, "Reply from 'SB.storage.storeData()': \n", shardHandle, '\n', SEP)
+
+  //     return shardHandle
+  //   } catch (error: any) {
+  //     console.error("ERROR: failed to get storage server info: ", error)
+  //   }
+  // }
+
+  // for testing
+  async storeMessageCache(env: EnvType): Promise<SBObjectHandle | void> {
+    if (!storageFetchFunction) storageFetchFunction = this.createCustomFetch(env);
+    if (!storageServerBinding) storageServerBinding = env.STORAGE_SERVER_BINDING
+    try {
+      const sb = new Snackabra("<CHANNEL_SERVER_REDIRECT>", { sbFetch: storageFetchFunction, DEBUG: true })
+
+      // const messageHistory = new Map<string, ArrayBuffer>();
+      // const keys = this.messageKeysCache;
+      // const getOptions: DurableObjectGetOptions = { allowConcurrency: true };
+      // let remainingKeys = keys.length;
+
+      // while (keys.length > 0) {
+      //   const batchKeys = keys.splice(-100);
+      //   const results = await this.storage.get(batchKeys, getOptions);
+      //   for (const [key, { value }] of Object.entries(results)) {
+      //     if (value) messageHistory.set(key, value);
+      //     remainingKeys--;
+      //   }
+      // }
+
+      const messageHistory = new Map<string, ArrayBuffer>();
+
+      // const keys = [...this.messageKeysCache]; // Clone to avoid mutating the original array
+      const keysMap = await this.#_getMessageKeys('0')
+      // turn the keys into an array
+      const keys = Array.from(keysMap.keys())
+
+      const getOptions: DurableObjectGetOptions = { allowConcurrency: true };
+
+      while (keys.length > 0) {
+        // '100' is max number of values we can get in one go
+        const batchKeys = keys.splice(0, 100);
+        const results: Map<string, ArrayBuffer> = await this.storage.get(batchKeys, getOptions)
+        if (results instanceof Map) {
+          for (const [key, value] of results) {
+            if (value)
+              messageHistory.set(key, value);
+          }
+        } else {
+          console.error("Unexpected result format from storage.get (?)");
+          return
+        }
+      }
+
+      const messageHistoryPayload = assemblePayload(messageHistory)!
+      const token = this.#generateStorageToken(messageHistoryPayload.byteLength);
+
+      await this.env.LEDGER_NAMESPACE.put(token.hash, JSON.stringify(token))
+      const shardHandle = await sb.storage.storeData(messageHistoryPayload, token)
+
+      await shardHandle.verification
+      console.log('\n', SEP, "Reply from 'SB.storage.storeData()': \n", shardHandle, '\n', SEP)
+
+      this.historyShard = shardHandle
+
+      return shardHandle
+    } catch (error: any) {
+      console.error("ERROR: failed to get storage server info: ", error)
+    }
+  }
+
+  async #getHistory(request: Request, _apiBody: ChannelApiBody) {
+    // const testInfo = await this.getStorageServerInfo(this.env)
+    // console.log("Got storage server info: ", testInfo)
+    // return returnResult(request, { storageInfo: testInfo, greeting: 'hello from /getHistory' })
+    // const shardHandle = await this.storeRandomBuffer(this.env)
+    const shardHandle = await this.storeMessageCache(this.env)
+    if (!shardHandle) return returnError(request, "Failed to store random buffer", 400)
+    // return returnResult(request, { shardHandle: await stringify_SBObjectHandle(shardHandle), greeting: 'hello from /getHistory' })
+    return returnResult(request, { shardHandle: shardHandle, greeting: 'hello from /getHistory' })
   }
 
   // return messages matching set of keys
@@ -884,10 +1368,14 @@ export class ChannelServer implements DurableObject {
       if (!(apiBody.apiPayload instanceof Set)) throw new Error("[getMessages] payload needs to be a set of keys")
       const clientKeys = apiBody.apiPayload as Set<string>
       if (clientKeys.size === 0) return returnError(request, "[getMessages] No keys provided", 400)
+      const regex = /^([a-zA-Z0-9]+)______([0-3]{26})$/;
       const validKeys = [];
       for (const key of clientKeys) {
-        if (this.messageKeysCacheMap.has(key)) {
+        // we confirm format of the key
+        if (regex.test(key)) {
           validKeys.push(key);
+        } else if (dbg.DEBUG) {
+          console.error("ERROR: tried to read key with invalid key format: ", key)
         }
       }
       if (validKeys.length === 0) {
@@ -896,7 +1384,7 @@ export class ChannelServer implements DurableObject {
           console.log(apiBody.apiPayload)
           console.log(clientKeys)
           console.log('\n', SEP, "==== ChannelServer.getMessages() returning ====\n", "No valid keys found", "\n", SEP)
-          console.log(this.messageKeysCacheMap)
+          // console.log(this.messageKeysCacheMap)
         }
         return returnError(request, "[getMessages] No valid keys found", 400)
       }
@@ -1003,6 +1491,19 @@ export class ChannelServer implements DurableObject {
     return size // return what was actually consumed
   }
 
+  // prints the token, doesn't validate anything
+  #generateStorageToken(size: number): SBStorageToken {
+    const hash = SBStorageTokenPrefix + arrayBufferToBase62(crypto.getRandomValues(new Uint8Array(32)).buffer);
+    const token: SBStorageToken = {
+      hash: hash,
+      used: false,
+      size: size, // note that this is actual size, not requested (might be the same)
+      motherChannel: this.channelId!,
+      created: Date.now()
+    }
+    return validate_SBStorageToken(token);
+  }
+
   // channels approve storage by creating storage token out of their budget
   async #getStorageToken(request: Request, apiBody: ChannelApiBody) {
     // TODO: per-user storage boundaries (higher priority now since this will soon support Infinity)
@@ -1010,14 +1511,7 @@ export class ChannelServer implements DurableObject {
     try {
       const size = await this.#consumeStorage(Number(apiBody.apiPayload.size)); // will throw if there are issues, otherwise quietly return
       // the channel was good for the charge, so create the token
-      const hash = SBStorageTokenPrefix + arrayBufferToBase62(crypto.getRandomValues(new Uint8Array(32)).buffer);
-      const token: SBStorageToken = {
-        hash: hash,
-        used: false,
-        size: size, // note that this is actual size, not requested (might be the same)
-        motherChannel: this.channelId!,
-        created: Date.now()
-      }
+      const token = this.#generateStorageToken(size);
       await this.env.LEDGER_NAMESPACE.put(token.hash, JSON.stringify(validate_SBStorageToken(token)));
       if (dbg.DEBUG)
         console.log(`[newStorage()]: Created new storage token for ${size} bytes\n`,
@@ -1132,7 +1626,7 @@ export class ChannelServer implements DurableObject {
           "channel_id": this.channelId,
           "notification": {
             silent: false,
-            // replace notification in the queue, this limits message spam. 
+            // replace notification in the queue, this limits message spam.
             // We are limited in how we want to deliever notifications because of the encryption of messages
             // We limit the number of notifications to 1 per minute
             tag: `${this.channelId}${date.getTime()}`,
@@ -1174,7 +1668,7 @@ export class ChannelServer implements DurableObject {
         // this could be an error, or an attempt to hack; always log
         console.error("ERROR **** channelData ownerChannelId does not match channelId - possible hack attempt?")
         return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
-      }  
+      }
     } else {
       currentStorageLimit = this.storageLimit; // it's a 'deposit' so we are adding to this
     }

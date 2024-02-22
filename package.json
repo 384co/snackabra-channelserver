@@ -14,7 +14,7 @@
   },
   "keywords": [],
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20231218.0",
+    "@cloudflare/workers-types": "^4.20240208.0",
     "miniflare": "^3.0.1",
     "snackabra": "^2.0.0-alpha.4",
     "ts-loader": "^9.4.2",

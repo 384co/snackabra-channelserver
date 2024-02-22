@@ -20,3 +20,4 @@ package-lock.json
 *.wrangler.toml
 .yarn/
 .mf/
+.local.data.json

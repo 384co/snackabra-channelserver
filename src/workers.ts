@@ -117,7 +117,11 @@ export const serverConstants = {
     MAX_BUDGET_TRANSFER: 1024 * 1024 * 1024 * 1024 * 1024, // 1 PB
 
     // see discussion in jslib
-    MAX_SB_BODY_SIZE: 64 * 1024
+    MAX_SB_BODY_SIZE: 64 * 1024,
+
+    // maximum number of (perma) messages kept in KV format; beyond this,
+    // messages are shardified. note that current CF hard limit is 1000.
+    MAX_MESSAGE_SET_SIZE: 100, // if this is lower than 1000, we're testing
 }
 
 // used by both storage and channel servers to create 'key' into IMAGES KV
@@ -342,6 +346,20 @@ export async function handleErrors(request: Request, func: () => Promise<Respons
 import type { EnvType } from './env'
 import { handleApiRequest } from './index'
 
+export async function serverFetch(request: Request, env: EnvType) {
+    console.log("serverFetch() called with url:", request.url)
+    return await handleErrors(request, async () => {
+        if (request.method == "OPTIONS")
+            return returnResult(request);
+        const path = (new URL(request.url)).pathname.slice(1).split('/');
+        console.log("serverFetch() path:", path)
+        if ((path.length >= 1) && (path[0] === 'api') && (path[1] == 'v2'))
+            return handleApiRequest(path.slice(2), request, env);
+        else
+            return returnError(request, "Not found (must give API endpoint '/api/v2/...')", 404)
+    });
+}
+
 export default {
     async fetch(request: Request, env: EnvType) {
         // note: this will only toggle these values in this file
@@ -350,21 +368,13 @@ export default {
         if (dbg.DEBUG) {
             const msg = `==== [${request.method}] Fetch called: ${request.url}`;
             console.log(
-                `\n${'='.repeat(Math.max(msg.length, 60))}` +
+                `\n${'='.repeat(Math.min(msg.length, 76))}` +
                 `\n${msg}` +
-                `\n${'='.repeat(Math.max(msg.length, 60))}`
+                `\n${'='.repeat(Math.min(msg.length, 76))}`
             );
             if (dbg.DEBUG2) console.log(request.headers);
         }
-        return await handleErrors(request, async () => {
-            if (request.method == "OPTIONS")
-                return returnResult(request);
-            const path = (new URL(request.url)).pathname.slice(1).split('/');
-            if ((path.length >= 1) && (path[0] === 'api') && (path[1] == 'v2'))
-                return handleApiRequest(path.slice(2), request, env);
-            else
-                return returnError(request, "Not found (must give API endpoint '/api/v2/...')", 404)
-        });
+        return await serverFetch(request, env);
     }
 }
 
