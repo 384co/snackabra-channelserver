@@ -23,16 +23,16 @@
 */
 
 import {
+  Channel,
   sbCrypto, extractPayload, assemblePayload, ChannelMessage,
-  stripChannelMessage, setDebugLevel, composeMessageKey, SBStorageToken,
+  stripChannelMessage, setDebugLevel, SBStorageToken,
   validate_SBStorageToken, SBStorageTokenPrefix,
   SB384, arrayBufferToBase62, jsonParseWrapper,
   version, validate_ChannelMessage, validate_SBChannelData,
   SBUserPublicKey,
   SBError,
   Snackabra, // stringify_SBObjectHandle,
-  timestampToBase4String,
-  deComposeMessageKey, base4StringToDate, // arrayBufferToBase64url,
+ // arrayBufferToBase64url,
 } from 'snackabra';
 
 import type { SBChannelId, ChannelAdminData, SBUserId, SBChannelData, ChannelApiBody, SBObjectHandle } from 'snackabra';
@@ -357,7 +357,7 @@ export class ChannelServer implements DurableObject {
     console.log("++++ setting websocket handler timeout to (seconds):", this.state.getHibernatableWebSocketEventTimeout()! / 1000)
 
     console.log("++++ setting autoresponse to timestamp ++++")
-    this.state.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', timestampToBase4String(this.lastTimestamp)))
+    this.state.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', Channel.timestampToBase4String(this.lastTimestamp)))
 
     console.log("++++ ChannelServer constructor done ++++")
   }
@@ -432,12 +432,10 @@ export class ChannelServer implements DurableObject {
     console.log(SEPx)
 
     // extract the timestamp from 'lowest' and 'highest' keys
-    let [_channelId, _i2, lowestTimeStampString] = deComposeMessageKey(lowest)
-    const lowDate = base4StringToDate(lowestTimeStampString);
-    [_channelId, _i2, lowestTimeStampString] = deComposeMessageKey(highest)
-    const highDate = base4StringToDate(lowestTimeStampString);
-
-
+    let [_channelId, _i2, lowestTimeStampString] = Channel.deComposeMessageKey(lowest)
+    const lowDate = Channel.base4StringToDate(lowestTimeStampString);
+    [_channelId, _i2, lowestTimeStampString] = Channel.deComposeMessageKey(highest)
+    const highDate = Channel.base4StringToDate(lowestTimeStampString);
 
     console.log(SEPx)
     console.log(SEPx)
@@ -751,7 +749,7 @@ export class ChannelServer implements DurableObject {
 
     // appending timestamp to channel id. this is global, unique message identifier
     // const key = this.channelId + '_' + message.i2 + '_' + ts;
-    const key = composeMessageKey(this.channelId!, tsNum, message.i2)
+    const key = Channel.composeMessageKey(this.channelId!, tsNum, message.i2)
 
     // TODO: sync TTL with 'i2'
     var i2Key: string | null = null
@@ -763,9 +761,9 @@ export class ChannelServer implements DurableObject {
         if (dbg.DEBUG) console.error("ERROR: subchannel cannot be used with TTL")
         throw new Error("Subchannel cannot be used with TTL. Discarding message.")
       } else {
-        // ttl is a digit 1-9, we append that to the i2 centerpiece (eg encoded in subchannel)
+        // ttl is a digit 3-8, we append that to the i2 centerpiece (eg encoded in subchannel)
         // i2Key = this.channelId + '_' + message.i2.slice(0, 3) + message.ttl + '_' + ts;
-        i2Key = composeMessageKey(this.channelId!, tsNum, message.i2.slice(0, 3) + message.ttl)
+        i2Key = Channel.composeMessageKey(this.channelId!, tsNum, message.i2.slice(0, 3) + message.ttl)
       }
     }
 
@@ -827,7 +825,7 @@ export class ChannelServer implements DurableObject {
     if (!message.ttl || message.ttl === 0xF) this.messageCount++; // permanent messages
     this.allMessageCount++; // all messages
     // ... and finally update our auto response
-    this.state.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', timestampToBase4String(this.lastTimestamp)))
+    this.state.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', Channel.timestampToBase4String(this.lastTimestamp)))
   }
 
   async #send(request: Request, apiBody: ChannelApiBody) {
@@ -948,7 +946,7 @@ export class ChannelServer implements DurableObject {
         } else if (msg === 'ping') {
           // mimic ping/pong semantics of hibernatable websockets (todo: is this is ever needed?)
           if (dbg.DEBUG) console.log("Sending ping response to client")
-          ws.send(timestampToBase4String(this.lastTimestamp))
+          ws.send(Channel.timestampToBase4String(this.lastTimestamp))
           return;
         } else {
           if (dbg.DEBUG) console.log("Got string message from client, but not recognized: ", msg)
