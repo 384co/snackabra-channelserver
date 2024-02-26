@@ -64,6 +64,9 @@ const base62Regex = new RegExp(`[${base62mi}]`);
 
 export { default } from './workers'
 
+const CHANNEL_STORAGE_MULTIPLIER_PERMA = serverApiCosts.CHANNEL_STORAGE_MULTIPLIER
+const CHANNEL_STORAGE_MULTIPLIER_TEMP = serverApiCosts.CHANNEL_STORAGE_MULTIPLIER_TTL_ZERO
+
 // todo (below): most things go through DO only, but there are probably more API
 // endpoints we can handle before callDurableObject(), at which point we go from
 // stateless (scalable) servlets to a singleton.
@@ -72,7 +75,7 @@ export { default } from './workers'
 var myOrigin: string = '';
 
 export async function handleApiRequest(path: Array<string>, request: Request, env: EnvType) {
-  dbg.DEBUG = env.DEBUG_ON; dbg.DEBUG2 = env.VERBOSE_ON; if (dbg.DEBUG) dbg.LOG_ERRORS = true;
+  // dbg.DEBUG = env.DEBUG_ON; dbg.DEBUG2 = env.VERBOSE_ON; if (dbg.DEBUG) dbg.LOG_ERRORS = true;
 
   if (!myOrigin) myOrigin = new URL(request.url).origin;
 
@@ -159,7 +162,7 @@ export async function handleApiRequest(path: Array<string>, request: Request, en
 // calling this switches from 'generic' (anonymous) microservice to a
 // (synchronous) Durable Object (unique per channel)
 async function callDurableObject(channelId: SBChannelId, path: Array<string>, request: Request, env: EnvType) {
-  dbg.DEBUG = env.DEBUG_ON; dbg.DEBUG2 = env.VERBOSE_ON; if (dbg.DEBUG) dbg.LOG_ERRORS = true;
+  // dbg.DEBUG = env.DEBUG_ON; dbg.DEBUG2 = env.VERBOSE_ON; if (dbg.DEBUG) dbg.LOG_ERRORS = true;
   const durableObjectId = env.channels.idFromName(channelId);
   const durableObject = env.channels.get(durableObjectId);
   const newUrl = new URL(request.url);
@@ -264,7 +267,7 @@ export class ChannelServer implements DurableObject {
   /* ----- these are updated dynamically      ----- */
   /* 'storageLimit'        */ storageLimit: number = 0;        // current storage budget
   /* 'capacity'            */ capacity: number = 20;           // max number of (accepted) visitors
-  /* 'lastTimestamp'       */ lastTimestamp: number = 0;       // monotonically increasing timestamp
+  /* 'latestTimestamp'       */ latestTimestamp: number = 0;       // monotonically increasing timestamp
   /* ----- these track access permissions      ----- */
   /* 'locked'              */ locked: boolean = false;
   /* 'visitors'            */ visitors: Map<SBUserId, SBUserPublicKey> = new Map();
@@ -298,7 +301,7 @@ export class ChannelServer implements DurableObject {
   // // used for caching message keys
   // private messageKeysCache: string[] = []; // L2 cache
   // messageKeysCacheMap: Map<string, number> = new Map(); // 'indexes' into messageKeysCache
-  // private lastCacheTimestamp: number = 0; // mirrors lastTimestamp (should be the same)
+  // private lastCacheTimestamp: number = 0; // mirrors latestTimestamp (should be the same)
   // private recentKeysCache: Set<string> = new Set(); // L1 cache
   // private lastL1CacheTimestamp: number = 0; // similar but tracks the 'set'
 
@@ -315,7 +318,10 @@ export class ChannelServer implements DurableObject {
 
   constructor(public state: DurableObjectState, public env: EnvType) {
     // load from wrangler.toml (don't override here or in env.ts)
-    dbg.DEBUG = env.DEBUG_ON; dbg.DEBUG2 = env.VERBOSE_ON; if (dbg.DEBUG) dbg.LOG_ERRORS = true;
+    dbg.DEBUG = env.DEBUG_ON === true;
+    dbg.DEBUG2 = env.VERBOSE_ON === true;
+    dbg.LOG_ERRORS = env.LOG_ERRORS === true;
+    if (dbg.DEBUG) dbg.LOG_ERRORS = true;
     if (dbg.DEBUG) console.log("++++ channel server code loaded ++++ dbg.DEBUG is enabled ++++")
     if (dbg.DEBUG2) console.log("++++ dbg.DEBUG2 (verbose) enabled ++++")
     // if we're on verbose mode, then we poke jslib to be on basic dbg.DEBUG mode
@@ -329,6 +335,7 @@ export class ChannelServer implements DurableObject {
     this.visitorCalls = {
       "/getChannelKeys": this.#getChannelKeys.bind(this),
       "/getHistory": this.#getHistory.bind(this),
+      "/getLatestTimestamp": this.#getLatestTimestamp.bind(this),
       "/getMessageKeys": this.#getMessageKeys.bind(this),
       "/getMessages": this.#getMessages.bind(this),
       "/getPubKeys": this.#getPubKeys.bind(this),
@@ -353,11 +360,11 @@ export class ChannelServer implements DurableObject {
     // loadedOwnerApiEndpoints = Object.keys(this.ownerCalls)
 
     // todo: presumed to be a good idea to limit this
-    this.state.setHibernatableWebSocketEventTimeout(10 * 1000) // milliseconds
+    this.state.setHibernatableWebSocketEventTimeout(1 * 60 * 1000) // milliseconds thus this is 1 minute
     console.log("++++ setting websocket handler timeout to (seconds):", this.state.getHibernatableWebSocketEventTimeout()! / 1000)
 
     console.log("++++ setting autoresponse to timestamp ++++")
-    this.state.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', Channel.timestampToBase4String(this.lastTimestamp)))
+    this.state.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', Channel.timestampToBase4String(this.latestTimestamp)))
 
     console.log("++++ ChannelServer constructor done ++++")
   }
@@ -432,10 +439,10 @@ export class ChannelServer implements DurableObject {
     console.log(SEPx)
 
     // extract the timestamp from 'lowest' and 'highest' keys
-    let [_channelId, _i2, lowestTimeStampString] = Channel.deComposeMessageKey(lowest)
-    const lowDate = Channel.base4StringToDate(lowestTimeStampString);
-    [_channelId, _i2, lowestTimeStampString] = Channel.deComposeMessageKey(highest)
-    const highDate = Channel.base4StringToDate(lowestTimeStampString);
+    let { timestamp } = Channel.deComposeMessageKey(lowest)
+    const lowDate = Channel.base4StringToDate(timestamp);
+    ({ timestamp } = Channel.deComposeMessageKey(highest));
+    const highDate = Channel.base4StringToDate(timestamp);
 
     console.log(SEPx)
     console.log(SEPx)
@@ -464,7 +471,7 @@ export class ChannelServer implements DurableObject {
       if (dbg.DEBUG) console.log("\n", channelData, "\n", SEP)
 
       const channelState = await this.storage.get(
-        ['channelId', 'channelData', 'motherChannel', 'storageLimit', 'capacity', 'lastTimestamp', 'visitors',
+        ['channelId', 'channelData', 'motherChannel', 'storageLimit', 'capacity', 'latestTimestamp', 'visitors',
           'locked', 'messageCount', 'allMessageCount', 'historyShard']
       )
       const storedChannelData = jsonParseWrapper(channelState.get('channelData') as string, 'L234') as SBChannelData
@@ -481,7 +488,7 @@ export class ChannelServer implements DurableObject {
 
       this.storageLimit = Number(channelState.get('storageLimit')) || 0
       this.capacity = Number(channelState.get('capacity')) || 20
-      this.lastTimestamp = Number(channelState.get('lastTimestamp')) || 0;
+      this.latestTimestamp = Number(channelState.get('latestTimestamp')) || 0;
       this.locked = (channelState.get('locked')) === 'true' ? true : false;
 
       // we do these LAST since it signals that we've fully initialized the channel
@@ -509,7 +516,7 @@ export class ChannelServer implements DurableObject {
   //   const listOptions: DurableObjectListOptions = { limit: serverConstants.MAX_MESSAGE_SET_SIZE, prefix: this.channelId! + '______', reverse: true };
   //   const keys = Array.from((await this.storage.list(listOptions)).keys());
   //   if (keys) this.messageKeysCache = keys // else leave it empty
-  //   this.lastCacheTimestamp = this.lastTimestamp; // todo: add a check that ts of last key is same
+  //   this.lastCacheTimestamp = this.latestTimestamp; // todo: add a check that ts of last key is same
   //   this.messageKeysCacheMap = new Map(keys.map((key, index) => [key, index]));
   // }
 
@@ -724,6 +731,19 @@ export class ChannelServer implements DurableObject {
       return; // all good
     }
 
+    if (msg.close && msg.close === true) {
+      if (dbg.DEBUG2) console.log("client is shutting down connection")
+      const session = this.sessions.get(apiBody.userId)
+      if (!session) {
+        if (dbg.DEBUG) console.warn("[processMessage]: session not found for 'close' message, ignoring")
+        return;
+      }
+      session.quit = true;
+      session.webSocket.close(1011, "Client requested 'close'.");
+      this.sessions.delete(apiBody.userId);
+      return; // all good
+    }
+
     const message: ChannelMessage = validate_ChannelMessage(msg) // will throw if anything wrong
 
     // at this point we have a validated, verified, and parsed message
@@ -742,10 +762,10 @@ export class ChannelServer implements DurableObject {
       message.i2 = '____' // default; use to keep track of where we're at in processing
     }
 
-    const tsNum = Math.max(Date.now(), this.lastTimestamp + 1);
+    const tsNum = Math.max(Date.now(), this.latestTimestamp + 1);
     message.sts = tsNum; // server timestamp
-    this.lastTimestamp = tsNum;
-    this.storage.put('lastTimestamp', tsNum)
+    this.latestTimestamp = tsNum;
+    this.storage.put('latestTimestamp', tsNum)
 
     // appending timestamp to channel id. this is global, unique message identifier
     // const key = this.channelId + '_' + message.i2 + '_' + ts;
@@ -773,8 +793,9 @@ export class ChannelServer implements DurableObject {
         throw new Error("ERROR: any 'to' (routed) message must have a short TTL")
     }
 
-    // strip (minimize) it and, package it, result chunk is stand-alone except for channelId
-    const messagePayload = assemblePayload(stripChannelMessage(message))!
+    // strip (minimize) it and, package it, result chunk is stand-alone except
+    // for channelId; calling in 'serverMode' (true) to enforce server-side
+    const messagePayload = assemblePayload(stripChannelMessage(message, true))!
 
     // final, final, we enforce storage limit
     const messagePayloadSize = messagePayload.byteLength
@@ -794,9 +815,10 @@ export class ChannelServer implements DurableObject {
     }
 
     // consume storage budget
-    if ((messagePayloadSize * serverApiCosts.CHANNEL_STORAGE_MULTIPLIER) > this.storageLimit)
+    const multiplier = message.ttl === 0 ? CHANNEL_STORAGE_MULTIPLIER_PERMA : CHANNEL_STORAGE_MULTIPLIER_TEMP
+    if ((messagePayloadSize * multiplier) > this.storageLimit)
       throw new Error("Storage limit exceeded. Message cannot be stored or broadcast. Discarding message.");
-    this.storageLimit -= (messagePayloadSize * serverApiCosts.CHANNEL_STORAGE_MULTIPLIER);
+    this.storageLimit -= (messagePayloadSize * multiplier);
     await this.storage.put('storageLimit', this.storageLimit)
 
     // todo: add per-user budget limits; also adjust down cost for TTL, especially '0'
@@ -825,11 +847,15 @@ export class ChannelServer implements DurableObject {
     if (!message.ttl || message.ttl === 0xF) this.messageCount++; // permanent messages
     this.allMessageCount++; // all messages
     // ... and finally update our auto response
-    this.state.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', Channel.timestampToBase4String(this.lastTimestamp)))
+    this.state.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', Channel.timestampToBase4String(this.latestTimestamp)))
   }
 
   async #send(request: Request, apiBody: ChannelApiBody) {
-    _sb_assert(apiBody && apiBody.apiPayload, "send(): need payload (the message)")
+    // _sb_assert(apiBody && apiBody.apiPayload, "[ChannelServer] send(): need payload (the message)")
+    if (!apiBody || !apiBody.apiPayload) {
+      if (dbg.LOG_ERRORS) console.error("[ChannelServer.send] No payload found?")
+      return returnError(request, "No payload included - 'send' needs payload (...perhaps a missing 'await' at your end?)");
+    }
     if (dbg.DEBUG) {
       console.log("==== ChannelServer.handleSend() called ====")
       console.log(apiBody)
@@ -877,7 +903,7 @@ export class ChannelServer implements DurableObject {
 
     if (dbg.DEBUG) console.log(page, type, '\n', SEP)
     try {
-      const size = await this.#consumeStorage(pageSize! * serverApiCosts.CHANNEL_STORAGE_MULTIPLIER);
+      const size = await this.#consumeStorage(pageSize! * CHANNEL_STORAGE_MULTIPLIER_PERMA);
       const pageKey = ownerKeys.hashB32
       const pageKeyKV = genKey(pageKey, 'G')
       // first we sanity check that this does not exist or, if it does, it's the
@@ -934,6 +960,7 @@ export class ChannelServer implements DurableObject {
 
     if (!session || session.quit) {
       ws.close(1011, "WebSocket broken (got a quit).");
+      if (session) this.sessions.delete(userId);
       return;
     }
 
@@ -946,7 +973,7 @@ export class ChannelServer implements DurableObject {
         } else if (msg === 'ping') {
           // mimic ping/pong semantics of hibernatable websockets (todo: is this is ever needed?)
           if (dbg.DEBUG) console.log("Sending ping response to client")
-          ws.send(Channel.timestampToBase4String(this.lastTimestamp))
+          ws.send(Channel.timestampToBase4String(this.latestTimestamp))
           return;
         } else {
           if (dbg.DEBUG) console.log("Got string message from client, but not recognized: ", msg)
@@ -984,6 +1011,7 @@ export class ChannelServer implements DurableObject {
     return JSON.stringify({
       ready: true,
       messageCount: this.messageCount,
+      latestTimestamp: Channel.timestampToBase4String(this.latestTimestamp),
       historyShard: this.historyShard,
      });
   }
@@ -1128,16 +1156,16 @@ export class ChannelServer implements DurableObject {
     // const cursor = searchParams.get('cursor') || '';
 
     // // main cache should always be in sync
-    // if (this.lastCacheTimestamp !== this.lastTimestamp) {
+    // if (this.lastCacheTimestamp !== this.latestTimestamp) {
     //   if (dbg.LOG_ERRORS) console.log("**** message cache is out of sync, reloading it ...")
     //   this.refreshCache()
     // }
 
-    // if (this.lastL1CacheTimestamp !== this.lastTimestamp) {
+    // if (this.lastL1CacheTimestamp !== this.latestTimestamp) {
     //   // L1 cache is not up-to-date, update it from the L2 cache
     //   this.recentKeysCache = new Set(this.messageKeysCache.slice(-100));
     // }
-    // this.lastL1CacheTimestamp = this.lastTimestamp;
+    // this.lastL1CacheTimestamp = this.latestTimestamp;
     // return returnResult(request, this.recentKeysCache)
 
     // 2024.02.20 yet another redesign ...
@@ -1169,7 +1197,7 @@ export class ChannelServer implements DurableObject {
     }
 
     // if (keys) this.messageKeysCache = keys // else leave it empty
-    // this.lastCacheTimestamp = this.lastTimestamp; // todo: add a check that ts of last key is same
+    // this.lastCacheTimestamp = this.latestTimestamp; // todo: add a check that ts of last key is same
     // this.messageKeysCacheMap = new Map(keys.map((key, index) => [key, index]));
 
   }
@@ -1179,8 +1207,10 @@ export class ChannelServer implements DurableObject {
     return returnResult(request, this.visitors)
   }
 
-
-
+  // getlatestTimestamp
+  #getLatestTimestamp(request: Request, _apiBody: ChannelApiBody) {
+    return returnResult(request, Channel.timestampToBase4String(this.latestTimestamp))
+  }
 
   // async function storageFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response>{
   //   console.log("Fetching from storage server: ", input)
@@ -1290,7 +1320,7 @@ export class ChannelServer implements DurableObject {
     if (!storageFetchFunction) storageFetchFunction = this.createCustomFetch(env);
     if (!storageServerBinding) storageServerBinding = env.STORAGE_SERVER_BINDING
     try {
-      const sb = new Snackabra("<CHANNEL_SERVER_REDIRECT>", { sbFetch: storageFetchFunction, DEBUG: true })
+      const sb = new Snackabra("<CHANNEL_SERVER_REDIRECT>", { sbFetch: storageFetchFunction, DEBUG: env.DEBUG_ON })
 
       // const messageHistory = new Map<string, ArrayBuffer>();
       // const keys = this.messageKeysCache;
@@ -1580,7 +1610,7 @@ export class ChannelServer implements DurableObject {
       storageLimit: this.storageLimit,
       visitors: this.visitors,
       motherChannel: this.motherChannel ?? "<UNKNOWN>",
-      lastTimestamp: this.lastTimestamp,
+      latestTimestamp: Channel.timestampToBase4String(this.latestTimestamp),
     }
     return adminData
   }
@@ -1606,10 +1636,10 @@ export class ChannelServer implements DurableObject {
   async #sendWebNotifications() {
     const envNotifications = this.env.notifications
     if (!envNotifications) {
-      if (dbg.DEBUG) console.log("Cannot send web notifications (expected behavior if you're running locally")
+      if (dbg.DEBUG2) console.log("Cannot send web notifications (expected behavior if you're running locally")
       return;
     }
-    if (dbg.DEBUG) console.log("Sending web notification")
+    if (dbg.DEBUG2) console.log("Sending web notification")
 
     // message = jsonParseWrapper(message, 'L999')
     // if (message?.type === 'ack') return

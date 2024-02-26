@@ -67,14 +67,15 @@ export var dbg = {
  *     /api/v2/channel/<ID>/getCapacity         : [O]
  *     /api/v2/channel/<ID>/getChannelKeys      :     get owner pub key, channel pub key
  *     /api/v2/channel/<ID>/getJoinRequests     : [O]
+ *     /api/v2/channel/<ID>/getLatestTimestamp  :     in prefix format (v3 api)
  *     /api/v2/channel/<ID>/getMother           : [O]
- *     /api/v2/channel/<ID>/getPubKeys          :      returns Map<userId, pubKey>
- *     /api/v2/channel/<ID>/getStorageLimit     :      (under development)
+ *     /api/v2/channel/<ID>/getPubKeys          :     returns Map<userId, pubKey>
+ *     /api/v2/channel/<ID>/getStorageLimit     :     (under development)
  *     /api/v2/channel/<ID>/getStorageToken
  *     /api/v2/channel/<ID>/lockChannel         : [O]
  *     /api/v2/channel/<ID>/send
  *     /api/v2/channel/<ID>/setCapacity         : [O]
- *     /api/v2/channel/<ID>/uploadChannel       :     (v2 version not implemtened)
+ *     /api/v2/channel/<ID>/uploadChannel       :     (v2/v3 not implemtened, will use shards)
  *     /api/v2/channel/<ID>/websocket           :     connect to channel socket (wss protocol)
  * 
  * The following are deprecated or disabled:
@@ -147,7 +148,8 @@ export function genKeyPrefix(prefix: string, type: string = '_') {
 export const serverApiCosts = {
     // multiplier of cost of storage on channel vs. storage server
     // (this includes Pages)
-    CHANNEL_STORAGE_MULTIPLIER: 8,
+    CHANNEL_STORAGE_MULTIPLIER: 8.0,
+    CHANNEL_STORAGE_MULTIPLIER_TTL_ZERO: 1/8.0 // upwards 1/100th cost of storing
 }
 
 // internal - handle assertions
@@ -363,8 +365,9 @@ export async function serverFetch(request: Request, env: EnvType) {
 export default {
     async fetch(request: Request, env: EnvType) {
         // note: this will only toggle these values in this file
-        dbg.DEBUG = env.DEBUG_ON
-        dbg.DEBUG2 = env.VERBOSE_ON
+        dbg.DEBUG = env.DEBUG_ON === true
+        dbg.DEBUG2 = env.VERBOSE_ON === true
+        dbg.LOG_ERRORS = env.LOG_ERRORS === true
         if (dbg.DEBUG) {
             const msg = `==== [${request.method}] Fetch called: ${request.url}`;
             console.log(

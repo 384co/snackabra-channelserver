@@ -9,6 +9,7 @@ export type EnvType = {
   STORAGE_SERVER_NAME: string,
   DEBUG_ON: boolean,
   VERBOSE_ON: boolean,
+  LOG_ERRORS: boolean,
   notifications: Fetcher,
   WEB_NOTIFICATION_SERVER: string,
   ENVIRONMENT?: string,
