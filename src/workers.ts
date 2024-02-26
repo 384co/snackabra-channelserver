@@ -12,7 +12,8 @@ import { NEW_CHANNEL_MINIMUM_BUDGET as _NEW_CHANNEL_MINIMUM_BUDGET } from 'snack
 export var dbg = {
     DEBUG: false,
     DEBUG2: false,
-    LOG_ERRORS: true
+    LOG_ERRORS: true,
+    myOrigin: '',     // tracks our origin as well
   }
 
 
@@ -349,12 +350,12 @@ import type { EnvType } from './env'
 import { handleApiRequest } from './index'
 
 export async function serverFetch(request: Request, env: EnvType) {
-    console.log("serverFetch() called with url:", request.url)
+    if (dbg.DEBUG) console.log("serverFetch() called with url:", request.url)
     return await handleErrors(request, async () => {
         if (request.method == "OPTIONS")
             return returnResult(request);
         const path = (new URL(request.url)).pathname.slice(1).split('/');
-        console.log("serverFetch() path:", path)
+        if (dbg.DEBUG2) console.log("serverFetch() path:", path)
         if ((path.length >= 1) && (path[0] === 'api') && (path[1] == 'v2'))
             return handleApiRequest(path.slice(2), request, env);
         else
@@ -368,12 +369,14 @@ export default {
         dbg.DEBUG = env.DEBUG_ON === true
         dbg.DEBUG2 = env.VERBOSE_ON === true
         dbg.LOG_ERRORS = env.LOG_ERRORS === true
+        if (!dbg.myOrigin) dbg.myOrigin = new URL(request.url).origin
+
         if (dbg.DEBUG) {
             const msg = `==== [${request.method}] Fetch called: ${request.url}`;
             console.log(
-                `\n${'='.repeat(Math.min(msg.length, 76))}` +
+                `\n${'='.repeat(Math.min(msg.length, 120))}` +
                 `\n${msg}` +
-                `\n${'='.repeat(Math.min(msg.length, 76))}`
+                `\n${'='.repeat(Math.min(msg.length, 120))}`
             );
             if (dbg.DEBUG2) console.log(request.headers);
         }

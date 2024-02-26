@@ -126,6 +126,8 @@ Follow format from [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/
 
 - added 'return304' as helper, added Etag support for Pages
 
+- adding '.env' file to set 'IS_LOCAL'
+
 ## [1.1.0] - 2023-03-01
 
 ### Added

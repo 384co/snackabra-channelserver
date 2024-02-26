@@ -14,4 +14,5 @@ export type EnvType = {
   WEB_NOTIFICATION_SERVER: string,
   ENVIRONMENT?: string,
   STORAGE_SERVER_BINDING: any,
+  IS_LOCAL: boolean, // set to true by 'yarn start' to signal we're on local dev
 }

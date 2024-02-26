@@ -71,13 +71,13 @@ const CHANNEL_STORAGE_MULTIPLIER_TEMP = serverApiCosts.CHANNEL_STORAGE_MULTIPLIE
 // endpoints we can handle before callDurableObject(), at which point we go from
 // stateless (scalable) servlets to a singleton.
 
-// simple way to track what our origin is
-var myOrigin: string = '';
+// // simple way to track what our origin is
+// var myOrigin: string = '';
 
 export async function handleApiRequest(path: Array<string>, request: Request, env: EnvType) {
   // dbg.DEBUG = env.DEBUG_ON; dbg.DEBUG2 = env.VERBOSE_ON; if (dbg.DEBUG) dbg.LOG_ERRORS = true;
 
-  if (!myOrigin) myOrigin = new URL(request.url).origin;
+  // if (!myOrigin) myOrigin = new URL(request.url).origin;
 
   try {
     switch (path[0]) {
@@ -529,6 +529,7 @@ export class ChannelServer implements DurableObject {
     const apiCall = '/' + path[1]
 
     try {
+      if (!dbg.myOrigin) dbg.myOrigin = url.origin;
 
       if (dbg.DEBUG) console.log("111111 ==== ChannelServer.fetch() ==== phase ONE ==== 111111")
       // phase 'one' - sort out parameters
@@ -543,8 +544,9 @@ export class ChannelServer implements DurableObject {
         console.log(
           SEP,
           '[Durable Object] fetch() called:\n',
-          '  channelId:', channelId, '\n',
+          '  myOrigin:', dbg.myOrigin, '\n',
           '    apiCall:', apiCall, '\n',
+          '  channelId:', channelId, '\n',
           '  full path:', path, '\n',
           SEP, request.url, '\n', SEP,
           '    apiBody: \n', apiBody, '\n', SEP)
@@ -1234,20 +1236,39 @@ export class ChannelServer implements DurableObject {
     return async function (input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
       console.log("Custom fetch called with: ", input);
       if (typeof input === 'string' && input.includes("<CHANNEL_SERVER_REDIRECT>")) {
-        input = myOrigin + input.replace("<CHANNEL_SERVER_REDIRECT>", "");
+        _sb_assert(dbg.myOrigin, "Our origin still unknown. Internal Error [L1238]")
+        input = dbg.myOrigin + input.replace("<CHANNEL_SERVER_REDIRECT>", "");
         const request = new Request(input, init);
         const result = await serverFetch(request, env); // closure over env
         console.log("Got response from ourselves: ", result);
+
+        // let's 'clone' the result, and print out the body
+        const clonedResult = result.clone();
+        // let's print out content type
+        console.log("Content type: ", clonedResult.headers.get('content-type'));
+        // if it's a text type, including json, print it as text
+        if (clonedResult.headers.get('content-type')?.includes('text') || clonedResult.headers.get('content-type')?.includes('json')) {
+          const text = await clonedResult.text();
+          console.log("Body: ", text);
+        }
+        // if it's binary, let's print out first 100 bytes in hexadecimals
+        if (clonedResult.headers.get('content-type')?.includes('application/octet-stream')) {
+          const buffer = await clonedResult.arrayBuffer();
+          const hex = Array.from(new Uint8Array(buffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+          console.log("Body (hex): ", hex.slice(0, 200) + "...");
+          console.log(SEP, "Payload: \n", extractPayload(buffer).payload, SEP)
+        }
+
         return result;
       }
       // ToDo: confirm it's to the storage server
-      if (env.ENVIRONMENT === 'development') {
-        console.log("We just relay the fetch ('development'): ", input)
+      if (env.IS_LOCAL) {
+        console.log(SEP, "Running LOCAL. We just relay the fetch ('development'):\n", input, SEP)
         return fetch(input, init);
       } else {
-        console.log("We redirect storage API calls to service binding: ", input)
+        console.log(SEP, "Deployed. We redirect storage API calls to service binding:\n", input, SEP)
         const response = await storageServerBinding.fetch(input, init);
-        console.log("Got response from storage server (non-dev): ", response);
+        console.log("Got response from storage server (NON LOCAL): ", response);
         return response;
       }
     };
@@ -1343,6 +1364,8 @@ export class ChannelServer implements DurableObject {
       // turn the keys into an array
       const keys = Array.from(keysMap.keys())
 
+      console.log("0000 0000 [storeMessageCache] Got keys: ", keys)
+
       const getOptions: DurableObjectGetOptions = { allowConcurrency: true };
 
       while (keys.length > 0) {
@@ -1360,11 +1383,19 @@ export class ChannelServer implements DurableObject {
         }
       }
 
+      console.log("1111 1111 [storeMessageCache] Got messageHistory: ", messageHistory)
+
       const messageHistoryPayload = assemblePayload(messageHistory)!
       const token = this.#generateStorageToken(messageHistoryPayload.byteLength);
 
       await this.env.LEDGER_NAMESPACE.put(token.hash, JSON.stringify(token))
-      const shardHandle = await sb.storage.storeData(messageHistoryPayload, token)
+
+      console.log("2222 2222 [storeMessageCache] About to store with payload")
+
+      // const shardHandle = await sb.storage.storeData(messageHistoryPayload, token)
+      const shardHandle = await sb.storage.storeData(messageHistory, token)
+
+      console.log("3333 3333 [storeMessageCache] Got handle in return:\n", shardHandle)
 
       await shardHandle.verification
       console.log('\n', SEP, "Reply from 'SB.storage.storeData()': \n", shardHandle, '\n', SEP)

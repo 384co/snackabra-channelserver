@@ -7,6 +7,8 @@
 Snackabra Room Server
 =====================
 
+_This is all very, very outdated_
+
 This repository is for the chat room server. For general documentation
 on Snackabra see: https://snackabra.io
 
