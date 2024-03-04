@@ -128,6 +128,8 @@ Follow format from [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/
 
 - adding '.env' file to set 'IS_LOCAL'
 
+- stopping use of local storage (eg DO KV) for messages
+
 ## [1.1.0] - 2023-03-01
 
 ### Added

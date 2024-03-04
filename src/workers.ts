@@ -123,7 +123,8 @@ export const serverConstants = {
 
     // maximum number of (perma) messages kept in KV format; beyond this,
     // messages are shardified. note that current CF hard limit is 1000.
-    MAX_MESSAGE_SET_SIZE: 100, // if this is lower than 1000, we're testing
+    MAX_MESSAGE_SET_SIZE: 512, // should be around half of 1000, to give headroom
+    MESSAGE_HISTORY_BRANCH_FACTOR: 32, // per-node branching factor
 }
 
 // used by both storage and channel servers to create 'key' into IMAGES KV
