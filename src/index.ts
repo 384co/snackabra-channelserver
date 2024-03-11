@@ -285,13 +285,19 @@ interface TTL0Buffer {
   first: number, // points to first entry (unless equal to 'last', in which case buffer is empty)
   last: number, // always points to next 'free' spot
   totalSize: number,
-  ring: Map<number, { x: number, id: string}> // from ring buffer, to message Map, includ 'expiration' timestamp
+   // from ring buffer, to message Map; 'x' is expiration, 'id' is message key, 't' is userId (if targeted)
+  ring: Map<number, { x: number, id: string, t: SBUserId | undefined }>
   messages: Map<string, ArrayBuffer>
 }
 
 const TTL0_MAX_MESSAGES = 1024; // have a modulo index ring buffer
 const TTL0_MAX_SPACE = 2 * 1024 * 1024; // 2 MiB; note this is in-memory only
 const TTL0_EXPIRATION = 30 * 1000; // 30 seconds
+
+/**
+ * Ring buffer for all recent messages; includes TTL0 messages but also everything else.
+ * This is dumped upon hibernation.
+ */
 export class TTL0BufferClass {
   constructor(public buffer: TTL0Buffer =
     { first: 0, last: 0, totalSize: 0, ring: new Map(), messages: new Map() })
@@ -326,12 +332,12 @@ export class TTL0BufferClass {
   }
 
   // note: when we add a message, we do not need to trim for SIZE until AFTER it's been added
-  addMessage(id: string, m: ArrayBuffer) {
+  addMessage(id: string, m: ArrayBuffer, userId?: SBUserId) {
     _sb_assert(!this.buffer.messages.has(id), "Message already in buffer (Internal Error) [L312]");
     if (dbg.DEBUG2) console.log("... adding message to buffer:", id)
     this.deleteExpired(); // just keeping things tight
     this.buffer.totalSize += m.byteLength;
-    this.buffer.ring.set(this.buffer.last, { x: Date.now() + TTL0_EXPIRATION, id: id });
+    this.buffer.ring.set(this.buffer.last, { x: Date.now() + TTL0_EXPIRATION, id: id, t: userId});
     this.buffer.messages.set(id, m);
     this.buffer.last = (this.buffer.last + 1) % TTL0_MAX_MESSAGES;
     if (this.buffer.last === this.buffer.first)
@@ -391,22 +397,30 @@ export class TTL0BufferClass {
     return filtered;
   }
 
-  // call the callback function for all messages that have a key that is greater
-  // than the given value; the callback function should return 'true' to stop the
-  // iteration, and 'false' to continue. The callback function is called with
-  // the message key and the message itself. Note that the iteration is in 'ring'
-  // order (modulo the buffer size etc).
-  iterate(callback: (key: string, message: ArrayBuffer) => boolean, start: string) {
+  /** call the callback function for all messages that have a key that is
+      greater than the given value; the callback function should return 'true'
+      to stop the iteration, and 'false' to continue. The callback function is
+      called with the message key and the message itself. Note that the
+      iteration is in 'ring' order (modulo the buffer size etc). */
+  iterate(callback: (key: string, userId: SBUserId | undefined, message: ArrayBuffer) => boolean, start: string) {
     this.deleteExpired();
     let tail = this.buffer.first;
     while (tail !== this.buffer.last) {
-      const id = this.buffer.ring.get(tail)?.id;
-      _sb_assert(id, "Message not found in buffer (Internal Error) [L404]");
+      const info = this.buffer.ring.get(tail)!
+      _sb_assert(info, "Message not found in buffer (Internal Error) [L410]");
+      const id = info.id
+      _sb_assert(id, "Message not found in buffer (Internal Error) [L412]");
       const m = this.buffer.messages.get(id!);
-      _sb_assert(m, "Message not found in buffer (Internal Error) [L406]");
-      if (id! > start && callback(id!, m!)) return;
+      _sb_assert(m, "Message not found in buffer (Internal Error) [L414]");
+      if (id! > start && callback(id!, info.t,  m!)) return;
       tail = (tail + 1) % TTL0_MAX_MESSAGES;
     }
+  }
+
+  get bufferOldestTimestamp() {
+    this.deleteExpired();
+    if (this.buffer.first === this.buffer.last) return '3'.repeat(26); // max timestamp (buffer empty)
+    return Channel.deComposeMessageKey(this.buffer.ring.get(this.buffer.first)!.id).timestamp;
   }
 
   get getBuffer() {
@@ -1013,9 +1027,12 @@ export class ChannelServer implements DurableObject {
     }
   }
 
-  // all messages come through here. they're either through api call or websocket.
-  // any issues will throw.
-  async #processMessage(msg: any, userId: SBUserId, isOwner: boolean /*, apiBody: ChannelApiBody */): Promise<void> {
+  /** all messages come through here. they're either through api call or
+      websocket. any issues will throw. for websocket messages,
+      'webSocketMessage()' will catch and process any low-level commands
+      ('ready', 'close', etc)
+  */
+  async #processMessage(msg: any, /* userId: SBUserId, */ isOwner: boolean /*, apiBody: ChannelApiBody */): Promise<void> {
 
     try {
       // var message: ChannelMessage = {}
@@ -1034,57 +1051,57 @@ export class ChannelServer implements DurableObject {
         // "\n", "apiBody:\n", apiBody, "\n",
         )
 
-      if (msg.ready) {
-        // the client sends a "ready" message when it can start receiving; reception means websocket is all set up
-        if (DBG0 || dbg.DEBUG2) console.log("got 'ready' message from client, UserId:", /* apiBody. */ userId)
-        const session = this.sessions.get(/* apiBody. */ userId)
-        if (!session) {
-          // if client sends a ready api call, or the socket has closed, we ignore
-          if (dbg.DEBUG) console.warn("[processMessage]: session not found for 'ready' message, discarding")
-          if (dbg.DEBUG) console.log(SEP, "Current sessions:\n", this.sessions, SEP)
-          return;
-        }
-        // if there's a session, we mark it as ready and mirror the ready message
-        session.ready = true;
-        if (dbg.DEBUG2) console.log("sending 'ready' response to client")
-        session!.webSocket.send(this.readyMessage());
+      // if (msg.ready) {
+      //   // the client sends a "ready" message when it can start receiving; reception means websocket is all set up
+      //   if (DBG0 || dbg.DEBUG2) console.log("got 'ready' message from client, UserId:", /* apiBody. */ userId)
+      //   const session = this.sessions.get(/* apiBody. */ userId)
+      //   if (!session) {
+      //     // if client sends a ready api call, or the socket has closed, we ignore
+      //     if (dbg.DEBUG) console.warn("[processMessage]: session not found for 'ready' message, discarding")
+      //     if (dbg.DEBUG) console.log(SEP, "Current sessions:\n", this.sessions, SEP)
+      //     return;
+      //   }
+      //   // if there's a session, we mark it as ready and mirror the ready message
+      //   session.ready = true;
+      //   if (dbg.DEBUG2) console.log("sending 'ready' response to client")
+      //   session!.webSocket.send(this.readyMessage());
         
-        return; // all good
-      }
+      //   return; // all good
+      // }
 
-      if (msg.reset) {
-        // client sends 'reset' if it's notices that i might have missed TTL0 messages
-        const session = this.sessions.get(/* apiBody. */ userId)
-        if (session) {
-          // if we have entries in the TTL0 buffer, we send them now
-          const ttl0Messages = this.ttl0Buffer.messages;
-          if (ttl0Messages.size > 0) {
-            const keysToSend = Array.from(ttl0Messages.keys()).sort()
-            if (DBG0) console.log("ttl0Messages:", ttl0Messages, "keysToSend:", keysToSend)
-            keysToSend.forEach((key) => {
-              if (DBG0) console.log("Looking up key:", key)
-              const msg = ttl0Messages.get(key)
-              if (!msg) throw new Error("Internal Error (L952), cannot find key: " + key)
-              if (DBG0) console.log(SEP, "sending TTL0 messages to client", SEP, extractPayload(msg).payload, SEP)
-              session.webSocket.send(msg);
-            });
-          }
-        }
-      }
+      // if (msg.reset) {
+      //   // client sends 'reset' if it's notices that i might have missed TTL0 messages
+      //   const session = this.sessions.get(/* apiBody. */ userId)
+      //   if (session) {
+      //     // if we have entries in the TTL0 buffer, we send them now
+      //     const ttl0Messages = this.ttl0Buffer.messages;
+      //     if (ttl0Messages.size > 0) {
+      //       const keysToSend = Array.from(ttl0Messages.keys()).sort()
+      //       if (DBG0) console.log("ttl0Messages:", ttl0Messages, "keysToSend:", keysToSend)
+      //       keysToSend.forEach((key) => {
+      //         if (DBG0) console.log("Looking up key:", key)
+      //         const msg = ttl0Messages.get(key)
+      //         if (!msg) throw new Error("Internal Error (L952), cannot find key: " + key)
+      //         if (DBG0) console.log(SEP, "sending TTL0 messages to client", SEP, extractPayload(msg).payload, SEP)
+      //         session.webSocket.send(msg);
+      //       });
+      //     }
+      //   }
+      // }
 
 
-      if (msg.close && msg.close === true) {
-        if (DBG0 || dbg.DEBUG2) console.log("client is shutting down connection")
-        const session = this.sessions.get(/* apiBody. */ userId)
-        if (!session) {
-          if (dbg.LOG_ERRORS) console.warn("[processMessage]: session not found for 'close' message, ignoring")
-          return;
-        }
-        session.quit = true;
-        session.webSocket.close(1011, "Client requested 'close'.");
-        this.sessions.delete(/* apiBody. */ userId);
-        return; // all good
-      }
+      // if (msg.close && msg.close === true) {
+      //   if (DBG0 || dbg.DEBUG2) console.log("client is shutting down connection")
+      //   const session = this.sessions.get(/* apiBody. */ userId)
+      //   if (!session) {
+      //     if (dbg.LOG_ERRORS) console.warn("[processMessage]: session not found for 'close' message, ignoring")
+      //     return;
+      //   }
+      //   session.quit = true;
+      //   session.webSocket.close(1011, "Client requested 'close'.");
+      //   this.sessions.delete(/* apiBody. */ userId);
+      //   return; // all good
+      // }
 
       const message: ChannelMessage = validate_ChannelMessage(msg) // will throw if anything wrong
       // if (DBG0) console.log("Message after validation:", message)
@@ -1184,21 +1201,13 @@ export class ChannelServer implements DurableObject {
           // // and currently it's only non-subchannel messages that we cache
           // this.#appendMessageKeyToCache(key);
         }
-      } else {
-        // 'TTL0' are essentially ephemeral, how we want to buffer them for a
-        // bit for various reasons, notably that in interacting with hibernateable
-        // websockets they can otherwise be lost
-
-        // await this.env.MESSAGES_NAMESPACE.put(key, messagePayload, {expirationTtl: 30});
-        // console.log(SEP, "TTL0 message, buffering", SEP)
-        this.ttl0Buffer.addMessage(key, messagePayload)
-
-        // // and back it up
-        // await this.storage.put('ttl0Buffer', assemblePayload(this.ttl0Buffer.getBuffer))
       }
 
       // everything looks good. we broadcast to all connected clients (if any)
       await this.#broadcast(messagePayload)
+
+      // all messages are cached in the 'TTL0' buffer
+      this.ttl0Buffer.addMessage(key, messagePayload, message.t)
 
       // after broadcast, we update the message count
       await this.#incrementMessageCount(!message.ttl || message.ttl === 0xF)
@@ -1220,7 +1229,7 @@ export class ChannelServer implements DurableObject {
       console.log(apiBody)
     }
     try {
-      await this.#processMessage(apiBody.apiPayload!, apiBody.userId, apiBody.isOwner! /*, apiBody */)
+      await this.#processMessage(apiBody.apiPayload!, /* apiBody.userId, */ apiBody.isOwner! /*, apiBody */)
       return returnSuccess(request)
     } catch (error: any) {
       return returnError(request, error.message, 400);
@@ -1318,8 +1327,8 @@ export class ChannelServer implements DurableObject {
       const userId = this.state.getTags(ws)[0]!;
       const session = this.sessions.get(userId)
       if (!session) {
-        ws.close(1011, "[ChannelServer.webSocketMessage] No current session for userId: " + userId);
-        if (DBG0) console.log(SEP, "COULD NOT FIND SESSION for user:", userId, "\n", "Current sessions:", "\n", this.sessions, SEP)
+        ws.close(1011, "[ChannelServer.webSocketMessage] No current session (closing socket), userId: " + userId);
+        if (DBG0 || dbg.LOG_ERRORS) console.log("[ChannelServer.webSocketMessage]: No sesssion for: ", userId)
       } else if (session.quit) {
         ws.close(1011, "[ChannelServer.webSocketMessage] The session has been closed (quit) for userId: " + userId);
         this.sessions.delete(userId);
@@ -1330,44 +1339,75 @@ export class ChannelServer implements DurableObject {
           const regex = /^[0-3]{26}$/;
           if (regex.test(msg)) {
             // if it's a (timestamp) prefix string, then it's a request for TTL0 buffer
-            // we iterate through TTL0 buffer and send all messages with timestamp > prefix
-            this.ttl0Buffer.iterate((_key, message) => {
-              if (DBG0) console.log(SEP, "sending TTL0 messages to client", SEP, extractPayload(message).payload, SEP)
-              ws.send(message);
-              return true; // continue
-            }, msg);
-
-        } else switch (msg) {
+            // if we're asked for something that is before our oldest TTL0 message, then we
+            // disconnect
+            if (this.ttl0Buffer.bufferOldestTimestamp > msg && msg !== '0'.repeat(26)) {
+              if (DBG0) console.log(
+                SEP,
+                "Disconnecting client, requested TTL0 buffer is too old",
+                SEP,
+                "requested:", msg,
+                "oldest:   ", this.ttl0Buffer.bufferOldestTimestamp,
+                SEP
+                )
+              ws.close(1011, "Requested TTL0 buffer is too old.");
+              session.quit = true;
+              this.sessions.delete(userId);
+            } else {
+              // we iterate through TTL0 buffer and send all messages with timestamp > prefix
+              this.ttl0Buffer.iterate((_key, userId, message) => {
+                if (!userId || userId !== userId || session.isOwner) {
+                  if (DBG0) console.log(SEP, "sending TTL0 (and other) messages to client", SEP, extractPayload(message).payload, SEP)
+                  ws.send(message);
+                }
+                return true; // continue
+              }, msg);
+            }
+          } else switch (msg) {
+            case 'close':
+              // client sends 'close' if it's shutting down connection
+              if (DBG0 || dbg.DEBUG) console.log("client is shutting down connection")
+              session.quit = true;
+              ws.close(1011, "Client requested 'close'.");
+              this.sessions.delete(userId);
+              return;
             case 'ping':
-              // 'keep alive' message from client, respond with timestamp prefix
+              // 'keep alive' message from client, respond with timestamp prefix; if running on
+              // hibernation-capable network stack, this is caught before getting here
               if (DBG0 || dbg.DEBUG) console.log("[ChannelServer.webSocketMessage] Sending ping response to client")
               ws.send(Channel.timestampToBase4String(this.latestTimestamp))
               return;
+            case 'ready':
+              // client sends a "ready" message when it can start receiving; reception means websocket is all set up
+              if (DBG0 || dbg.DEBUG) console.log("got 'ready' message from client, UserId:", userId)
+              session.ready = true;
+              ws.send(this.readyMessage());
+              return;
             default:
               if (DBG0 || dbg.DEBUG) console.log("Got string message from client, but not recognized: ", msg)
-              ws.send(JSON.stringify({ error: "[ChannelServer.webSocketMessage] Message not recognized (fatal): " + msg }));
+              ws.send(assemblePayload({ error: "[ChannelServer.webSocketMessage] Message not recognized (fatal): " + msg })!);
               return;
           }
         } else {
           const message = extractPayload(msg as ArrayBuffer).payload
           if (!message)
-            ws.send(JSON.stringify({ error: "[ChannelServer.webSocketMessage] Could not process message payload" }));
+            ws.send(assemblePayload({ error: "[ChannelServer.webSocketMessage] Could not process message payload" })!);
           else
-            await this.#processMessage(message, userId, session.isOwner /*, apiBody */);
+            await this.#processMessage(message, /* userId, */ session.isOwner /*, apiBody */);
         }
       }
     } catch (error: any) {
       if (dbg.LOG_ERRORS) console.error('[ChannelServer.webSocketMessage] Unknown error while processing message:\n', error.message)
-      ws.send(JSON.stringify({ error: '[ChannelServer.webSocketMessage] Unknown error while processing message' }));
+      ws.send(assemblePayload({ error: '[ChannelServer.webSocketMessage] Unknown error while processing message' })!);
     }
   }
 
   readyMessage() {
-    return JSON.stringify({
+    return assemblePayload({
       ready: true,
       messageCount: this.messageCount,
       latestTimestamp: Channel.timestampToBase4String(this.latestTimestamp),
-     });
+     })!;
   }
 
   async #setUpNewSession(webSocket: WebSocket, _ip: string | null, apiBody: ChannelApiBody) {
@@ -1869,23 +1909,24 @@ export class ChannelServer implements DurableObject {
       const clientKeys = apiBody.apiPayload as Set<string>
       if (clientKeys.size === 0) return returnError(request, "[getMessages] No keys provided", 400)
       const regex = /^([a-zA-Z0-9]+)______([0-3]{26})$/;
-      const validKeys = [];
+      const validKeys: Array<string> = [];
       
-      const ttl0bufferKeys = this.ttl0Buffer.getMessageKeys()
-      const requestedTTL0Keys = []
+      // const ttl0bufferKeys = this.ttl0Buffer.getMessageKeys()
+      // const requestedTTL0Keys = []
       for (const key of clientKeys) {
         // we confirm format of the key
         if (regex.test(key)) {
-          if (ttl0bufferKeys.has(key)) {
-            requestedTTL0Keys.push(key)
-          } else {
+          // if (ttl0bufferKeys.has(key)) {
+          //   requestedTTL0Keys.push(key)
+          // } else {
             validKeys.push(key);
-          }
+          // }
         } else if (dbg.DEBUG) {
           console.error("ERROR: tried to read key with invalid key format: ", key)
         }
       }
-      if (validKeys.length === 0 && requestedTTL0Keys.length === 0) {
+
+      if (validKeys.length === 0 /* && requestedTTL0Keys.length === 0 */) {
         if (dbg.DEBUG) {
           console.log('\n', SEP, "And here are the keys that were requested", "\n", SEP)
           console.log(apiBody.apiPayload)
@@ -1898,7 +1939,7 @@ export class ChannelServer implements DurableObject {
       const getOptions: DurableObjectGetOptions = { allowConcurrency: true };
       let messages: Map<string, ArrayBuffer> = new Map();
       if (validKeys.length > 0) messages = await this.storage.get(validKeys, getOptions); // get stored messages
-      if (requestedTTL0Keys.length > 0) messages = new Map([...messages, ...this.ttl0Buffer.getMessages(requestedTTL0Keys)])
+      // if (requestedTTL0Keys.length > 0) messages = new Map([...messages, ...this.ttl0Buffer.getMessages(requestedTTL0Keys)])
       _sb_assert(messages, "Internal Error [L1768]");
       // if (dbg.DEBUG) console.log(SEP, "==== ChannelServer.getMessages() returning ====\n", messages, "\n", SEP)
       return returnResult(request, messages);

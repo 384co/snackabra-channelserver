@@ -130,6 +130,11 @@ Follow format from [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/
 
 - stopping use of local storage (eg DO KV) for messages
 
+- channel server: cleaned up how/where incoming low-level (for the server)
+  websocket (string) messages are handled (NOT in #processMessage)
+
+- adding ttl0buffer
+
 ## [1.1.0] - 2023-03-01
 
 ### Added
