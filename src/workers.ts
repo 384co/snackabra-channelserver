@@ -151,7 +151,7 @@ export const serverApiCosts = {
     // multiplier of cost of storage on channel vs. storage server
     // (this includes Pages)
     CHANNEL_STORAGE_MULTIPLIER: 8.0,
-    CHANNEL_STORAGE_MULTIPLIER_TTL_ZERO: 1/8.0 // upwards 1/100th cost of storing
+    CHANNEL_STORAGE_MULTIPLIER_TTL_ZERO: 1.0/8.0 // upwards 1/100th cost of storing
 }
 
 // internal - handle assertions

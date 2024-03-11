@@ -22,6 +22,9 @@
 
 */
 
+// this feature is under development
+const MESSAGE_HISTORY = false;
+
 import {
   Channel,
   sbCrypto, extractPayload, assemblePayload, ChannelMessage,
@@ -60,6 +63,17 @@ const SEPx = '='.repeat(76)
 const SEP = '\n' + SEPx + '\n'
 const SEPxStar = '\n' + '*'.repeat(76) + '\n'
 
+const DBG0 = true; // set to true to enable specific debug output
+
+// called on all 'entry points' to set the debug level
+function setServerDebugLevel(env: EnvType) {
+  dbg.DEBUG = env.DEBUG_ON ? true : false;
+  dbg.LOG_ERRORS = env.LOG_ERRORS || dbg.DEBUG ? true : false;
+  dbg.DEBUG2 = env.VERBOSE_ON ? true : false;
+  if (dbg.DEBUG2) setDebugLevel(dbg.DEBUG) // poke jslib
+}
+
+
 const base62mi = "0123456789ADMRTxQjrEywcLBdHpNufk" // "v05.05" (strongpinVersion ^0.6.0)
 const base62Regex = new RegExp(`[${base62mi}]`);
 
@@ -75,8 +89,9 @@ const CHANNEL_STORAGE_MULTIPLIER_TEMP = serverApiCosts.CHANNEL_STORAGE_MULTIPLIE
 // // simple way to track what our origin is
 // var myOrigin: string = '';
 
+
 export async function handleApiRequest(path: Array<string>, request: Request, env: EnvType) {
-  // dbg.DEBUG = env.DEBUG_ON; dbg.DEBUG2 = env.VERBOSE_ON; if (dbg.DEBUG) dbg.LOG_ERRORS = true;
+  setServerDebugLevel(env)
 
   // if (!myOrigin) myOrigin = new URL(request.url).origin;
 
@@ -163,7 +178,6 @@ export async function handleApiRequest(path: Array<string>, request: Request, en
 // calling this switches from 'generic' (anonymous) microservice to a
 // (synchronous) Durable Object (unique per channel)
 async function callDurableObject(channelId: SBChannelId, path: Array<string>, request: Request, env: EnvType) {
-  // dbg.DEBUG = env.DEBUG_ON; dbg.DEBUG2 = env.VERBOSE_ON; if (dbg.DEBUG) dbg.LOG_ERRORS = true;
   const durableObjectId = env.channels.idFromName(channelId);
   // locate to west north america (not relocated afterwards); todo: see if
   // there's a simple way to select 'enam' if that's closer
@@ -223,16 +237,29 @@ type ApiCallMap = {
   [key: string]: ((request: Request, apiBody: ChannelApiBody) => Promise<Response>) | undefined;
 };
 
-type SessionType = {
+interface SessionInfoHibernated {
+  // the following are included in hibernation
   userId: SBUserId,
-  userKeys: SB384,
   channelId: SBChannelId,
+  isOwner: boolean,
+}
+
+interface SessionInfo extends SessionInfoHibernated {
+  // the following are re-created on return from hibernation
+  // (non-serializable or trivially re-creatable)
+  userKeys: SB384,
   webSocket: WebSocket,
   ready: boolean,
-  // blockedMessages: Map<string, unknown>,
   quit: boolean,
-  receivedUserInfo: boolean
 }
+
+// interface HibernationInfo {
+//   userId: SBUserId,
+//   channelId: SBChannelId,
+//   isOwner: boolean,
+//   // apiBody: ChannelApiBody,
+//   // channelData: SBChannelData,
+// }
 
 // var loadedVisitorApiEndpoints: Array<string> = []
 // var loadedOwnerApiEndpoints: Array<string> = []
@@ -254,6 +281,143 @@ let storageServerBinding: any = null;
 // in a comment section, list the most common MIME types on the Internet
 // https://developer.mozilla.org/en-US/docs/Web/HTTP/Basics_of_HTTP/MIME_types/Common_types
 
+interface TTL0Buffer {
+  first: number, // points to first entry (unless equal to 'last', in which case buffer is empty)
+  last: number, // always points to next 'free' spot
+  totalSize: number,
+  ring: Map<number, { x: number, id: string}> // from ring buffer, to message Map, includ 'expiration' timestamp
+  messages: Map<string, ArrayBuffer>
+}
+
+const TTL0_MAX_MESSAGES = 1024; // have a modulo index ring buffer
+const TTL0_MAX_SPACE = 2 * 1024 * 1024; // 2 MiB; note this is in-memory only
+const TTL0_EXPIRATION = 30 * 1000; // 30 seconds
+export class TTL0BufferClass {
+  constructor(public buffer: TTL0Buffer =
+    { first: 0, last: 0, totalSize: 0, ring: new Map(), messages: new Map() })
+    {
+      // we do a few sanity checks on the buffer before using it
+      let tail = this.buffer.first;
+      while (tail !== this.buffer.last) {
+        const id = this.buffer.ring.get(tail)?.id;
+        _sb_assert(id, "Message not found in buffer (Internal Error) [L280]");
+        const m = this.buffer.messages.get(id!);
+        _sb_assert(m, "Message not found in buffer (Internal Error) [L282]");
+        tail = (tail + 1) % TTL0_MAX_MESSAGES;
+      }
+      let totalSize = 0;
+      for (const m of this.buffer.messages.values()) totalSize += m.byteLength;
+      _sb_assert(totalSize === this.buffer.totalSize, "Total size does not match (Internal Error) [L290]");
+      this.deleteExpired(); // looks good, let's clean it up
+      if (DBG0 && this.buffer.first !== this.buffer.last) console.log("Loaded TTL0BufferClass from storage: ", this.buffer);
+    }
+
+  // remove from the 'top' (start) of the buffer
+  removeFirst() {
+    if (this.buffer.first === this.buffer.last) return; // nothing to remove
+    const id = this.buffer.ring.get(this.buffer.first)?.id;
+    _sb_assert(id, "Message not found in buffer (Internal Error) [L301]");
+    this.buffer.ring.delete(this.buffer.first);
+    const m = this.buffer.messages.get(id!);
+    _sb_assert(m, "Message not found in buffer (Internal Error) [L304]");
+    this.buffer.totalSize -= m!.byteLength;
+    this.buffer.messages.delete(id!);
+    this.buffer.first = (this.buffer.first + 1) % TTL0_MAX_MESSAGES;
+  }
+
+  // note: when we add a message, we do not need to trim for SIZE until AFTER it's been added
+  addMessage(id: string, m: ArrayBuffer) {
+    _sb_assert(!this.buffer.messages.has(id), "Message already in buffer (Internal Error) [L312]");
+    if (DBG0) console.log("... adding message to buffer:", id)
+    this.deleteExpired(); // just keeping things tight
+    this.buffer.totalSize += m.byteLength;
+    this.buffer.ring.set(this.buffer.last, { x: Date.now() + TTL0_EXPIRATION, id: id });
+    this.buffer.messages.set(id, m);
+    this.buffer.last = (this.buffer.last + 1) % TTL0_MAX_MESSAGES;
+    if (this.buffer.last === this.buffer.first)
+      // if we're hitting our tail, we delete the tail; 'last' must point to a free spot
+      this.removeFirst();
+    while (this.buffer.totalSize > TTL0_MAX_SPACE) {
+      // if necessary, guaranteed to be successful
+      this.removeFirst();
+    }
+  }
+    
+  // remove all messages that have expire
+  deleteExpired() {
+    const now = Date.now();
+    while (this.buffer.ring.get(this.buffer.first)?.x! < now) {
+      if (DBG0) console.log("... deleting expired message from buffer")
+      this.removeFirst();
+    }
+  }
+
+  get messages() {
+    this.deleteExpired();
+    return this.buffer.messages;
+  }
+
+  // getMessages(prefix?: string) {
+  //   this.deleteExpired();
+  //   if (!prefix) return this.buffer.messages;
+  //   // otherwise we filter by matching beginning of id
+  //   const filtered = new Map<string, ArrayBuffer>(
+  //     [...this.buffer.messages].filter(([id]) => id.startsWith(prefix))
+  //   );
+  //   return filtered;
+  // }
+
+  // returns any message keys in the buffer that matches prefix
+  getMessageKeys(prefix?: string): Set<string> {
+    this.deleteExpired();
+    if (!prefix)
+      // return this.buffer.messages.keys();
+      return new Set<string>(this.buffer.messages.keys());
+    // otherwise we filter by matching beginning of id
+    const filtered = new Set<string>(
+      [...this.buffer.messages.keys()].filter(id => id.startsWith(prefix))
+    );
+    return filtered;
+  }
+
+  // returns (as a Map) any ttl0 messages if they match the keys
+  getMessages(requestedKeys: Array<string>) {
+    this.deleteExpired();
+    const filtered = new Map<string, ArrayBuffer>();
+    for (const key of requestedKeys) {
+      const m = this.buffer.messages.get(key);
+      if (m) filtered.set(key, m);
+    }
+    return filtered;
+  }
+
+  // call the callback function for all messages that have a key that is greater
+  // than the given value; the callback function should return 'true' to stop the
+  // iteration, and 'false' to continue. The callback function is called with
+  // the message key and the message itself. Note that the iteration is in 'ring'
+  // order (modulo the buffer size etc).
+  iterate(callback: (key: string, message: ArrayBuffer) => boolean, start: string) {
+    this.deleteExpired();
+    let tail = this.buffer.first;
+    while (tail !== this.buffer.last) {
+      const id = this.buffer.ring.get(tail)?.id;
+      _sb_assert(id, "Message not found in buffer (Internal Error) [L404]");
+      const m = this.buffer.messages.get(id!);
+      _sb_assert(m, "Message not found in buffer (Internal Error) [L406]");
+      if (id! > start && callback(id!, m!)) return;
+      tail = (tail + 1) % TTL0_MAX_MESSAGES;
+    }
+  }
+
+  get getBuffer() {
+    this.deleteExpired();
+    return this.buffer;
+  }
+}
+
+
+
+
 /**
  *
  * ChannelServer Durable Object Class
@@ -270,7 +434,7 @@ export class ChannelServer implements DurableObject {
   /* ----- these are updated dynamically      ----- */
   /* 'storageLimit'        */ storageLimit: number = 0;        // current storage budget
   /* 'capacity'            */ capacity: number = 20;           // max number of (accepted) visitors
-  /* 'latestTimestamp'     */ latestTimestamp: number = 0;       // monotonically increasing timestamp
+  /* 'latestTimestamp'     */ latestTimestamp: number = 0;     // monotonically increasing timestamp
   /* ----- these track access permissions      ----- */
   /* 'locked'              */ locked: boolean = false;
   /* 'visitors'            */ visitors: Map<SBUserId, SBUserPublicKey> = new Map();
@@ -283,11 +447,16 @@ export class ChannelServer implements DurableObject {
 
   /* the rest are for run time and are not backed up as such to KVs  */
   visitorKeys: Map<SBUserId, SB384> = new Map();    // convenience caching of SB384 objects for any visitors
-  sessions: Map<SBUserId, SessionType> = new Map(); // track open (websocket) sessions, keyed by userId
+  sessions: Map<SBUserId, SessionInfo> = new Map(); // track open (websocket) sessions, keyed by userId
   storage: DurableObjectStorage; // this is the DO storage, not the global KV storage
   visitorCalls: ApiCallMap; // API endpoints visitors are allowed to use
   ownerCalls: ApiCallMap;   // API endpoints that require ownership
+
+  ttl0Buffer: TTL0BufferClass = new TTL0BufferClass(); // in-memory buffer for TTL0 messages
+
   webNotificationServer: string;
+
+  hibernationPromise: Promise<void> | null = null; // used to track hibernation (if present, we're recovering from it)
 
   // ToDo: this caching was essentially working; disabling for now to focus on
   // feature completeness and correctness of new 'stream' design. It makes sense
@@ -323,15 +492,11 @@ export class ChannelServer implements DurableObject {
 
   // ToDo: evaluate if and where we might need 'blockConcurrencyWhile()'
   constructor(public state: DurableObjectState, public env: EnvType) {
-    // load from wrangler.toml (don't override here or in env.ts)
-    dbg.DEBUG = env.DEBUG_ON === true;
-    dbg.DEBUG2 = env.VERBOSE_ON === true;
-    dbg.LOG_ERRORS = env.LOG_ERRORS === true;
-    if (dbg.DEBUG) dbg.LOG_ERRORS = true;
+    setServerDebugLevel(env)
+
     if (dbg.DEBUG) console.log("++++ channel server code loaded ++++ dbg.DEBUG is enabled ++++")
+    else console.log("++++ channel server code loaded (NO DEBUG) ++++")
     if (dbg.DEBUG2) console.log("++++ dbg.DEBUG2 (verbose) enabled ++++")
-    // if we're on verbose mode, then we poke jslib to be on basic dbg.DEBUG mode
-    if (dbg.DEBUG2) setDebugLevel(dbg.DEBUG)
 
     // durObj storage has a different API than global KV, see:
     // https://developers.cloudflare.com/workers/runtime-apis/durable-objects/#transactional-storage-api
@@ -372,11 +537,57 @@ export class ChannelServer implements DurableObject {
     console.log("++++ setting autoresponse to timestamp ++++")
     this.state.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', Channel.timestampToBase4String(this.latestTimestamp)))
 
+    console.log("++++ CURRENT WEBSOCKETS  ++++")
+    const wsList = this.state.getWebSockets()
+    if (wsList.length > 0) {
+      this.hibernationPromise = new Promise<void>(async (resolve, _reject) => {
+        // ToDo: refactor, '#setUpNewSession' code overlap
+        // we've returned from hibernation ... first we need to initialize
+        if (DBG0) console.log(SEP, "[RETURNING FROM HIBERNATION] Beginning recovery ... ", SEP)
+        const channelData = jsonParseWrapper(await (this.storage.get('channelData') as Promise<string>), 'L512') as SBChannelData
+        await this.#initialize(channelData)
+        if (DBG0) console.log(SEP, "[RETURNING FROM HIBERNATION] MAIN CHANNEL object should be initialized now ...", SEP)
+        for (const ws of wsList) {
+          let wsInfo = ws.deserializeAttachment() as SessionInfo
+          if (DBG0) console.log('state:', ws.readyState, ', url:', ws.url, ', info:', wsInfo)
+          // reconstruct things that weren't serialized
+          const userKeys = this.visitorKeys.get(wsInfo.userId)!
+          _sb_assert(userKeys, "Internal Error [L535]")
+          wsInfo = {
+            ...wsInfo,
+            userKeys: userKeys,
+            webSocket: ws,
+            ready: true,
+            quit: false,
+            // receivedUserInfo: false
+          }
+          this.sessions.set(wsInfo.userId, wsInfo)
+          // this.sessions.set(wsInfo.userId, {
+          //   userId: wsInfo.userId,
+          //   userKeys: userKeys,
+          //   channelId: wsInfo.channelId,
+          //   isOwner: wsInfo.isOwner,
+          //   webSocket: ws,
+          //   ready: true,
+          //   quit: false,
+          //   // receivedUserInfo: false
+          // })
+        }
+        if (DBG0) console.log(SEP, "[RETURNING FROM HIBERNATION] done with post-hibernation work", SEP)
+        if (DBG0) console.log(this.sessions)
+        resolve(void 0)
+      });
+      console.log(SEP, "[RETURNING FROM HIBERNATION] 'blockConcurrencyWhile' now awaiting setup finishing", SEP)
+      this.state.blockConcurrencyWhile(() => this.hibernationPromise!)
+    }
+    console.log("++++ ++++ ++++ ++++ ++++ ++++")
+
     console.log("++++ ChannelServer constructor done ++++")
   }
 
-  // called after a DO channel is initialized, if DEBUG is on. kitchen sink for
-  // a variety of tests, debug operations, measurements, and so on
+  // called after a DO channel is initialized. kitchen sink for a variety of
+  // tests, debug operations, measurements, and so on. currently it's always
+  // called, though what it does and/or prints out will depend on DEBUG level.
   async #startupDebugOrTest() {
     _sb_assert(this.channelId, "ERROR: channelId is not set (fatal)")
     if (dbg.DEBUG2) console.log(SEP, 'Full DO info\n', this, '\n', SEP)
@@ -445,27 +656,45 @@ export class ChannelServer implements DurableObject {
     console.log(SEPx)
 
     // extract the timestamp from 'lowest' and 'highest' keys
-    let { timestamp } = Channel.deComposeMessageKey(lowest)
-    const lowDate = Channel.base4StringToDate(timestamp);
-    ({ timestamp } = Channel.deComposeMessageKey(highest));
-    const highDate = Channel.base4StringToDate(timestamp);
+    const { timestamp: lowTimestamp } = Channel.deComposeMessageKey(lowest)
+    const lowDate = Channel.base4StringToDate(lowTimestamp);
+    const { timestamp: highTimestamp } = Channel.deComposeMessageKey(highest);
+    const highDate = Channel.base4StringToDate(highTimestamp);
 
-    console.log(SEPx)
-    console.log(SEPx)
-    console.log("Summary information about DO KV entries (all): ")
-    console.log("           Map size: ", _currentMessageKeys.size)
-    console.log("    Counted entries: ", i)
-    console.log("   (metadata-sized): ", metaDataSized)
-    console.log("         Lowest key: ", lowest)
-    console.log("         (low date): ", lowDate)
-    console.log("        Highest key: ", highest)
-    console.log("        (high date): ", highDate)
-    console.log(" Total size of data: ", totalSize)
-    if (foundErrors) console.log(SEPxStar)
-    console.log("       Found errors: ", foundErrors)
-    if (foundErrors) console.log(SEPxStar)
-    console.log(SEPx, SEP)
+    if (dbg.DEBUG) {
+      console.log("\n")
+      console.log(SEPx)
+      console.log(SEPx)
+      console.log("Summary information about DO KV entries (all): ")
+      console.log("          ChannelID: ", this.channelId)
+      console.log("           Map size: ", _currentMessageKeys.size)
+      console.log("    Counted entries: ", i)
+      console.log("   (metadata-sized): ", metaDataSized)
+      console.log("         Lowest key: ", lowest)
+      console.log("         (low date): ", lowDate)
+      console.log("        Highest key: ", highest)
+      console.log("        (high date): ", highDate)
+      console.log(" Total size of data: ", totalSize)
+      console.log("       storage left: ", this.storageLimit)
+      if (foundErrors) console.log(SEPxStar)
+      console.log("       Found errors: ", foundErrors)
+      if (foundErrors) console.log(SEPxStar)
+      console.log(SEPx)
+      console.log("ChannelData:")
+      console.log(JSON.stringify(this.channelData, null, 2))
+      console.log(SEPx, SEP)
+    } else if (foundErrors && dbg.LOG_ERRORS) {
+      console.error("ERROR: found errors in DO KV entries in channel " + this.channelId)
+    }
 
+    this.latestTimestamp = Channel.base4StringToTimestamp(highTimestamp)
+    console.log(
+      "\n", SEP,
+      "ChannelServer startup, latest timestamp:\n",
+      "  number format: ", this.latestTimestamp, "\n",
+      "   base4 format: ", highTimestamp, "\n",
+      "    date format: ", highDate, "\n",
+      SEPx, "\n");
   }
 
   // load channel from storage: either it's been descheduled, or it's a new
@@ -477,8 +706,21 @@ export class ChannelServer implements DurableObject {
       if (dbg.DEBUG) console.log("\n", channelData, "\n", SEP)
 
       const channelState = await this.storage.get(
-        ['channelId', 'channelData', 'motherChannel', 'storageLimit', 'capacity', 'latestTimestamp', 'visitors',
-          'locked', 'messageCount', 'allMessageCount', 'newMessageCount', 'messageHistory']
+        [
+          'channelId',
+          'channelData',
+          'motherChannel',
+          'storageLimit',
+          'capacity',
+          'latestTimestamp',
+          'visitors',
+          'locked',
+          'messageCount',
+          'allMessageCount',
+          'newMessageCount',
+          'messageHistory',
+          // 'ttl0Buffer',
+        ]
       )
       const storedChannelData = jsonParseWrapper(channelState.get('channelData') as string, 'L234') as SBChannelData
 
@@ -498,29 +740,43 @@ export class ChannelServer implements DurableObject {
       this.locked = (channelState.get('locked')) === 'true' ? true : false;
 
       // we do these LAST since it signals that we've fully initialized the channel
-      this.channelId = channelData.channelId;
+      this.channelId = channelData.channelId
       this.channelData = channelData
 
       this.messageCount = Number(channelState.get('messageCount')) || 0
       this.allMessageCount = Number(channelState.get('allMessageCount')) || 0
 
-      this.visitors = extractPayload(channelState.get('visitors') as ArrayBuffer).payload as Map<SBUserId, SBUserPublicKey>
+      const latestVisitors = channelState.get('visitors')
+      if (latestVisitors && latestVisitors instanceof ArrayBuffer) {
+        this.visitors = extractPayload(latestVisitors as ArrayBuffer).payload as Map<SBUserId, SBUserPublicKey>
+        // now we bootstrap the visitorKeys cache
+        for (const [userId, userPublicKey] of this.visitors)
+          this.visitorKeys.set(userId, await (new SB384(userPublicKey).ready))      
+      } else {
+        this.visitors = new Map()
+        this.visitorKeys = new Map()
+      }
       if (dbg.DEBUG) console.log("Fetched visitors for channel: ", this.visitors)
-      // now we bootstrap the visitorKeys cache
-      for (const [userId, userPublicKey] of this.visitors)
-        this.visitorKeys.set(userId, await (new SB384(userPublicKey).ready))
 
       this.newMessageCount = Number(channelState.get('newMessageCount')) || 0
-      this.messageHistory = extractPayload(channelState.get('messageHistory') as ArrayBuffer).payload as MessageHistoryDirectory
+      const oldMessageHistory = channelState.get('messageHistory')
+      if (oldMessageHistory) {
+        this.messageHistory = extractPayload(oldMessageHistory as ArrayBuffer).payload as MessageHistoryDirectory
+      } else {
+        this.messageHistory = null
+      }
+
+      // const oldTTL0Buffer = channelState.get('ttl0Buffer')
+      // if (oldTTL0Buffer)
+      //   this.ttl0Buffer = new TTL0BufferClass(extractPayload(oldTTL0Buffer as ArrayBuffer).payload as TTL0Buffer)
 
       // this.refreshCache() // see below
 
-      if (dbg.DEBUG) console.log("++++ Done initializing channel:\n", this.channelId, '\n', this.channelData)
-      if (dbg.DEBUG) await this.#startupDebugOrTest()
+      await this.#startupDebugOrTest()
 
     } catch (error: any) {
       const msg = `ERROR failed to initialize channel [L250]: ${error.message}`
-      if (dbg.DEBUG) console.error(msg)
+      if (dbg.LOG_ERRORS) console.error(msg)
       throw new Error(msg)
     }
   }
@@ -587,7 +843,7 @@ export class ChannelServer implements DurableObject {
         const channelData = jsonParseWrapper(await (this.storage.get('channelData') as Promise<string>), 'L495') as SBChannelData
         if (!channelData || !channelData.channelId) {
           // no channel, no object, no upload, no dice
-          if (dbg.LOG_ERRORS) console.error('Not initialized, but channelData is not in KV (?). Here is what we know:\n', channelId, '\n', channelData, '\n', SEP, '\n', this.#describe(), '\n', SEP)
+          if (dbg.LOG_ERRORS) console.warn(`Channel not initialized, and no channelData in KV, eg does not exist ('${channelId}')`)
           return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
         }
         // channel exists but object needs reloading
@@ -598,7 +854,10 @@ export class ChannelServer implements DurableObject {
         // bootstrap from storage
         await this
           .#initialize(channelData) // it will throw an error if there's an issue
-          .catch(() => { return returnError(request, `Internal Error (L332)`); });
+          .catch((e) => {
+            if (dbg.LOG_ERRORS) console.error("ERROR: failed to initialize channel (L332)", e)
+            return returnError(request, `Internal Error (L332)`);
+          });
       }
 
       if (dbg.DEBUG) console.log("444444 ==== ChannelServer.fetch() ==== phase FOUR ==== 444444")
@@ -726,14 +985,18 @@ export class ChannelServer implements DurableObject {
     this.state.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', Channel.timestampToBase4String(this.latestTimestamp)))
 
     // if we are over our preferred limit, we initiate shardification
-    if (this.newMessageCount >= serverConstants.MAX_MESSAGE_SET_SIZE) {
+    if (MESSAGE_HISTORY && this.newMessageCount >= serverConstants.MAX_MESSAGE_SET_SIZE) {
       if (dbg.DEBUG) console.log(`---- initiating shardification .. we have ${this.messageCount} messages`)
       const newHistory = await this.messageCacheToHistoryEntry(this.env)
       // ToDo: add support for depth greater than '0', eg directories of directories etc
       _sb_assert(newHistory && newHistory.depth === 0 && this.messageHistory && this.messageHistory.depth === 0, "Internal Error (L729)")
       if (this.messageHistory) {
         // we have history already, so, we merge the directories
-        this.messageHistory.entries.set(newHistory.from, newHistory.entries.get(newHistory.from)!)
+        // ToDo: test this some more
+        if (newHistory.shards) {
+          if (!this.messageHistory.shards) this.messageHistory.shards = new Map()
+          this.messageHistory.shards.set(newHistory.from, newHistory.shards.get(newHistory.from)!)
+        }
         this.messageHistory.to = newHistory.to
         this.messageHistory.count += newHistory.count
         this.messageHistory.lastModified = newHistory.lastModified
@@ -752,157 +1015,197 @@ export class ChannelServer implements DurableObject {
 
   // all messages come through here. they're either through api call or websocket.
   // any issues will throw.
-  async #processMessage(msg: any, apiBody: ChannelApiBody): Promise<void> {
+  async #processMessage(msg: any, userId: SBUserId, isOwner: boolean /*, apiBody: ChannelApiBody */): Promise<void> {
 
-    // var message: ChannelMessage = {}
-    // if (typeof msg === "string") {
-    //   message = jsonParseWrapper(msg.toString(), 'L594');
-    // } else if (msg instanceof ArrayBuffer) {
-    //   message = extractPayload(extractPayload(msg).payload).payload // TODO: hack
-    // } else {
-    //   throw new Error("Cannot parse contents type (not json nor arraybuffer)")
-    // }
+    try {
+      // var message: ChannelMessage = {}
+      // if (typeof msg === "string") {
+      //   message = jsonParseWrapper(msg.toString(), 'L594');
+      // } else if (msg instanceof ArrayBuffer) {
+      //   message = extractPayload(extractPayload(msg).payload).payload // TODO: hack
+      // } else {
+      //   throw new Error("Cannot parse contents type (not json nor arraybuffer)")
+      // }
 
-    if (dbg.DEBUG2) console.log(
-      "------------ getting message from client (pre validation) ------------",
-      "\n", msg, "\n",
-      "-------------------------------------------------")
+      if (dbg.DEBUG2) console.log(
+        "------------ getting message from client (pre validation) ------------",
+        "\n", msg, "\n",
+        // "-------------------------------------------------",
+        // "\n", "apiBody:\n", apiBody, "\n",
+        )
 
-    if (msg.ready) {
-      // the client sends a "ready" message when it can start receiving; reception means websocket is all set up
-      if (dbg.DEBUG2) console.log("got 'ready' message from client")
-      const session = this.sessions.get(apiBody.userId)
-      if (!session) {
-        // if client sends a ready api call, or the socket has closed, we ignore
-        if (dbg.DEBUG) console.warn("[processMessage]: session not found for 'ready' message, discarding")
-        return;
+      if (msg.ready) {
+        // the client sends a "ready" message when it can start receiving; reception means websocket is all set up
+        if (DBG0 || dbg.DEBUG2) console.log("got 'ready' message from client, UserId:", /* apiBody. */ userId)
+        const session = this.sessions.get(/* apiBody. */ userId)
+        if (!session) {
+          // if client sends a ready api call, or the socket has closed, we ignore
+          if (dbg.DEBUG) console.warn("[processMessage]: session not found for 'ready' message, discarding")
+          if (dbg.DEBUG) console.log(SEP, "Current sessions:\n", this.sessions, SEP)
+          return;
+        }
+        // if there's a session, we mark it as ready and mirror the ready message
+        session.ready = true;
+        if (dbg.DEBUG2) console.log("sending 'ready' response to client")
+        session!.webSocket.send(this.readyMessage());
+        
+        return; // all good
       }
-      // if there's a session, we mark it as ready and mirror the ready message
-      session.ready = true;
-      if (dbg.DEBUG2) console.log("sending 'ready' response to client")
-      session!.webSocket.send(this.readyMessage());
-      return; // all good
-    }
 
-    if (msg.close && msg.close === true) {
-      if (dbg.DEBUG2) console.log("client is shutting down connection")
-      const session = this.sessions.get(apiBody.userId)
-      if (!session) {
-        if (dbg.DEBUG) console.warn("[processMessage]: session not found for 'close' message, ignoring")
-        return;
+      if (msg.reset) {
+        // client sends 'reset' if it's notices that i might have missed TTL0 messages
+        const session = this.sessions.get(/* apiBody. */ userId)
+        if (session) {
+          // if we have entries in the TTL0 buffer, we send them now
+          const ttl0Messages = this.ttl0Buffer.messages;
+          if (ttl0Messages.size > 0) {
+            const keysToSend = Array.from(ttl0Messages.keys()).sort()
+            if (DBG0) console.log("ttl0Messages:", ttl0Messages, "keysToSend:", keysToSend)
+            keysToSend.forEach((key) => {
+              if (DBG0) console.log("Looking up key:", key)
+              const msg = ttl0Messages.get(key)
+              if (!msg) throw new Error("Internal Error (L952), cannot find key: " + key)
+              if (DBG0) console.log(SEP, "sending TTL0 messages to client", SEP, extractPayload(msg).payload, SEP)
+              session.webSocket.send(msg);
+            });
+          }
+        }
       }
-      session.quit = true;
-      session.webSocket.close(1011, "Client requested 'close'.");
-      this.sessions.delete(apiBody.userId);
-      return; // all good
-    }
 
-    const message: ChannelMessage = validate_ChannelMessage(msg) // will throw if anything wrong
 
-    // at this point we have a validated, verified, and parsed message
-    // a few minor things to check before proceeding
+      if (msg.close && msg.close === true) {
+        if (DBG0 || dbg.DEBUG2) console.log("client is shutting down connection")
+        const session = this.sessions.get(/* apiBody. */ userId)
+        if (!session) {
+          if (dbg.LOG_ERRORS) console.warn("[processMessage]: session not found for 'close' message, ignoring")
+          return;
+        }
+        session.quit = true;
+        session.webSocket.close(1011, "Client requested 'close'.");
+        this.sessions.delete(/* apiBody. */ userId);
+        return; // all good
+      }
 
-    if (typeof message.c === 'string') {
-      const msg = "[processMessage]: Contents ('c') sent as string. Discarding message."
-      if (dbg.DEBUG) console.error(msg)
-      throw new Error(msg);
-    }
+      const message: ChannelMessage = validate_ChannelMessage(msg) // will throw if anything wrong
+      // if (DBG0) console.log("Message after validation:", message)
 
-    if (message.i2 && !apiBody.isOwner) {
-      if (dbg.DEBUG) console.error("ERROR: non-owner message setting subchannel")
-      throw new Error("Only Owner can set subchannel. Discarding message.");
-    } else if (!message.i2) {
-      message.i2 = '____' // default; use to keep track of where we're at in processing
-    }
+      // at this point we have a validated, verified, and parsed message
+      // a few minor things to check before proceeding
 
-    const tsNum = Math.max(Date.now(), this.latestTimestamp + 1);
-    message.sts = tsNum; // server timestamp
-    this.latestTimestamp = tsNum;
-    await this.storage.put('latestTimestamp', tsNum)
+      if (typeof message.c === 'string') {
+        const msg = "[processMessage]: Contents ('c') sent as string. Discarding message."
+        if (dbg.DEBUG) console.error(msg)
+        throw new Error(msg);
+      }
 
-    // appending timestamp to channel id. this is global, unique message identifier
-    // const key = this.channelId + '_' + message.i2 + '_' + ts;
-    const key = Channel.composeMessageKey(this.channelId!, tsNum, message.i2)
+      if (message.i2 && !/* apiBody.*/ isOwner) {
+        if (dbg.DEBUG) console.error("ERROR: non-owner message setting subchannel")
+        throw new Error("Only Owner can set subchannel. Discarding message.");
+      } else if (!message.i2) {
+        message.i2 = '____' // default; use to keep track of where we're at in processing
+      }
 
-    // TODO: sync TTL with 'i2'
-    var i2Key: string | null = null
+      const tsNum = Math.max(Date.now(), this.latestTimestamp + 1);
+      message.sts = tsNum; // server timestamp
+      this.latestTimestamp = tsNum;
+      await this.storage.put('latestTimestamp', tsNum)
 
-    if (message.ttl && message.ttl > 0 && message.ttl < 0xF) {
-      // these are the cases where messages are also stored under a TTL subchannel
-      if (message.i2[3] === '_') {
-        // if there's a TTL, you can't have a subchannel using last character, this is an error
-        if (dbg.DEBUG) console.error("ERROR: subchannel cannot be used with TTL")
-        throw new Error("Subchannel cannot be used with TTL. Discarding message.")
+      // appending timestamp to channel id. this is global, unique message identifier
+      // const key = this.channelId + '_' + message.i2 + '_' + ts;
+      const key = Channel.composeMessageKey(this.channelId!, tsNum, message.i2)
+
+      // TODO: sync TTL with 'i2'
+      var i2Key: string | null = null
+
+      if (message.ttl && message.ttl > 0 && message.ttl < 0xF) {
+        // these are the cases where messages are also stored under a TTL subchannel
+        if (message.i2[3] === '_') {
+          // if there's a TTL, you can't have a subchannel using last character, this is an error
+          if (dbg.DEBUG) console.error("ERROR: subchannel cannot be used with TTL")
+          throw new Error("Subchannel cannot be used with TTL. Discarding message.")
+        } else {
+          // ttl is a digit 3-8, we append that to the i2 centerpiece (eg encoded in subchannel)
+          // i2Key = this.channelId + '_' + message.i2.slice(0, 3) + message.ttl + '_' + ts;
+          i2Key = Channel.composeMessageKey(this.channelId!, tsNum, message.i2.slice(0, 3) + message.ttl)
+        }
+      }
+
+      // messages with destinations must be short-lived
+      if (!message.ttl || message.ttl > 0x8) { // max currently defined message age, 10 days
+        if (message.t)
+          throw new Error("ERROR: any 'to' (routed) message must have a short TTL")
+      }
+
+      // strip (minimize) it and, package it, result chunk is stand-alone except
+      // for channelId; calling in 'serverMode' (true) to enforce server-side
+      const messagePayload = assemblePayload(stripChannelMessage(message, true))!
+
+      // final, final, we enforce storage limit
+      const messagePayloadSize = messagePayload.byteLength
+      if (messagePayloadSize > serverConstants.MAX_SB_BODY_SIZE) {
+        if (dbg.DEBUG) console.error(`ERROR: message too large (${messagePayloadSize} bytes)`)
+        throw new Error("Message too large. Discarding message.");
+      }
+
+      if (dbg.DEBUG) {
+        const payloadAsMetaData = arrayBufferToBase62(messagePayload)
+        if (payloadAsMetaData.length <= 1000) { // some margin
+          console.log(SEPx)
+          // we're tracking this as 'fyi' for near future optimization
+          console.log(`[info] this message could be stored as metadata (size would be ${messagePayloadSize} chars)`)
+          console.log(payloadAsMetaData.slice(0, 200) + "..." + payloadAsMetaData.slice(-50))
+          console.log(SEPx)
+        }
+      }
+
+      // consume storage budget; 'TTL0' handling
+      const multiplier = message.ttl === 0 ? CHANNEL_STORAGE_MULTIPLIER_TEMP : CHANNEL_STORAGE_MULTIPLIER_PERMA
+      const spaceNeeded = messagePayloadSize * multiplier
+      // if (spaceNeeded > this.storageLimit) {
+      //   if (dbg.LOG_ERRORS) console.error(`ERROR: storage limit (${this.storageLimit}) exceeded, need ${spaceNeeded} bytes.`)
+      //   throw new Error(`Storage limit exceeded. Message cannot be stored or broadcast. Discarding message. Storage amount needed: ${spaceNeeded} bytes.`);
+      // }
+      // this.storageLimit -= (messagePayloadSize * multiplier);
+      // await this.storage.put('storageLimit', this.storageLimit)
+
+      await this.#consumeStorage(spaceNeeded, false); // don't need results
+
+      // todo: add per-user budget limits; also adjust down cost for TTL, especially '0'
+
+      // if (DBG0) console.log("Message so far:", message)
+      if (message.ttl !== 0) {
+        await this.storage.put(key, messagePayload); // local storage
+        await this.env.MESSAGES_NAMESPACE.put(key, messagePayload); // global storage
+        if (i2Key) {
+          // we don't block on these (messages with TTLs have slightly lower SLA)
+          this.storage.put(i2Key, messagePayload);
+          this.env.MESSAGES_NAMESPACE.put(i2Key, messagePayload);
+        } else {
+          // // and currently it's only non-subchannel messages that we cache
+          // this.#appendMessageKeyToCache(key);
+        }
       } else {
-        // ttl is a digit 3-8, we append that to the i2 centerpiece (eg encoded in subchannel)
-        // i2Key = this.channelId + '_' + message.i2.slice(0, 3) + message.ttl + '_' + ts;
-        i2Key = Channel.composeMessageKey(this.channelId!, tsNum, message.i2.slice(0, 3) + message.ttl)
+        // 'TTL0' are essentially ephemeral, how we want to buffer them for a
+        // bit for various reasons, notably that in interacting with hibernateable
+        // websockets they can otherwise be lost
+
+        // await this.env.MESSAGES_NAMESPACE.put(key, messagePayload, {expirationTtl: 30});
+        // console.log(SEP, "TTL0 message, buffering", SEP)
+        this.ttl0Buffer.addMessage(key, messagePayload)
+
+        // // and back it up
+        // await this.storage.put('ttl0Buffer', assemblePayload(this.ttl0Buffer.getBuffer))
       }
+
+      // everything looks good. we broadcast to all connected clients (if any)
+      await this.#broadcast(messagePayload)
+
+      // after broadcast, we update the message count
+      await this.#incrementMessageCount(!message.ttl || message.ttl === 0xF)
+    } catch (error: any) {
+      if (dbg.LOG_ERRORS) console.error("ERROR: failed to process message", error)
+      throw new SBError("Failed to process message: " + error.message)
     }
-
-    // messages with destinations must be short-lived
-    if (!message.ttl || message.ttl > 0x8) { // max currently defined message age, 10 days
-      if (message.t)
-        throw new Error("ERROR: any 'to' (routed) message must have a short TTL")
-    }
-
-    // strip (minimize) it and, package it, result chunk is stand-alone except
-    // for channelId; calling in 'serverMode' (true) to enforce server-side
-    const messagePayload = assemblePayload(stripChannelMessage(message, true))!
-
-    // final, final, we enforce storage limit
-    const messagePayloadSize = messagePayload.byteLength
-    if (messagePayloadSize > serverConstants.MAX_SB_BODY_SIZE) {
-      if (dbg.DEBUG) console.error(`ERROR: message too large (${messagePayloadSize} bytes)`)
-      throw new Error("Message too large. Discarding message.");
-    }
-
-    if (dbg.DEBUG) {
-      const payloadAsMetaData = arrayBufferToBase62(messagePayload)
-      if (payloadAsMetaData.length <= 1000) { // some margin
-        console.log(SEPx)
-        console.log(`[info] this message could be stored as metadata (size would be ${messagePayloadSize} chars)`)
-        console.log(payloadAsMetaData.slice(0, 200) + "..." + payloadAsMetaData.slice(-50))
-        console.log(SEPx)
-      }
-    }
-
-    // consume storage budget
-    const multiplier = message.ttl === 0 ? CHANNEL_STORAGE_MULTIPLIER_PERMA : CHANNEL_STORAGE_MULTIPLIER_TEMP
-    if ((messagePayloadSize * multiplier) > this.storageLimit)
-      throw new Error("Storage limit exceeded. Message cannot be stored or broadcast. Discarding message.");
-    this.storageLimit -= (messagePayloadSize * multiplier);
-    await this.storage.put('storageLimit', this.storageLimit)
-
-    // todo: add per-user budget limits; also adjust down cost for TTL, especially '0'
-
-    if (message.ttl !== 0) {
-      await this.storage.put(key, messagePayload); // local storage
-      await this.env.MESSAGES_NAMESPACE.put(key, messagePayload); // global storage
-      if (i2Key) {
-        // we don't block on these (messages with TTLs have slightly lower SLA)
-        this.storage.put(i2Key, messagePayload);
-        this.env.MESSAGES_NAMESPACE.put(i2Key, messagePayload);
-      } else {
-        // // and currently it's only non-subchannel messages that we cache
-        // this.#appendMessageKeyToCache(key);
-      }
-    } else {
-      // TTL zero are essentially ephemeral, how we want to buffer them for a
-      // bit for various reasons, notably that in interacting with hibernateable
-      // websockets they can otherwise be lost
-      // TODO: if we add ephemeral to local storage, we need to use eg alarms to clean up
-      await this.env.MESSAGES_NAMESPACE.put(key, messagePayload, {expirationTtl: 30});
-    }
-
-    // everything looks good. we broadcast to all connected clients (if any)
-    this.#broadcast(messagePayload)
-      .catch((error: any) => {
-        throw new Error(`ERROR: failed to broadcast message: ${error.message}`)
-      });
-
-    // after broadcast, we update the message count
-    await this.#incrementMessageCount(!message.ttl || message.ttl === 0xF)
 
   }
 
@@ -917,7 +1220,7 @@ export class ChannelServer implements DurableObject {
       console.log(apiBody)
     }
     try {
-      await this.#processMessage(apiBody.apiPayload!, apiBody)
+      await this.#processMessage(apiBody.apiPayload!, apiBody.userId, apiBody.isOwner! /*, apiBody */)
       return returnSuccess(request)
     } catch (error: any) {
       return returnError(request, error.message, 400);
@@ -1006,61 +1309,57 @@ export class ChannelServer implements DurableObject {
     }
   }
 
+  // this is called directly from the Durable Object for a new message
   async webSocketMessage(ws: WebSocket, msg: string | ArrayBuffer) {
-    if (dbg.DEBUG) console.log("==== ChannelServer.webSocketMessage() called ====")
-    if (dbg.DEBUG) console.log(msg)
-
-    // webSocket.addEventListener("message", async msg => {
-    const userId = this.state.getTags(ws)[0]!;
-    const session = this.sessions.get(userId)
-
-    if (!session || session.quit) {
-      ws.close(1011, "WebSocket broken (got a quit).");
-      if (session) this.sessions.delete(userId);
-      return;
-    }
-
+    _sb_assert(msg, "[ChannelServer.webSocketMessage] ERROR: no message received (fatal)")
+    if (dbg.DEBUG2) console.log("==== ChannelServer.webSocketMessage() called ====\n", msg)
     try {
-      if (typeof msg === "string") {
-        if (msg === undefined) {
-          if (dbg.DEBUG) console.log("Got 'undefined' message from client, discarding")
-          ws.send(JSON.stringify({ error: "Received 'undefined' as message, discarding" }));
-          return;
-        } else if (msg === 'ping') {
-          // mimic ping/pong semantics of hibernatable websockets (todo: is this is ever needed?)
-          if (dbg.DEBUG) console.log("Sending ping response to client")
-          ws.send(Channel.timestampToBase4String(this.latestTimestamp))
-          return;
-        } else {
-          if (dbg.DEBUG) console.log("Got string message from client, but not recognized: ", msg)
-          ws.send(JSON.stringify({ error: "Message not recognized (fatal): " + msg }));
-          return;
-        }
-      } else if (!(msg instanceof ArrayBuffer)) {
-        ws.send(JSON.stringify({ error: "Message neither string nor an ArrayBuffer (fatal)"}));
-        return;
-      }
-      // const message = extractPayload(msg.data).payload
-      const message = extractPayload(msg as ArrayBuffer).payload
-      if (!message) throw new SBError("ERROR: could not process message payload")
-      const apiBody = ws.deserializeAttachment()
-      await this.#processMessage(message, apiBody); // apiBody from original setup
-    } catch (error: any) {
-      console.error(`[channel server websocket listener] error: <<${error.message}>>`)
-      console.log(msg)
-      ws.send(JSON.stringify({ error: `ERROR: failed to process message: ${error.message}` }));
-    }
+      if (this.hibernationPromise) await this.hibernationPromise
+      const userId = this.state.getTags(ws)[0]!;
+      const session = this.sessions.get(userId)
+      if (!session) {
+        ws.close(1011, "[ChannelServer.webSocketMessage] No current session for userId: " + userId);
+        if (DBG0) console.log(SEP, "COULD NOT FIND SESSION for user:", userId, "\n", "Current sessions:", "\n", this.sessions, SEP)
+      } else if (session.quit) {
+        ws.close(1011, "[ChannelServer.webSocketMessage] The session has been closed (quit) for userId: " + userId);
+        this.sessions.delete(userId);
+      } else {
+        if (typeof msg === "string") {
+          // the channel server responds directly to any string type messages,
+          // these are 'link level' (kind of).
+          const regex = /^[0-3]{26}$/;
+          if (regex.test(msg)) {
+            // if it's a (timestamp) prefix string, then it's a request for TTL0 buffer
+            // we iterate through TTL0 buffer and send all messages with timestamp > prefix
+            this.ttl0Buffer.iterate((_key, message) => {
+              if (DBG0) console.log(SEP, "sending TTL0 messages to client", SEP, extractPayload(message).payload, SEP)
+              ws.send(message);
+              return true; // continue
+            }, msg);
 
-    // } catch (error: any) {
-    //   // Report any exceptions directly back to the client
-    //   const err_msg = '[handleSession()] ' + error.message + '\n' + error.stack + '\n';
-    //   if (dbg.DEBUG2) console.log(err_msg);
-    //   try {
-    //     webSocket.send(JSON.stringify({ error: err_msg }));
-    //   } catch {
-    //     console.error(`ERROR: was unable to propagate error to client: ${err_msg}`);
-    //   }
-    // }
+        } else switch (msg) {
+            case 'ping':
+              // 'keep alive' message from client, respond with timestamp prefix
+              if (DBG0 || dbg.DEBUG) console.log("[ChannelServer.webSocketMessage] Sending ping response to client")
+              ws.send(Channel.timestampToBase4String(this.latestTimestamp))
+              return;
+            default:
+              if (DBG0 || dbg.DEBUG) console.log("Got string message from client, but not recognized: ", msg)
+              ws.send(JSON.stringify({ error: "[ChannelServer.webSocketMessage] Message not recognized (fatal): " + msg }));
+              return;
+          }
+        } else {
+          const message = extractPayload(msg as ArrayBuffer).payload
+          if (!message)
+            ws.send(JSON.stringify({ error: "[ChannelServer.webSocketMessage] Could not process message payload" }));
+          else
+            await this.#processMessage(message, userId, session.isOwner /*, apiBody */);
+        }
+      }
+    } catch (error: any) {
+      if (dbg.LOG_ERRORS) console.error('[ChannelServer.webSocketMessage] Unknown error while processing message:\n', error.message)
+      ws.send(JSON.stringify({ error: '[ChannelServer.webSocketMessage] Unknown error while processing message' }));
+    }
   }
 
   readyMessage() {
@@ -1076,31 +1375,37 @@ export class ChannelServer implements DurableObject {
 
     // (webSocket as any).accept(); // typing override (old issue with CF types)
 
+    if (DBG0) console.log("Setting up new websocket session for user: ", apiBody.userId)
     this.state.acceptWebSocket(webSocket, [apiBody.userId])
-    webSocket.serializeAttachment(apiBody) // we attach the apiBody to the websocket
 
-    // not applicable to CF 'webSocket' object
+    // attach (serializable) subset of info to websocket
+    let sessionHibernate: SessionInfoHibernated = {
+      userId: apiBody.userId,
+      channelId: apiBody.channelId,
+      isOwner: apiBody.isOwner === true,
+    }
+    webSocket.serializeAttachment(sessionHibernate)
+
+    // not applicable to CF 'webSocket' object ?
     // webSocket.binaryType = "arraybuffer"; // otherwise default is 'blob'
 
     const userKeys = this.visitorKeys.get(apiBody.userId)!
-    _sb_assert(userKeys, "Internal Error [L585]")
+    _sb_assert(userKeys, "Internal Error [L1364]")
 
     // Create our session and add it to the sessions list.
-    const session: SessionType = {
-      userId: apiBody.userId,
+    let session: SessionInfo = {
+      ...sessionHibernate,
       userKeys: userKeys,
-      channelId: apiBody.channelId,
       webSocket: webSocket,
       ready: false,
       quit: false, // tracks cleanup, true means go away
-      receivedUserInfo: false,
     };
 
     // if same listener is already active, we close it; note we try to follow
     // https://www.rfc-editor.org/rfc/rfc6455.html#section-7.4.1
     if (this.sessions.has(apiBody.userId)) {
-      if (dbg.DEBUG) console.log("closing previous session for same user")
-      this.sessions.get(apiBody.userId)!.webSocket.close(1011, "Same user/key has opened a new session; closing this one.");
+      if (DBG0 || dbg.DEBUG) console.log("closing previous session for same user")
+      this.sessions.get(apiBody.userId)!.webSocket!.close(1011, "Same user/key has opened a new session; closing this one.");
     }
 
     // track active connections
@@ -1170,7 +1475,7 @@ export class ChannelServer implements DurableObject {
   // broadcasts a message to all clients.
   async #broadcast(messagePayload: ArrayBuffer) {
     if (this.sessions.size === 0) return; // nothing to do
-    // MTG ToDo: we don't send notifications for everything? for example locked-out messages?
+    // MTG TODO: should we send notifications for everything? for example locked-out messages?
     if (dbg.DEBUG2) console.log("calling sendWebNotifications()", messagePayload);
     await this.#sendWebNotifications(); // ping anybody subscribing to channel
     // Iterate over all the sessions sending them messages.
@@ -1179,13 +1484,14 @@ export class ChannelServer implements DurableObject {
         try {
           if (dbg.DEBUG) console.log("sending message to session (user): ", session.userId)
           session.webSocket.send(messagePayload);
+          if (dbg.DEBUG2) console.log(SEP, "sent BROADCAST message to client", SEP, extractPayload(messagePayload).payload, SEP)
         } catch (err) {
           if (dbg.DEBUG) console.log("ERROR: failed to send message to session: ", session.userId)
           session.ready = false;
           session.quit = true; // should probably close it
         }
       } else {
-        if (dbg.DEBUG) console.log(`session not ready, not forwarding message to ${session.userId}`);
+        if (dbg.DEBUG) console.warn(`session not ready, not forwarding message to ${session.userId}`);
       }
     }
     );
@@ -1236,6 +1542,11 @@ export class ChannelServer implements DurableObject {
       if (dbg.LOG_ERRORS) console.error("ERROR: message set too large")
       return returnError(request, "Message set too large (need to add pagination)", 400);
     }
+
+    // // we check for any matches in ttl0 buffer
+    // const ttl0Messages = this.ttl0Buffer.getMessageKeys(prefix)
+    // // merge the sets
+    // const allKeys = new Set([...listQuery.keys(), ...ttl0Messages])
 
     if (listQuery && listQuery.size > 0) {
       // we get a Map, but we want to return a Set using the keys
@@ -1463,6 +1774,7 @@ export class ChannelServer implements DurableObject {
    * Takes current message cache, and constructs a history entry from it.
    */
   async messageCacheToHistoryEntry(env: EnvType): Promise<MessageHistoryDirectory> {
+    _sb_assert(MESSAGE_HISTORY, "MESSAGE_HISTORY not set, fatal")
     if (!storageFetchFunction) storageFetchFunction = this.createCustomFetch(env);
     if (!storageServerBinding) storageServerBinding = env.STORAGE_SERVER_BINDING
     try {
@@ -1520,7 +1832,7 @@ export class ChannelServer implements DurableObject {
         depth: 0, // indicates all entries (in this case just the one) are shards of message maps
         type: 'directory',
         lastModified: lastModified,
-        entries: new Map<string, SBObjectHandle>().set(lowestFrom, shardHandle),
+        shards: new Map<string, SBObjectHandle>().set(lowestFrom, shardHandle),
       }
       //@ts-ignore
       delete historyDirectory.messages // hack to work around TS type limitations
@@ -1531,6 +1843,8 @@ export class ChannelServer implements DurableObject {
   }
 
   async #getHistory(request: Request, _apiBody: ChannelApiBody) {
+    _sb_assert(MESSAGE_HISTORY, "MESSAGE_HISTORY not set, fatal")
+
     // const testInfo = await this.getStorageServerInfo(this.env)
     // console.log("Got storage server info: ", testInfo)
     // return returnResult(request, { storageInfo: testInfo, greeting: 'hello from /getHistory' })
@@ -1556,15 +1870,22 @@ export class ChannelServer implements DurableObject {
       if (clientKeys.size === 0) return returnError(request, "[getMessages] No keys provided", 400)
       const regex = /^([a-zA-Z0-9]+)______([0-3]{26})$/;
       const validKeys = [];
+      
+      const ttl0bufferKeys = this.ttl0Buffer.getMessageKeys()
+      const requestedTTL0Keys = []
       for (const key of clientKeys) {
         // we confirm format of the key
         if (regex.test(key)) {
-          validKeys.push(key);
+          if (ttl0bufferKeys.has(key)) {
+            requestedTTL0Keys.push(key)
+          } else {
+            validKeys.push(key);
+          }
         } else if (dbg.DEBUG) {
           console.error("ERROR: tried to read key with invalid key format: ", key)
         }
       }
-      if (validKeys.length === 0) {
+      if (validKeys.length === 0 && requestedTTL0Keys.length === 0) {
         if (dbg.DEBUG) {
           console.log('\n', SEP, "And here are the keys that were requested", "\n", SEP)
           console.log(apiBody.apiPayload)
@@ -1575,8 +1896,10 @@ export class ChannelServer implements DurableObject {
         return returnError(request, "[getMessages] No valid keys found", 400)
       }
       const getOptions: DurableObjectGetOptions = { allowConcurrency: true };
-      const messages = await this.storage.get(validKeys, getOptions);
-      _sb_assert(messages, "Internal Error [L777]");
+      let messages: Map<string, ArrayBuffer> = new Map();
+      if (validKeys.length > 0) messages = await this.storage.get(validKeys, getOptions); // get stored messages
+      if (requestedTTL0Keys.length > 0) messages = new Map([...messages, ...this.ttl0Buffer.getMessages(requestedTTL0Keys)])
+      _sb_assert(messages, "Internal Error [L1768]");
       // if (dbg.DEBUG) console.log(SEP, "==== ChannelServer.getMessages() returning ====\n", messages, "\n", SEP)
       return returnResult(request, messages);
     } catch (error: any) {
@@ -1647,15 +1970,20 @@ export class ChannelServer implements DurableObject {
   }
 
   // will 'spend' this amount; if there are any issues, we throw, otherwise the
-  // amount actually (which can differ from the request in many ways). if
-  // 'round' is set (default), will apply rounding semantics (such as for
-  // storage). otherwise it accepts any positive integer (eg set to 'false' for
-  // API charges)
+  // amount actually spent is returned (which can differ from the request in
+  // many ways). if 'round' is set (default), will apply rounding semantics
+  // (such as for storage). otherwise it accepts any positive integer (eg set to
+  // 'false' for API charges)
   async #consumeStorage(size: number, round = true): Promise<number> {
+    if (DBG0) console.log("Consuming storage: ", size, round ? " (will round up)" : "", "current limit:", this.storageLimit, "bytes")
     if (round)
       size = this.#roundSize(size) || 0;
-    if (!size || !Number.isInteger(size) || size <= 0)
+    size = Math.ceil(size);
+    if (!size || !Number.isInteger(size) || size <= 0) {
+      console.log("Problem with size:\n", size)
+      if (DBG0 || dbg.LOG_ERRORS) console.trace(SEP, `[consumeStorage] invalid size:\n`, size, SEP)
       throw new SBError("'size' missing in API call or internally, or zero, or can't parse")
+    }
     // get the requested amount, apply various semantics on the budd operation
     if (size >= 0) {
       if ((size === Infinity) || (size > serverConstants.MAX_BUDGET_TRANSFER)) {
@@ -1673,7 +2001,9 @@ export class ChannelServer implements DurableObject {
         size = this.storageLimit - _leaveBehind;
     }
     this.storageLimit -= size; // apply reduction
+    this.storageLimit = Math.floor(this.storageLimit); // make sure it's an integer
     await this.storage.put('storageLimit', this.storageLimit); // here we've consumed it
+    if (DBG0) console.log("[#consumeSTorage] Storage amount consumed:", size, "bytes; new limit:", this.storageLimit, "bytes") 
     return size // return what was actually consumed
   }
 
