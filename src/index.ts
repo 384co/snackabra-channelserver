@@ -328,7 +328,7 @@ export class TTL0BufferClass {
   // note: when we add a message, we do not need to trim for SIZE until AFTER it's been added
   addMessage(id: string, m: ArrayBuffer) {
     _sb_assert(!this.buffer.messages.has(id), "Message already in buffer (Internal Error) [L312]");
-    if (DBG0) console.log("... adding message to buffer:", id)
+    if (dbg.DEBUG2) console.log("... adding message to buffer:", id)
     this.deleteExpired(); // just keeping things tight
     this.buffer.totalSize += m.byteLength;
     this.buffer.ring.set(this.buffer.last, { x: Date.now() + TTL0_EXPIRATION, id: id });
@@ -1482,7 +1482,7 @@ export class ChannelServer implements DurableObject {
     this.sessions.forEach((session, _userId) => {
       if (session.ready) {
         try {
-          if (dbg.DEBUG) console.log("sending message to session (user): ", session.userId)
+          if (dbg.DEBUG2) console.log("sending message to session (user): ", session.userId)
           session.webSocket.send(messagePayload);
           if (dbg.DEBUG2) console.log(SEP, "sent BROADCAST message to client", SEP, extractPayload(messagePayload).payload, SEP)
         } catch (err) {
@@ -1975,7 +1975,7 @@ export class ChannelServer implements DurableObject {
   // (such as for storage). otherwise it accepts any positive integer (eg set to
   // 'false' for API charges)
   async #consumeStorage(size: number, round = true): Promise<number> {
-    if (DBG0) console.log("Consuming storage: ", size, round ? " (will round up)" : "", "current limit:", this.storageLimit, "bytes")
+    if (dbg.DEBUG2) console.log("Consuming storage: ", size, round ? " (will round up)" : "", "current limit:", this.storageLimit, "bytes")
     if (round)
       size = this.#roundSize(size) || 0;
     size = Math.ceil(size);
@@ -2003,7 +2003,7 @@ export class ChannelServer implements DurableObject {
     this.storageLimit -= size; // apply reduction
     this.storageLimit = Math.floor(this.storageLimit); // make sure it's an integer
     await this.storage.put('storageLimit', this.storageLimit); // here we've consumed it
-    if (DBG0) console.log("[#consumeSTorage] Storage amount consumed:", size, "bytes; new limit:", this.storageLimit, "bytes") 
+    if (dbg.DEBUG2) console.log("[#consumeSTorage] Storage amount consumed:", size, "bytes; new limit:", this.storageLimit, "bytes") 
     return size // return what was actually consumed
   }
 
