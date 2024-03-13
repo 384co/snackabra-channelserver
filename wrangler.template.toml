@@ -3,9 +3,8 @@
 # ergo "<name>.<your CF domain>.workers.dev"
 name = "channel" # for dev/preview/local
 
-# type = "javascript"
 workers_dev = true
-compatibility_date = "2023-05-07"
+compatibility_date =  "2024-01-29"
 main = "./src/index.ts"
 
 # Replace with your account id (on the right side of your CF dashboard)
@@ -15,13 +14,21 @@ usage_model = 'unbound'
 # The ledger namespace is shared with the storage server
 kv_namespaces = [
   { binding = "MESSAGES_NAMESPACE", id = "...", preview_id = "..." },
+
+  # first one is selected with '--preview false', second one with '--preview'
+  # both also exist in '--local' versions (local development)
   { binding = "LEDGER_NAMESPACE", id = "...", preview_id = "..." },
+
   { binding = "IMAGES_NAMESPACE", id = "...", preview_id = "..." }
 ]
 
 [[migrations]]
 tag = "v1" # Should be unique for each entry
 new_classes = ["ChannelServer"]
+
+[[services]]
+binding = "STORAGE_SERVER_BINDING"
+service = "storage" # needs to be your matching storage server (for history shards)
 
 [durable_objects]
 bindings = [
@@ -36,9 +43,15 @@ kv_namespaces = [
   { binding = "IMAGES_NAMESPACE", id = "...", preview_id = "..." }
 ]
 
+[[env.production.services]]
+binding = "STORAGE_SERVER_BINDING"
+service = "s"
+
 [vars]
+VERSION="..."
 ENVIRONMENT="development"
-STORAGE_SERVER="storage"
+STORAGE_SERVER_NAME="storage"
+LOG_ERRORS=true
 DEBUG_ON=false # low-noise debug output
 VERBOSE_ON=false # noisier
 
@@ -46,8 +59,10 @@ VERBOSE_ON=false # noisier
 WEB_NOTIFICATION_SERVER = "..."
 
 [env.production.vars]
+VERSION="..."
 ENVIRONMENT="production"
-STORAGE_SERVER="s"
+STORAGE_SERVER_NAME="s"
+LOG_ERRORS=true
 DEBUG_ON=false
 VERBOSE_ON=false
 WEB_NOTIFICATION_SERVER = "..."
