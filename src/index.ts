@@ -403,6 +403,7 @@ export class TTL0BufferClass {
       called with the message key and the message itself. Note that the
       iteration is in 'ring' order (modulo the buffer size etc). */
   iterate(callback: (key: string, userId: SBUserId | undefined, message: ArrayBuffer) => boolean, start: string) {
+    console.log("Asked for everything AFTER timestamp: ", start)
     this.deleteExpired();
     let tail = this.buffer.first;
     while (tail !== this.buffer.last) {
@@ -1355,6 +1356,7 @@ export class ChannelServer implements DurableObject {
               this.sessions.delete(userId);
             } else {
               // we iterate through TTL0 buffer and send all messages with timestamp > prefix
+              console.log("CALLING iterate with msg:", msg)
               this.ttl0Buffer.iterate((_key, userId, message) => {
                 if (!userId || userId !== userId || session.isOwner) {
                   if (DBG0) console.log(SEP, "sending TTL0 (and other) messages to client", SEP, extractPayload(message).payload, SEP)
