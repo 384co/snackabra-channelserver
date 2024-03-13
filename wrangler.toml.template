@@ -1,0 +1,53 @@
+# Copyright (c) 2023-2024 384(tm) Inc, All Rights Reserved.
+
+# ergo "<name>.<your CF domain>.workers.dev"
+name = "channel" # for dev/preview/local
+
+# type = "javascript"
+workers_dev = true
+compatibility_date = "2023-05-07"
+main = "./src/index.ts"
+
+# Replace with your account id (on the right side of your CF dashboard)
+account_id = '....'
+usage_model = 'unbound'
+
+# The ledger namespace is shared with the storage server
+kv_namespaces = [
+  { binding = "MESSAGES_NAMESPACE", id = "...", preview_id = "..." },
+  { binding = "LEDGER_NAMESPACE", id = "...", preview_id = "..." },
+  { binding = "IMAGES_NAMESPACE", id = "...", preview_id = "..." }
+]
+
+[[migrations]]
+tag = "v1" # Should be unique for each entry
+new_classes = ["ChannelServer"]
+
+[durable_objects]
+bindings = [
+  { name = "channels", class_name = "ChannelServer" },
+]
+
+[env.production]
+name = "c" # default production channel name eg "c.<your CF domain>.workers.dev"
+kv_namespaces = [
+  { binding = "MESSAGES_NAMESPACE", id = "...", preview_id = "..." },
+  { binding = "LEDGER_NAMESPACE", id = "...", preview_id = "..." },
+  { binding = "IMAGES_NAMESPACE", id = "...", preview_id = "..." }
+]
+
+[vars]
+ENVIRONMENT="development"
+STORAGE_SERVER="storage"
+DEBUG_ON=false # low-noise debug output
+VERBOSE_ON=false # noisier
+
+# ToDo: separate for dev and prod?
+WEB_NOTIFICATION_SERVER = "..."
+
+[env.production.vars]
+ENVIRONMENT="production"
+STORAGE_SERVER="s"
+DEBUG_ON=false
+VERBOSE_ON=false
+WEB_NOTIFICATION_SERVER = "..."
