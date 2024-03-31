@@ -318,6 +318,7 @@ export function returnBinaryResult(request: Request, payload: BodyInit, headers?
  */
 export function returnError(_request: Request, errorString: string, status: ResponseCode = 500, delay = 0) {
     console.log("**** ERROR: (status: " + status + ")\n" + errorString);
+    if (errorString === ANONYMOUS_CANNOT_CONNECT_MSG) status = 401;
     if (!delay && ((status == 401) || (status == 403))) delay = 50; // delay if auth-related
     return returnResultJson(_request, { success: false, error: errorString }, status);
 }
