@@ -135,6 +135,8 @@ Follow format from [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/
 
 - adding ttl0buffer
 
+- added enforcement of shard data sizes (STORAGE_MAX_SIZE)
+
 ## [1.1.0] - 2023-03-01
 
 ### Added

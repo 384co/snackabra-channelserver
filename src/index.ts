@@ -73,7 +73,6 @@ function setServerDebugLevel(env: EnvType) {
   if (dbg.DEBUG2) setDebugLevel(dbg.DEBUG) // poke jslib
 }
 
-
 const base62mi = "0123456789ADMRTxQjrEywcLBdHpNufk" // "v05.05" (strongpinVersion ^0.6.0)
 const base62Regex = new RegExp(`[${base62mi}]`);
 
@@ -1158,7 +1157,7 @@ export class ChannelServer implements DurableObject {
       // for channelId; calling in 'serverMode' (true) to enforce server-side
       const messagePayload = assemblePayload(stripChannelMessage(message, true))!
 
-      // final, final, we enforce storage limit
+      // finally, we enforce storage limit
       const messagePayloadSize = messagePayload.byteLength
       if (messagePayloadSize > serverConstants.MAX_SB_BODY_SIZE) {
         if (dbg.DEBUG) console.error(`ERROR: message too large (${messagePayloadSize} bytes)`)
@@ -1268,6 +1267,10 @@ export class ChannelServer implements DurableObject {
     } else {
       if (dbg.DEBUG) console.error("Got contents we can't process: ", page)
       return returnError(request, `Contents provided for Page not supported (needs to be string or ArrayBuffer)`);
+    }
+
+    if (pageSize > serverConstants.STORAGE_SIZE_MAX) {
+      return returnError(request, `Page contents too large (${pageSize} bytes, current limit is ${serverConstants.STORAGE_SIZE_MAX} bytes)`, 413);
     }
 
     if (dbg.DEBUG) console.log(page, type, '\n', SEP)
@@ -2068,7 +2071,8 @@ export class ChannelServer implements DurableObject {
     // TODO: per-user storage boundaries (higher priority now since this will soon support Infinity)
     _sb_assert(apiBody.apiPayload, "[getStorageToken] needs parameters")
     try {
-      const size = await this.#consumeStorage(Number(apiBody.apiPayload.size)); // will throw if there are issues, otherwise quietly return
+      const payloadSize = Number(apiBody.apiPayload.size);
+      const size = await this.#consumeStorage(payloadSize); // will throw if there are issues, otherwise quietly return
       // the channel was good for the charge, so create the token
       const token = this.#generateStorageToken(size);
       await this.env.LEDGER_NAMESPACE.put(token.hash, JSON.stringify(validate_SBStorageToken(token)));
