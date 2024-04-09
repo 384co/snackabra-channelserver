@@ -8,7 +8,9 @@
   "homepage": "https://snackabra.io",
   "license": "GPL-3.0-only",
   "scripts": {
+    "dev": "wrangler dev --port 3845",
     "start": "wrangler dev --port 3845",
+    "tail": "wrangler tail",
     "deploy": "wrangler deploy",
     "deploy:prod": "wrangler deploy --env production"
   },
