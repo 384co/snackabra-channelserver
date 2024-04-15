@@ -1585,7 +1585,7 @@ export class ChannelServer implements DurableObject {
 
     if (listQuery.size > serverConstants.MAX_MESSAGE_SET_SIZE) {
       if (dbg.LOG_ERRORS) console.error("ERROR: message set too large")
-      return returnError(request, "Message set too large (need to add pagination)", 400);
+      return returnError(request, `Message set too large (current limit is ${serverConstants.MAX_MESSAGE_SET_SIZE}), awaiting launch of 'deep history' feature on channel histories.`, 400);
     }
 
     // // we check for any matches in ttl0 buffer
