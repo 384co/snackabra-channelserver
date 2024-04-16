@@ -31,7 +31,7 @@ import {
   stripChannelMessage, setDebugLevel, SBStorageToken,
   validate_SBStorageToken, SBStorageTokenPrefix,
   SB384, arrayBufferToBase62, jsonParseWrapper,
-  version, validate_ChannelMessage, validate_SBChannelData,
+  validate_ChannelMessage, validate_SBChannelData,
   SBUserPublicKey,
   SBError,
   Snackabra, // stringify_SBObjectHandle,
@@ -220,7 +220,7 @@ function serverInfo(request: Request, env: EnvType) {
   var retVal = {
     version: env.VERSION,
     storageServer: storageUrl,
-    jslibVersion: version,
+    jslibVersion: Snackabra.version,
 
     // ... we would have to go to DO for this info, and we don't want to
     // apiEndpoints: {
@@ -2002,17 +2002,22 @@ export class ChannelServer implements DurableObject {
     return returnSuccess(request);
   }
 
-  /* NOTE: current design limits this to 2^52 bytes, future limit will be 2^64 bytes */
+  /* This rounds up to nearest 4 KiB, plus apply some limits
+     NOTE: current design limits this to 2^52 bytes, future limit will be 2^64 bytes */
   #roundSize(size: number, roundUp = true) {
-    if (size === Infinity) return Infinity; // special case
-    if (size <= serverConstants.STORAGE_SIZE_MIN) size = serverConstants.STORAGE_SIZE_MIN;
-    if (size > (2 ** 52)) throw new Error(`Storage size too large (max 2^52 and we got ${size})`);
-    const exp1 = Math.floor(Math.log2(size));
-    const exp2 = exp1 - 3;
-    const frac = Math.floor(size / (2 ** exp2));
-    const result = frac << exp2;
-    if ((size > result) && roundUp) return result + (2 ** exp2);
-    else return result;
+    const STORAGE_SIZE_MAX = 2 ** 52; // 4 PiB
+    const BLOCK_SIZE = 4096; // 4 KiB
+    if (size === Infinity)
+      return Infinity;
+    if (size <= serverConstants.STORAGE_SIZE_MIN) {
+      return serverConstants.STORAGE_SIZE_MIN;
+    } else if (size > STORAGE_SIZE_MAX) {
+      throw new Error(`[ChannelServer] Storage size too large (max 2^52 and we got ${size})`);
+    } else {
+      const blockSize = BLOCK_SIZE;
+      const roundedSize = Math.floor(size / blockSize) * blockSize;  
+      return size > roundedSize && roundUp ? roundedSize + blockSize : roundedSize;
+    }
   }
 
   // will 'spend' this amount; if there are any issues, we throw, otherwise the
