@@ -353,6 +353,7 @@ import { handleApiRequest } from './index'
 
 export async function serverFetch(request: Request, env: EnvType) {
     if (dbg.DEBUG) console.log("serverFetch() called with url:", request.url)
+    // todo: might want to add a timeout of sorts here, to prevent hanging
     return await handleErrors(request, async () => {
         if (request.method == "OPTIONS")
             return returnResult(request);
@@ -365,14 +366,107 @@ export async function serverFetch(request: Request, env: EnvType) {
     });
 }
 
+// export class ServerFetchQueue<T> {
+//     private queue: T[] = [];
+//     private resolve: ((value: T | PromiseLike<T> | null) => void) | null = null;
+//     enqueue(item: T) {
+//       if (this.resolve) {
+//         this.resolve(item);
+//         this.resolve = null;
+//       } else {
+//         this.queue.push(item);
+//       }
+//     }
+//     async dequeue(): Promise<T | null> {
+//       if (this.queue.length > 0) {
+//         const item = this.queue.shift()!;
+//         return Promise.resolve(item);
+//       } else {
+//         return new Promise((resolve, reject) => {
+//           this.resolve = resolve;
+//         });
+//       }
+//     }
+//     isEmpty() {
+//       return this.queue.length === 0;
+//     }
+// }
+
+
+
+// export default {
+//     async fetch(request: Request, env: EnvType) {
+//         // note: this will only toggle these values in this file
+//         dbg.DEBUG = env.DEBUG_ON === true
+//         dbg.DEBUG2 = env.VERBOSE_ON === true
+//         dbg.LOG_ERRORS = env.LOG_ERRORS === true
+//         if (!dbg.myOrigin) dbg.myOrigin = new URL(request.url).origin
+
+//         if (dbg.DEBUG) {
+//             const msg = `==== [${request.method}] Fetch called: ${request.url}`;
+//             console.log(
+//                 `\n${'='.repeat(Math.min(msg.length, 120))}` +
+//                 `\n${msg}` +
+//                 `\n${'='.repeat(Math.min(msg.length, 120))}`
+//             );
+//             if (dbg.DEBUG2) console.log(request.headers);
+//         }
+//         return await serverFetch(request, env);
+//     }
+// }
+
+
+
+
+// export default {
+//     async fetch(request: Request, env: EnvType) {
+//         activeTasks++;
+//         if (activeTasks > MAX_CONCURRENT) {
+//             // create and insert a promise, that we then wait for
+//             // <insert code here>
+//             await <some entry in the array>
+//         }
+//         // otherwise we can just proceed
+//         const result = await serverFetch(request, env);
+//         activeTasks--;
+//         if (activeTasks < MAX_CONCURRENT) {
+//             // here we find the next task, and just resolve() that
+//         }
+// }
+
+
+// let activeTasks = 0;
+// const MAX_CONCURRENT = 2;
+// const barrierPromises: (() => void)[] = [];
+
+// export default {
+//     async fetch(request: Request, env: EnvType) {
+//         if (activeTasks >= MAX_CONCURRENT) {
+//             console.log("**** Too many active tasks, waiting for a slot")
+//             await new Promise<void>((resolve) => {
+//                 barrierPromises.push(resolve);
+//             });
+//         }
+//         // start our task
+//         activeTasks++;
+//         const result = await serverFetch(request, env);
+//         activeTasks--;
+//         if (barrierPromises.length > 0)
+//             barrierPromises.shift()!();
+//         return result;
+//     }
+// }
+
+
+let activeTasks = 0;
+const MAX_CONCURRENT = 4;
 export default {
     async fetch(request: Request, env: EnvType) {
-        // note: this will only toggle these values in this file
+        // debug output section
         dbg.DEBUG = env.DEBUG_ON === true
         dbg.DEBUG2 = env.VERBOSE_ON === true
         dbg.LOG_ERRORS = env.LOG_ERRORS === true
         if (!dbg.myOrigin) dbg.myOrigin = new URL(request.url).origin
-
         if (dbg.DEBUG) {
             const msg = `==== [${request.method}] Fetch called: ${request.url}`;
             console.log(
@@ -382,13 +476,26 @@ export default {
             );
             if (dbg.DEBUG2) console.log(request.headers);
         }
-        return await serverFetch(request, env);
+
+        activeTasks++;
+        while (activeTasks > MAX_CONCURRENT) {
+            // we delay and then try again
+            console.log("**** Too many active tasks, waiting for a slot:", activeTasks)
+            await new Promise(resolve => setTimeout(resolve, 50));
+        }
+        console.log("**** Active tasks:", activeTasks)
+        activeTasks--;
+        const result = await serverFetch(request, env);
+        return result;
     }
 }
 
 
-import { extractPayload, base62ToArrayBuffer, validate_ChannelApiBody, ChannelApiBody } from 'snackabra'
 
+
+
+
+import { extractPayload, base62ToArrayBuffer, validate_ChannelApiBody, ChannelApiBody } from 'snackabra'
 
 /**
  * Extracts the apiBody from the request. If the request is a binary

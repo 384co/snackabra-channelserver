@@ -31,7 +31,7 @@ import {
   stripChannelMessage, setDebugLevel, SBStorageToken,
   validate_SBStorageToken, SBStorageTokenPrefix,
   SB384, arrayBufferToBase62, jsonParseWrapper,
-  version, validate_ChannelMessage, validate_SBChannelData,
+  validate_ChannelMessage, validate_SBChannelData,
   SBUserPublicKey,
   SBError,
   Snackabra, // stringify_SBObjectHandle,
@@ -219,8 +219,9 @@ function serverInfo(request: Request, env: EnvType) {
   }
   var retVal = {
     version: env.VERSION,
+    channelServer: url.hostname,
     storageServer: storageUrl,
-    jslibVersion: version,
+    jslibVersion: Snackabra.version,
 
     // ... we would have to go to DO for this info, and we don't want to
     // apiEndpoints: {
@@ -469,6 +470,7 @@ export class ChannelServer implements DurableObject {
   ttl0Buffer: TTL0BufferClass = new TTL0BufferClass(); // in-memory buffer for TTL0 messages
 
   webNotificationServer: string;
+  ourDomain: string | undefined; // set as soon as there is a fetch
 
   hibernationPromise: Promise<void> | null = null; // used to track hibernation (if present, we're recovering from it)
 
@@ -808,6 +810,7 @@ export class ChannelServer implements DurableObject {
   // this is the fetch picked up by the Durable Object
   async fetch(request: Request) {
     const url = new URL(request.url);
+    if (!this.ourDomain) this.ourDomain = url.hostname;
     const path = url.pathname.slice(1).split('/');
     if (!path || path.length < 2) return returnError(request, "Internal Error (L293", 400);
     const channelId = path[0]
@@ -1152,6 +1155,8 @@ export class ChannelServer implements DurableObject {
         if (message.t)
           throw new Error("ERROR: any 'to' (routed) message must have a short TTL")
       }
+
+      if (this.ourDomain) message.cs = this.ourDomain;  // server domain
 
       // strip (minimize) it and, package it, result chunk is stand-alone except
       // for channelId; calling in 'serverMode' (true) to enforce server-side
