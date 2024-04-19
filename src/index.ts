@@ -2048,7 +2048,7 @@ export class ChannelServer implements DurableObject {
       }
       if (size > this.storageLimit)
         // if a specific amount is requested that exceeds the budget, we do NOT interpret it as plunder
-        throw new SBError(`Not enough storage budget in mother channel - requested ${size} from '${this.channelId?.slice(0,8)}...', ${this.storageLimit} available`);
+        throw new SBError(`Not enough storage budget in mother channel - requested ${size} from '${this.channelId?.slice(0,16)}...', ${this.storageLimit} available`);
     } else {
       // if it's negative, it's interpreted as how much to leave behind
       const _leaveBehind = -size;
