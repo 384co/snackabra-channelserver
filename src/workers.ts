@@ -223,12 +223,12 @@ console.log(isTextLikeMimeType("image/jpeg")); // false
 export type ResponseCode = 101 | 200 | 400 | 401 | 403 | 404 | 405 | 413 | 418 | 429 | 500 | 501 | 507;
 const SEP = '='.repeat(60) + '\n'
 
-function _headers(request: Request, contentType: string | null, immutable: boolean = false): HeadersInit {
+function _headers(_request: Request, contentType: string | null, immutable: boolean = false): HeadersInit {
     let corsHeaders: HeadersInit = {
         "Access-Control-Allow-Methods": "POST, OPTIONS, GET",
         "Access-Control-Allow-Headers": "Content-Type, authorization",
         "Access-Control-Allow-Credentials": "true",
-        "Access-Control-Allow-Origin": request.headers.get("Origin") ?? "*",
+        "Access-Control-Allow-Origin": "*",
     };
     if (contentType)
         corsHeaders = { ...corsHeaders, "Content-Type": contentType };
@@ -304,7 +304,7 @@ export function return304(request: Request, hash: string) {
  * payload but just passes on payload. Defaults to 200 (OK) and no delay.
  */
 export function returnBinaryResult(request: Request, payload: BodyInit, headers?: HeadersInit) {
-    let corsHeaders = _headers(request, "application/octet-stream");
+    let corsHeaders = _headers(request, "application/octet-stream", true); // immutable
     // if we have a list of headers, then we merge with corsHeaders
     if (headers) {
         corsHeaders = { ...corsHeaders, ...headers };

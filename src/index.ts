@@ -180,7 +180,8 @@ async function callDurableObject(channelId: SBChannelId, path: Array<string>, re
   const durableObjectId = env.channels.idFromName(channelId);
   // locate to west north america (not relocated afterwards); todo: see if
   // there's a simple way to select 'enam' if that's closer
-  const durableObject = env.channels.get(durableObjectId, { locationHint: 'wnam'});
+  // const durableObject = env.channels.get(durableObjectId, { locationHint: 'wnam'}); // todo: TS complains on second parameter
+  const durableObject = env.channels.get(durableObjectId);
   const newUrl = new URL(request.url);
   newUrl.pathname = "/" + channelId + "/" + path.join("/");
   const newRequest = new Request(newUrl.toString(), request);
