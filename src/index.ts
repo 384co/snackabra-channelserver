@@ -63,7 +63,7 @@ const SEPx = '='.repeat(76)
 const SEP = '\n' + SEPx + '\n'
 const SEPxStar = '\n' + '*'.repeat(76) + '\n'
 
-const DBG0 = true; // set to true to enable specific debug output (not production) XXX
+const DBG0 = false; // set to true to enable specific debug output (not production) XXX
 
 // called on all 'entry points' to set the debug level
 function setServerDebugLevel(env: EnvType) {
@@ -567,12 +567,12 @@ export class ChannelServer implements DurableObject {
 
     // todo: presumed to be a good idea to limit this?
     this.state.setHibernatableWebSocketEventTimeout(1 * 60 * 1000) // milliseconds thus this is 1 minute
-    console.log("++++ setting websocket handler timeout to (seconds):", this.state.getHibernatableWebSocketEventTimeout()! / 1000)
+    if (DBG0) console.log("++++ setting websocket handler timeout to (seconds):", this.state.getHibernatableWebSocketEventTimeout()! / 1000)
 
-    console.log("++++ setting autoresponse to timestamp ++++")
+    if (DBG0) console.log("++++ setting autoresponse to timestamp ++++")
     this.state.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', Channel.timestampToBase4String(this.latestTimestamp)))
 
-    console.log("++++ CURRENT WEBSOCKETS  ++++")
+    if (DBG0) console.log("++++ CURRENT WEBSOCKETS  ++++")
     const wsList = this.state.getWebSockets()
     if (wsList.length > 0) {
       this.hibernationPromise = new Promise<void>(async (resolve, _reject) => {
@@ -612,12 +612,12 @@ export class ChannelServer implements DurableObject {
         if (DBG0) console.log(this.sessions)
         resolve(void 0)
       });
-      console.log(SEP, "[RETURNING FROM HIBERNATION] 'blockConcurrencyWhile' now awaiting setup finishing", SEP)
+      if (DBG0) console.log(SEP, "[RETURNING FROM HIBERNATION] 'blockConcurrencyWhile' now awaiting setup finishing", SEP)
       this.state.blockConcurrencyWhile(() => this.hibernationPromise!)
     }
-    console.log("++++ ++++ ++++ ++++ ++++ ++++")
+    if (DBG0) console.log("++++ ++++ ++++ ++++ ++++ ++++")
 
-    console.log("++++ ChannelServer constructor done ++++")
+    if (DBG0) console.log("++++ ChannelServer constructor done ++++")
   }
 
   // called after a DO channel is initialized. kitchen sink for a variety of
@@ -723,7 +723,7 @@ export class ChannelServer implements DurableObject {
     }
 
     this.latestTimestamp = Channel.base4StringToTimestamp(highTimestamp)
-    console.log(
+    if (DBG0) console.log(
       "\n", SEP,
       "ChannelServer startup, latest timestamp:\n",
       "  number format: ", this.latestTimestamp, "\n",
@@ -1047,11 +1047,11 @@ export class ChannelServer implements DurableObject {
       if (!this.messageHistory) throw new SBError("ERROR: messageHistory not set, fatal (Internal Error L1046)")
       try {
 
-        console.log("1111 1111 [DeepHistory] We have overflow, initiating shardification ..")
+        if (DBG0) console.log("1111 1111 [DeepHistory] We have overflow, initiating shardification ..")
         const messageHistory = new Map<string, ChannelMessage>();
         const keysMap = await this.#_getMessageKeys('0', false) // get everything; don't cache
         const keys = Array.from(keysMap.keys())
-        console.log("0000 0000 [storeMessageCache] Got keys: ", keys)
+        if (DBG0) console.log("0000 0000 [storeMessageCache] Got keys: ", keys)
         const getOptions: DurableObjectGetOptions = { allowConcurrency: true };
         let lowestFrom = Channel.HIGHEST_TIMESTAMP
         let highestTo = Channel.LOWEST_TIMESTAMP
@@ -1080,7 +1080,7 @@ export class ChannelServer implements DurableObject {
           }
         }
   
-        console.log(SEP, "2222 2222 [DeepHistory] About to store with payload")
+        if (DBG0) console.log(SEP, "2222 2222 [DeepHistory] About to store with payload")
         const historyEntry: MessageHistory = {
           version: '20240601.0',
           channelId: this.channelId!,
@@ -1095,7 +1095,7 @@ export class ChannelServer implements DurableObject {
         await this.messageHistory.insertValue(historyEntry, lowestFrom, highestTo)
 
         const newHistoryContents = this.messageHistory.export()
-        console.log(SEP, "3333 3333 [DeepHistory] Message history should be up to date:\n", SEP, newHistoryContents, SEP)
+        if (DBG0) console.log(SEP, "3333 3333 [DeepHistory] Message history should be up to date:\n", SEP, newHistoryContents, SEP)
 
         // we await this separately from counters below
         const newHistoryContentsBuf = assemblePayload(newHistoryContents)
@@ -1105,14 +1105,14 @@ export class ChannelServer implements DurableObject {
         const i2Key = Channel.composeMessageKey(this.channelId!, Channel.base4StringToTimestamp(lowestFrom), '_H__')
         await this.env.MESSAGES_NAMESPACE.put(i2Key, newHistoryContentsBuf!);
 
-        console.log(SEP, "4444 4444 [DeepHistory] Deleting old messages from local storage", SEP)
+        if (DBG0) console.log(SEP, "4444 4444 [DeepHistory] Deleting old messages from local storage", SEP)
         const keysToDelete = Array.from(messageHistory.keys())
         while (keysToDelete.length > 0) {
           const batchKeys = keysToDelete.splice(0, 128); // 128 is max number of keys we can delete in a single go
           await this.storage.delete(batchKeys)
         }
 
-        console.log(SEP, "5555 5555 [DeepHistory] Updating history done, cleaning up", SEP)
+        if (DBG0) console.log(SEP, "5555 5555 [DeepHistory] Updating history done, cleaning up", SEP)
         // reset counter; we do this last, so if we're restarted during the above, should just pick it back up
         this.newMessageCount = 0;
         this.messageSize = 0;
