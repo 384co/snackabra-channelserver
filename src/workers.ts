@@ -7,15 +7,12 @@
 import { assemblePayload, SBError } from 'snackabra';
 import { NEW_CHANNEL_MINIMUM_BUDGET as _NEW_CHANNEL_MINIMUM_BUDGET } from 'snackabra'
 
-
-// also exported to 'workers.ts'
 export var dbg = {
     DEBUG: false,
     DEBUG2: false,
     LOG_ERRORS: true,
     myOrigin: '',     // tracks our origin as well
   }
-
 
 /**
  * API calls are in one of two forms:
@@ -479,7 +476,7 @@ const MAX_CONCURRENT = 4;
 export default {
     async fetch(request: Request, env: EnvType) {
         // debug output section
-        dbg.DEBUG = env.DEBUG_ON === true
+        dbg.DEBUG = env.DEBUG_LEVEL_1 === true
         dbg.DEBUG2 = env.VERBOSE_ON === true
         dbg.LOG_ERRORS = env.LOG_ERRORS === true
         if (!dbg.myOrigin) dbg.myOrigin = new URL(request.url).origin
@@ -499,7 +496,8 @@ export default {
             console.log("**** Too many active tasks, waiting for a slot:", activeTasks)
             await new Promise(resolve => setTimeout(resolve, 50));
         }
-        console.log("**** Active tasks:", activeTasks)
+        // ToDo: i simply cannot get this above one?
+        if (activeTasks > 1) console.log("**** Active tasks:", activeTasks)
         activeTasks--;
         const result = await serverFetch(request, env);
         return result;

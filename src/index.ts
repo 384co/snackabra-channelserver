@@ -61,16 +61,37 @@ function arrayBufferToText(buf: ArrayBuffer) {
 
 const SEPx = '='.repeat(76)
 const SEP = '\n' + SEPx + '\n'
+const SEP_ = SEPx + '\n'
 const SEPxStar = '\n' + '*'.repeat(76) + '\n'
 
-const DBG0 = false; // set to true to enable specific debug output (not production) XXX
+// enable for stress testing larger trees (narrower branching), but NOT in production
+const TEST_WITH_SMALL_BRANCHING = false
+
+// set to true to enable specific debug output or testing (local only, production will not allow this)
+var DBG0 = false;
+
+if (DBG0) console.log('', SEP_, SEP_, SEP_, "============     Starting Channel Server with DBG0 ENABLED     =============\n", SEP_, SEP_, SEP_)
+
+if (TEST_WITH_SMALL_BRANCHING && !DBG0)
+    throw new Error("TEST_WITH_SMALL_BRANCHING should not be set unless DBG0 is also set (local only)")
+const MSG_HISTORY_BRANCHING = TEST_WITH_SMALL_BRANCHING ? 3 : DeepHistory.MESSAGE_HISTORY_BRANCH_FACTOR
+const MSG_HISTORY_SET_SIZE = TEST_WITH_SMALL_BRANCHING ? 5 : DeepHistory.MAX_MESSAGE_SET_SIZE
 
 // called on all 'entry points' to set the debug level
+var debugLevelSet = false;
 function setServerDebugLevel(env: EnvType) {
-  dbg.DEBUG = env.DEBUG_ON ? true : false;
-  dbg.LOG_ERRORS = env.LOG_ERRORS || dbg.DEBUG ? true : false;
-  dbg.DEBUG2 = env.VERBOSE_ON ? true : false;
-  if (dbg.DEBUG2) setDebugLevel(dbg.DEBUG) // poke jslib
+  if (debugLevelSet) return;
+  if (DBG0 === true && env.ENVIRONMENT === 'production') {
+    const msg = "DBG0 is set in development environment (Internal Error) [L77]"
+    console.error(msg)
+    throw new Error(msg)
+  }
+  dbg.DEBUG = env.DEBUG_LEVEL_1 === true ? true : false;
+  dbg.LOG_ERRORS = env.LOG_ERRORS === true || dbg.DEBUG === true ? true : false;
+  dbg.DEBUG2 = env.VERBOSE_ON === true ? true : false;
+  if (dbg.DEBUG2 === true) setDebugLevel(dbg.DEBUG) // poke jslib
+  console.log(SEP, "Setting debug levels from environment:", SEP, env, SEP, dbg, SEP)
+  debugLevelSet = true;
 }
 
 const base62mi = "0123456789ADMRTxQjrEywcLBdHpNufk" // "v05.05" (strongpinVersion ^0.6.0)
@@ -256,17 +277,6 @@ interface SessionInfo extends SessionInfoHibernated {
   quit: boolean,
 }
 
-// interface HibernationInfo {
-//   userId: SBUserId,
-//   channelId: SBChannelId,
-//   isOwner: boolean,
-//   // apiBody: ChannelApiBody,
-//   // channelData: SBChannelData,
-// }
-
-// var loadedVisitorApiEndpoints: Array<string> = []
-// var loadedOwnerApiEndpoints: Array<string> = []
-
 interface PageMetaData {
   id: string,
   owner: SBUserId,
@@ -437,7 +447,7 @@ export class TTL0BufferClass {
 
 class ChannelHistory extends HistoryTree<MessageHistory, SBObjectHandle, string> {
   constructor(data: any, public storeData: (data: any) => Promise<SBObjectHandle>) {
-      super(DeepHistory.MESSAGE_HISTORY_BRANCH_FACTOR, data);
+      super(MSG_HISTORY_BRANCHING, data);
   }
   async freeze(data: Freezable<MessageHistory, SBObjectHandle>): Promise<SBObjectHandle> {
       return this.storeData(data)
@@ -597,16 +607,6 @@ export class ChannelServer implements DurableObject {
             // receivedUserInfo: false
           }
           this.sessions.set(wsInfo.userId, wsInfo)
-          // this.sessions.set(wsInfo.userId, {
-          //   userId: wsInfo.userId,
-          //   userKeys: userKeys,
-          //   channelId: wsInfo.channelId,
-          //   isOwner: wsInfo.isOwner,
-          //   webSocket: ws,
-          //   ready: true,
-          //   quit: false,
-          //   // receivedUserInfo: false
-          // })
         }
         if (DBG0) console.log(SEP, "[RETURNING FROM HIBERNATION] done with post-hibernation work", SEP)
         if (DBG0) console.log(this.sessions)
@@ -688,7 +688,7 @@ export class ChannelServer implements DurableObject {
 
       totalSize += value.byteLength;
     }
-    console.log(SEPx)
+    if (dbg.DEBUG2) console.log(SEPx)
 
     // extract the timestamp from 'lowest' and 'highest' keys
     const { timestamp: lowTimestamp } = Channel.deComposeMessageKey(lowest)
@@ -1039,7 +1039,7 @@ export class ChannelServer implements DurableObject {
 
     // if we are over our preferred limit, we initiate shardification
     if (MESSAGE_HISTORY && perma && !this.deepHistoryWritebackLock &&
-      (this.newMessageCount >= DeepHistory.MAX_MESSAGE_SET_SIZE || this.messageSize >= DeepHistory.MAX_MESSAGE_HISTORY_SHARD_SIZE)
+      (this.newMessageCount >= MSG_HISTORY_SET_SIZE || this.messageSize >= DeepHistory.MAX_MESSAGE_HISTORY_SHARD_SIZE)
     ) {
       this.deepHistoryWritebackLock = true; // LOCK out other writebacks (before any async operations)
       if (DBG0 || dbg.DEBUG) console.log(`---- initiating shardification .. we have ${this.newMessageCount} messages`)
@@ -1136,14 +1136,6 @@ export class ChannelServer implements DurableObject {
   async #processMessage(msg: any, /* userId: SBUserId, */ isOwner: boolean /*, apiBody: ChannelApiBody */): Promise<void> {
 
     try {
-      // var message: ChannelMessage = {}
-      // if (typeof msg === "string") {
-      //   message = jsonParseWrapper(msg.toString(), 'L594');
-      // } else if (msg instanceof ArrayBuffer) {
-      //   message = extractPayload(extractPayload(msg).payload).payload // TODO: hack
-      // } else {
-      //   throw new Error("Cannot parse contents type (not json nor arraybuffer)")
-      // }
 
       if (dbg.DEBUG2) console.log(
         "------------ getting message from client (pre validation) ------------",
@@ -1151,58 +1143,6 @@ export class ChannelServer implements DurableObject {
         // "-------------------------------------------------",
         // "\n", "apiBody:\n", apiBody, "\n",
         )
-
-      // if (msg.ready) {
-      //   // the client sends a "ready" message when it can start receiving; reception means websocket is all set up
-      //   if (DBG0 || dbg.DEBUG2) console.log("got 'ready' message from client, UserId:", /* apiBody. */ userId)
-      //   const session = this.sessions.get(/* apiBody. */ userId)
-      //   if (!session) {
-      //     // if client sends a ready api call, or the socket has closed, we ignore
-      //     if (dbg.DEBUG) console.warn("[processMessage]: session not found for 'ready' message, discarding")
-      //     if (dbg.DEBUG) console.log(SEP, "Current sessions:\n", this.sessions, SEP)
-      //     return;
-      //   }
-      //   // if there's a session, we mark it as ready and mirror the ready message
-      //   session.ready = true;
-      //   if (dbg.DEBUG2) console.log("sending 'ready' response to client")
-      //   session!.webSocket.send(this.readyMessage());
-        
-      //   return; // all good
-      // }
-
-      // if (msg.reset) {
-      //   // client sends 'reset' if it's notices that i might have missed TTL0 messages
-      //   const session = this.sessions.get(/* apiBody. */ userId)
-      //   if (session) {
-      //     // if we have entries in the TTL0 buffer, we send them now
-      //     const ttl0Messages = this.ttl0Buffer.messages;
-      //     if (ttl0Messages.size > 0) {
-      //       const keysToSend = Array.from(ttl0Messages.keys()).sort()
-      //       if (DBG0) console.log("ttl0Messages:", ttl0Messages, "keysToSend:", keysToSend)
-      //       keysToSend.forEach((key) => {
-      //         if (DBG0) console.log("Looking up key:", key)
-      //         const msg = ttl0Messages.get(key)
-      //         if (!msg) throw new Error("Internal Error (L952), cannot find key: " + key)
-      //         if (DBG0) console.log(SEP, "sending TTL0 messages to client", SEP, extractPayload(msg).payload, SEP)
-      //         session.webSocket.send(msg);
-      //       });
-      //     }
-      //   }
-      // }
-
-
-      // if (msg.close && msg.close === true) {
-      //   if (DBG0 || dbg.DEBUG2) console.log("client is shutting down connection")
-      //   const session = this.sessions.get(/* apiBody. */ userId)
-      //   if (!session) {
-      //     if (dbg.LOG_ERRORS) console.warn("[processMessage]: session not found for 'close' message, ignoring")
-      //     return;
-      //   }
-      //   session.quit = true;
-      //   session.webSocket.close(1011, "Client requested 'close'.");
-      //   this.sessions.delete(/* apiBody. */ userId);
-      //   return; // all good
-      // }
 
       const message: ChannelMessage = validate_ChannelMessage(msg) // will throw if anything wrong
       // if (DBG0) console.log("Message after validation:", message)
@@ -1281,13 +1221,6 @@ export class ChannelServer implements DurableObject {
       // consume storage budget; includes 'TTL0' handling
       const multiplier = message.ttl === 0 ? CHANNEL_STORAGE_MULTIPLIER_TEMP : CHANNEL_STORAGE_MULTIPLIER_PERMA
       const spaceNeeded = messagePayloadSize * multiplier
-
-      // if (spaceNeeded > this.storageLimit) {
-      //   if (dbg.LOG_ERRORS) console.error(`ERROR: storage limit (${this.storageLimit}) exceeded, need ${spaceNeeded} bytes.`)
-      //   throw new Error(`Storage limit exceeded. Message cannot be stored or broadcast. Discarding message. Storage amount needed: ${spaceNeeded} bytes.`);
-      // }
-      // this.storageLimit -= (messagePayloadSize * multiplier);
-      // await this.storage.put('storageLimit', this.storageLimit)
 
       await this.#consumeStorage(spaceNeeded, false); // don't need results
 
@@ -1570,44 +1503,6 @@ export class ChannelServer implements DurableObject {
     // track active connections
     this.sessions.set(apiBody.userId, session)
 
-    // webSocket.addEventListener("message", async msg => {
-    //   try {
-    //     if (session.quit) {
-    //       webSocket.close(1011, "WebSocket broken (got a quit).");
-    //       return;
-    //     }
-    //     try {
-    //       const message = extractPayload(msg.data).payload
-    //       if (!message) throw new Error("ERROR: could not process message payload")
-    //       await this.#processMessage(message, apiBody); // apiBody from original setup
-    //     } catch (error: any) {
-    //       console.error(`[channel server websocket listener] error: <<${error.message}>>`)
-    //       // console.log(msg)
-    //       console.log(msg.data)
-    //       webSocket.send(JSON.stringify({ error: `ERROR: failed to process message: ${error.message}` }));
-    //     }
-    //   } catch (error: any) {
-    //     // Report any exceptions directly back to the client
-    //     const err_msg = '[handleSession()] ' + error.message + '\n' + error.stack + '\n';
-    //     if (dbg.DEBUG2) console.log(err_msg);
-    //     try {
-    //       webSocket.send(JSON.stringify({ error: err_msg }));
-    //     } catch {
-    //       console.error(`ERROR: was unable to propagate error to client: ${err_msg}`);
-    //     }
-    //   }
-    // });
-
-    // // On "close" and "error" events, remove matching sessions
-    // const closeOrErrorHandler = () => {
-    //   session.quit = true; // tells any closure to go away
-    //   // this.sessions = this.sessions.filter(member => member !== session);
-    //   this.sessions.delete(apiBody.userId)
-    // };
-
-    // webSocket.addEventListener("close", closeOrErrorHandler);
-    // webSocket.addEventListener("error", closeOrErrorHandler);
-
     // just a little ping that we're up and running
     webSocket.send(this.readyMessage());
   }
@@ -1735,205 +1630,45 @@ export class ChannelServer implements DurableObject {
     return returnResult(request, Channel.timestampToBase4String(this.latestTimestamp))
   }
 
-  // async function storageFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response>{
-  //   console.log("Fetching from storage server: ", input)
-  //   // if the input has "<CHANNEL_SERVER_REDIRECT>" in it, then it's meant for *this* worker
-  //   // and we redirect it to ourselves; we do that by first stripping that string,
-  //   // and then calling 'serferFetch' with the new URL
-  //   if (typeof input === 'string') {
-  //     if (input.includes("<CHANNEL_SERVER_REDIRECT>")) {
-  //       input = input.replace("<CHANNEL_SERVER_REDIRECT>", "")
-  //       return serverFetch(input, init)
-  //     }
-  //   }
-  //   const response = await storageServerBinding.fetch(input, init)
-  //   console.log("Got response from storage server: ", response)
-  //   return response
-  // }
-
-
   createCustomFetch(env: EnvType) {
     // This function returns a new function that is "fetch-like"
     return async function (input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
-      console.log("Custom fetch called with: ", input);
+      if (DBG0) console.log("Custom fetch called with: ", input);
       if (typeof input === 'string' && input.includes("<CHANNEL_SERVER_REDIRECT>")) {
         _sb_assert(dbg.myOrigin, "Our origin still unknown. Internal Error [L1238]")
         input = dbg.myOrigin + input.replace("<CHANNEL_SERVER_REDIRECT>", "");
         const request = new Request(input, init);
         const result = await serverFetch(request, env); // closure over env
-        console.log("Got response from ourselves: ", result);
-
-        // let's 'clone' the result, and print out the body
-        const clonedResult = result.clone();
-        // let's print out content type
-        console.log("Content type: ", clonedResult.headers.get('content-type'));
-        // if it's a text type, including json, print it as text
-        if (clonedResult.headers.get('content-type')?.includes('text') || clonedResult.headers.get('content-type')?.includes('json')) {
-          const text = await clonedResult.text();
-          console.log("Body: ", text);
+        if (DBG0) {
+          const clonedResult = result.clone();
+          console.log("Got response from ourselves: ", clonedResult);
+          console.log("Content type: ", clonedResult.headers.get('content-type'));
+          // if it's a text type, including json, print it as text
+          if (clonedResult.headers.get('content-type')?.includes('text') || clonedResult.headers.get('content-type')?.includes('json')) {
+            const text = await clonedResult.text();
+            console.log("Body: ", text);
+          }
+          // if it's binary, let's print out first 100 bytes in hexadecimals
+          if (clonedResult.headers.get('content-type')?.includes('application/octet-stream')) {
+            const buffer = await clonedResult.arrayBuffer();
+            const hex = Array.from(new Uint8Array(buffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+            console.log("Body (hex): ", hex.slice(0, 200) + "...");
+            console.log(SEP, "Payload: \n", extractPayload(buffer).payload, SEP);
+          }
         }
-        // if it's binary, let's print out first 100 bytes in hexadecimals
-        if (clonedResult.headers.get('content-type')?.includes('application/octet-stream')) {
-          const buffer = await clonedResult.arrayBuffer();
-          const hex = Array.from(new Uint8Array(buffer)).map(b => b.toString(16).padStart(2, '0')).join('');
-          console.log("Body (hex): ", hex.slice(0, 200) + "...");
-          console.log(SEP, "Payload: \n", extractPayload(buffer).payload, SEP)
-        }
-
         return result;
       }
-      // ToDo: confirm it's to the storage server
-      if (env.IS_LOCAL) {
-        console.log(SEP, "Running LOCAL. We just relay the fetch ('development'):\n", input, SEP)
+      if (env.IS_LOCAL || env.ENVIRONMENT === 'development') {
+        if (DBG0) console.log(SEP, "Running LOCAL. We just relay the fetch ('development'):\n", input, SEP)
         return fetch(input, init);
       } else {
-        console.log(SEP, "Deployed. We redirect storage API calls to service binding:\n", input, SEP)
+        if (DBG0) console.log(SEP, "Deployed. We redirect storage API calls to service binding:\n", input, SEP)
         const response = await storageServerBinding.fetch(input, init);
-        console.log("Got response from storage server (NON LOCAL): ", response);
+        if (DBG0) console.log("Got response from storage server (NON LOCAL): ", response);
         return response;
       }
     };
   }
-
-  // for testing - WORKS!
-  // async getStorageServerInfo(env: EnvType): Promise<any> {
-  //   if (!storageFetchFunction) storageFetchFunction = this.createCustomFetch(env);
-  //   if (!storageServerBinding) storageServerBinding = env.STORAGE_SERVER_BINDING
-  //   // const response = await env.STORAGE_SERVER_BINDING.fetch(env.STORAGE_SERVER_NAME + "/info")
-  //   console.log("Getting storage server info")
-  //   try {
-  //     const sb = new Snackabra("<CHANNEL_SERVER_REDIRECT>", { sbFetch: storageFetchFunction })
-  //     const storageServer = await sb.storage.getStorageServer()
-  //     console.log("Got response from storage server: ", storageServer)
-  //     return storageServer
-  //   } catch (error: any) {
-  //     console.error("ERROR: failed to get storage server info: ", error)
-  //     return ({ error: error.message })
-  //   }
-  // }
-
-  // // for testing - WORKS!
-  // async storeRandomBuffer(env: EnvType): Promise<SBObjectHandle | void> {
-  //   if (!storageFetchFunction) storageFetchFunction = this.createCustomFetch(env);
-  //   if (!storageServerBinding) storageServerBinding = env.STORAGE_SERVER_BINDING
-  //   // const response = await env.STORAGE_SERVER_BINDING.fetch(env.STORAGE_SERVER_NAME + "/info")
-  //   console.log("Getting storage server info")
-  //   try {
-  //     const sb = new Snackabra("<CHANNEL_SERVER_REDIRECT>", { sbFetch: storageFetchFunction, DEBUG: true })
-
-  //     const testSize = 63 * 1024
-  //     const token = this.#generateStorageToken(testSize) // note: we do *not* charge for this
-  //     await this.env.LEDGER_NAMESPACE.put(token.hash, JSON.stringify(token))
-  //     const testBlock = crypto.getRandomValues(new Uint8Array(testSize))
-  //     const shardHandle = await sb.storage.storeData(testBlock, token)
-
-  //     await shardHandle.verification
-  //     console.log('\n', SEP, "Reply from 'SB.storage.storeData()': \n", shardHandle, '\n', SEP)
-
-  //     return shardHandle
-  //   } catch (error: any) {
-  //     console.error("ERROR: failed to get storage server info: ", error)
-  //   }
-  // }
-
-  // // for testing - WORKS!  (this is just with KEYS)
-  // async storeMessageCache(env: EnvType): Promise<SBObjectHandle | void> {
-  //   if (!storageFetchFunction) storageFetchFunction = this.createCustomFetch(env);
-  //   if (!storageServerBinding) storageServerBinding = env.STORAGE_SERVER_BINDING
-  //   try {
-  //     const sb = new Snackabra("<CHANNEL_SERVER_REDIRECT>", { sbFetch: storageFetchFunction, DEBUG: true })
-
-  //     const cache = assemblePayload(this.messageKeysCache)
-  //     const token = this.#generateStorageToken(cache!.byteLength)
-  //     await this.env.LEDGER_NAMESPACE.put(token.hash, JSON.stringify(token))
-  //     const shardHandle = await sb.storage.storeData(cache, token)
-
-  //     await shardHandle.verification
-  //     console.log('\n', SEP, "Reply from 'SB.storage.storeData()': \n", shardHandle, '\n', SEP)
-
-  //     return shardHandle
-  //   } catch (error: any) {
-  //     console.error("ERROR: failed to get storage server info: ", error)
-  //   }
-  // }
-
-  // // for testing - THIS ALSO WORKED, and is immediate basis for messageCacheToHistoryEntry()
-  // async storeMessageCache(env: EnvType): Promise<SBObjectHandle> {
-  //   if (!storageFetchFunction) storageFetchFunction = this.createCustomFetch(env);
-  //   if (!storageServerBinding) storageServerBinding = env.STORAGE_SERVER_BINDING
-  //   try {
-  //     const sb = new Snackabra("<CHANNEL_SERVER_REDIRECT>", { sbFetch: storageFetchFunction, DEBUG: env.DEBUG_ON })
-
-  //     // const messageHistory = new Map<string, ArrayBuffer>();
-  //     // const keys = this.messageKeysCache;
-  //     // const getOptions: DurableObjectGetOptions = { allowConcurrency: true };
-  //     // let remainingKeys = keys.length;
-
-  //     // while (keys.length > 0) {
-  //     //   const batchKeys = keys.splice(-100);
-  //     //   const results = await this.storage.get(batchKeys, getOptions);
-  //     //   for (const [key, { value }] of Object.entries(results)) {
-  //     //     if (value) messageHistory.set(key, value);
-  //     //     remainingKeys--;
-  //     //   }
-  //     // }
-
-  //     const messageHistory = new Map<string, ArrayBuffer>();
-
-  //     // const keys = [...this.messageKeysCache]; // Clone to avoid mutating the original array
-  //     const keysMap = await this.#_getMessageKeys('0')
-  //     // turn the keys into an array
-  //     const keys = Array.from(keysMap.keys())
-
-  //     console.log("0000 0000 [storeMessageCache] Got keys: ", keys)
-
-  //     const getOptions: DurableObjectGetOptions = { allowConcurrency: true };
-
-  //     let lowestFrom = Channel.LOWEST_TIMESTAMP
-  //     let highestTo = Channel.HIGHEST_TIMESTAMP
-  //     while (keys.length > 0) {
-  //       // '100' is max number of values we can get in one go from CF storage
-  //       const batchKeys = keys.splice(0, 100);
-  //       const results: Map<string, ArrayBuffer> = await this.storage.get(batchKeys, getOptions)
-  //       if (results instanceof Map) {
-  //         for (const [key, value] of results) {
-  //           if (value) {
-  //             messageHistory.set(key, value);
-  //             if (key > lowestFrom) lowestFrom = key
-  //             if (key < highestTo) highestTo = key
-  //           }
-  //         }
-  //       } else {
-  //         throw new SBError("Unexpected result format from storage.get, fatal (Internal Error L1407)");
-  //       }
-  //     }
-
-  //     console.log("1111 1111 [storeMessageCache] Got messageHistory: ", messageHistory)
-
-  //     const messageHistoryPayload = assemblePayload(messageHistory)!
-  //     const token = this.#generateStorageToken(messageHistoryPayload.byteLength);
-
-  //     await this.env.LEDGER_NAMESPACE.put(token.hash, JSON.stringify(token))
-
-  //     console.log("2222 2222 [storeMessageCache] About to store with payload")
-
-  //     // const shardHandle = await sb.storage.storeData(messageHistoryPayload, token)
-  //     const shardHandle = await sb.storage.storeData(messageHistory, token)
-
-  //     console.log("3333 3333 [storeMessageCache] Got handle in return:\n", shardHandle)
-
-  //     await shardHandle.verification
-  //     console.log('\n', SEP, "Reply from 'SB.storage.storeData()': \n", shardHandle, '\n', SEP)
-
-  //     this.historyShard = shardHandle
-
-  //     return shardHandle
-  //   } catch (error: any) {
-  //     console.error("ERROR: failed to get storage server info: ", error)
-  //   }
-  // }
-
-
 
   /**
    * Store data in the storage server. Returns cleaned-up handle / compacted handle.
@@ -1961,104 +1696,9 @@ export class ChannelServer implements DurableObject {
     }    
   }
 
-  // async messageCacheToHistoryEntry(_env: EnvType): Promise<MessageHistory> {
-  //   _sb_assert(MESSAGE_HISTORY, "MESSAGE_HISTORY not set, fatal")
-  //   _sb_assert(this.messageHistory, "ERROR: ChannelHistory object not set, fatal")
-  //   // if (!storageFetchFunction) storageFetchFunction = this.createCustomFetch(env);
-  //   // if (!storageServerBinding) storageServerBinding = env.STORAGE_SERVER_BINDING
-  //   try {
-  //     // const sb = new Snackabra("<CHANNEL_SERVER_REDIRECT>", { sbFetch: storageFetchFunction, DEBUG: env.DEBUG_ON })
-  //     const messageHistory = new Map<string, ChannelMessage>();
-  //     const keysMap = await this.#_getMessageKeys('0', false) // get everything; don't cache
-  //     const keys = Array.from(keysMap.keys())
-  //     console.log("0000 0000 [storeMessageCache] Got keys: ", keys)
-  //     const getOptions: DurableObjectGetOptions = { allowConcurrency: true };
-  //     let lowestFrom = Channel.HIGHEST_TIMESTAMP
-  //     let highestTo = Channel.LOWEST_TIMESTAMP
-  //     let totalMessageSize = 0
-  //     while (keys.length > 0) {
-  //       // '100' is max number of values we can get in a single go from CF storage
-  //       const batchKeys = keys.splice(0, 100);
-  //       // we fetch from local, and delete from same. this operation doesn't touch global replica.
-  //       const results: Map<string, ArrayBuffer> = await this.storage.get(batchKeys, getOptions)
-  //       if (results instanceof Map) {
-  //         for (const [key, value] of results) {
-  //           if (value) {
-  //             totalMessageSize += value.byteLength
-  //             const msg = extractPayload(value).payload as ChannelMessage
-  //             if (!msg) throw new SBError("Failed to extract payload from message (Internal Error L1887)")
-  //             if (msg.ttl && msg.ttl !== 0xF)
-  //               continue // skip any ephemeral messages
-  //             const { channelId, i2, timestamp } = Channel.deComposeMessageKey(key)
-  //             if (channelId != this.channelId) throw new SBError("ERROR: channelId mismatch (Internal Error L1898)")
-  //             if (i2 !== '____')
-  //               continue; // skipping subchannels by default; ToDo: separate API for owner history?
-  //             if (timestamp < lowestFrom) lowestFrom = timestamp
-  //             if (timestamp > highestTo) highestTo = timestamp
-  //             // messageHistory.set(key, value); // update: package extracted messages
-  //             messageHistory.set(key, msg);
-  //           }
-  //         }
-  //       } else {
-  //         throw new SBError("Unexpected result format from storage.get, fatal (Internal Error L1407)");
-  //       }
-  //     }
-  //     // let lastModified, created = lastModified = Date.now();
-
-  //     console.log("2222 2222 [storeMessageCache] About to store with payload")
-  //     const historyEntry: MessageHistory = {
-  //       version: '20240601.0',
-  //       channelId: this.channelId!,
-  //       ownerPublicKey: this.channelData!.ownerPublicKey,
-  //       created: Date.now(),
-  //       from: lowestFrom,
-  //       to: highestTo,
-  //       count: messageHistory.size,
-  //       size: totalMessageSize,
-  //       shard: await this.storeData(messageHistory),
-  //     }
-  //     console.log("1111 1111 [storeMessageCache] Created new history entry: ", historyEntry)
-  //     this.messageHistory!.insertValue(historyEntry, lowestFrom, highestTo)
-
-  //     // console.log("2222 2222 [storeMessageCache] About to store with payload")
-  //     // const shardHandle = await sb.storage.storeData(messageEntryPayload, token)
-  //     // console.log("3333 3333 [storeMessageCache] Got handle in return:\n", shardHandle)
-  //     // await shardHandle.verification
-  //     // console.log('\n', SEP, "Reply from 'SB.storage.storeData()': \n", shardHandle, '\n', SEP)
-  //     // const historyDirectory: MessageHistoryDirectory = {
-  //     //   ...historyEntry,
-  //     //   depth: 0, // indicates all entries (in this case just the one) are shards of message maps
-  //     //   type: 'directory',
-  //     //   lastModified: lastModified,
-  //     //   shards: new Map<string, SBObjectHandle>().set(lowestFrom, shardHandle),
-  //     // }
-  //     // //@ts-ignore
-  //     // delete historyDirectory.messages // hack to work around TS type limitations
-
-  //     return historyEntry
-  //   } catch (error: any) {
-  //     throw new SBError("ERROR: failed to get storage server info: " + error)
-  //   }
-  // }
-
   async #getHistory(request: Request, _apiBody: ChannelApiBody) {
     _sb_assert(MESSAGE_HISTORY, "MESSAGE_HISTORY not set, fatal")
-
     return returnResult(request, this.messageHistory ? this.messageHistory.export() : {})
-
-    // const testInfo = await this.getStorageServerInfo(this.env)
-    // console.log("Got storage server info: ", testInfo)
-    // return returnResult(request, { storageInfo: testInfo, greeting: 'hello from /getHistory' })
-    // const shardHandle = await this.storeRandomBuffer(this.env)
-
-    // const shardHandle = await this.storeMessageCache(this.env)
-    // if (!shardHandle) return returnError(request, "Failed to store random buffer", 400)
-
-    // // return returnResult(request, { shardHandle: await stringify_SBObjectHandle(shardHandle), greeting: 'hello from /getHistory' })
-
-    // return returnResult(request, { shardHandle: shardHandle, greeting: 'hello from /getHistory' })
-
-    // return returnResult(request, this.messageHistory || { type: 'directory', number: -1 })
   }
 
   // return messages matching set of keys
@@ -2187,7 +1827,7 @@ export class ChannelServer implements DurableObject {
       size = this.#roundSize(size) || 0;
     size = Math.ceil(size);
     if (!size || !Number.isInteger(size) || size <= 0) {
-      console.log("Problem with size:\n", size)
+      if (dbg.LOG_ERRORS) console.log("Problem with size:\n", size)
       if (DBG0 || dbg.LOG_ERRORS) console.trace(SEP, `[consumeStorage] invalid size:\n`, size, SEP)
       throw new SBError("'size' missing in API call or internally, or zero, or can't parse")
     }
@@ -2257,42 +1897,6 @@ export class ChannelServer implements DurableObject {
     // ToDo: per-user storage boundaries
     return returnResultJson(request, { storageLimit: this.storageLimit });
   }
-
-  // /*
-  //   Transfer storage budget to another channel. Note that this request enters
-  //   the server as 'budd': if the accessed channel does not exist, it is treated
-  //   as this.#create(), otherwise it's treated as this.#deposit().
-  // */
-  // async #deposit(request: Request, apiBody: ChannelApiBody): Promise<Response> {
-  //   _sb_assert(apiBody.apiPayload, "[budd] needs parameters")
-  //   var { targetChannel, transferBudget } = apiBody.apiPayload
-  //   if (!targetChannel) return returnError(request, "[budd] targetChannel missing in API call")
-  //   if (!transferBudget) transferBudget = Infinity // default
-  //   try {
-  //     targetChannel = validate_SBChannelData(apiBody.apiPayload) // will throw if anything wrong
-  //     if (!targetChannel.storageToken) return returnError(request, "[budd] storageToken missing in API call")
-  //     // note that if present, it's already been validated
-  //   } catch (error: any) {
-  //     return returnError(request, "[budd] unable to parse channelData payload", 400);
-  //   }
-  //   if (dbg.DEBUG) console.log("++++ deposit() from token: channelData:\n====\n", targetChannel, "\n", "====")
-
-  //   if (this.channelId === targetChannel) return returnResult(request, this.channelData)
-
-  //   // performing removal of budget - first deduct then kick off creation
-  //   const newStorageLimit = this.storageLimit - transferBudget;
-  //   this.storageLimit = newStorageLimit;
-  //   await this.storage.put('storageLimit', newStorageLimit);
-  //   if (dbg.DEBUG) console.log(`[budd()]: Removed ${transferBudget} bytes from ${this.channelId!.slice(0, 12)}... and forwarding to ${targetChannel.slice(0, 12)}... (new mother storage limit: ${newStorageLimit} bytes)`);
-  //   // we block on ledger since this will be verified
-  //   await this.env.LEDGER_NAMESPACE.put(targetChannel, JSON.stringify({ mother: this.channelId, size: transferBudget }));
-  //   if (dbg.DEBUG) console.log('++++ putting budget in ledger ... reading back:', await this.env.LEDGER_NAMESPACE.get(targetChannel))
-
-  //   // note that if the next operation fails, the ledger entry for the transfer is still there for possible recovery
-  //   return callDurableObject(targetChannel, ['uploadChannel'], newRequest, this.env)
-
-  //   // return callDurableObject(targetChannel, [ `budd?targetChannel=${targetChannel}&transferBudget=${size}&serverSecret=${_secret}` ], request, this.env);
-  // }
 
   #_getAdminData(): ChannelAdminData {
     const adminData: ChannelAdminData = {
@@ -2365,8 +1969,7 @@ export class ChannelServer implements DurableObject {
       }
       return await fetch(this.webNotificationServer, options)
     } catch (err) {
-      console.log(err)
-      console.log("Error sending web notification")
+      if (dbg.LOG_ERRORS) console.log("Error sending web notification", err)
       return err
     }
   }

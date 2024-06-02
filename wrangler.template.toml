@@ -48,11 +48,14 @@ binding = "STORAGE_SERVER_BINDING"
 service = "s"
 
 [vars]
+# note: '.dev.vars' (if present) will override these
 VERSION="..."
 ENVIRONMENT="development"
 STORAGE_SERVER_NAME="storage"
 LOG_ERRORS=true
-DEBUG_ON=false # low-noise debug output
+# it's recommended to set 'DEBUG_LEVEL-1' in '.dev.vars' to avoid mistakenly
+# deploying, even to staging or preview servers
+DEBUG_LEVEL_1=false # low-noise debug output
 VERBOSE_ON=false # noisier
 
 # ToDo: separate for dev and prod?
@@ -63,6 +66,6 @@ VERSION="..."
 ENVIRONMENT="production"
 STORAGE_SERVER_NAME="s"
 LOG_ERRORS=true
-DEBUG_ON=false
+DEBUG_LEVEL_1=false
 VERBOSE_ON=false
 WEB_NOTIFICATION_SERVER = "..."

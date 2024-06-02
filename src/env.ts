@@ -7,7 +7,7 @@ export type EnvType = {
   PAGES_NAMESPACE: KVNamespace, // used for Pages, also accessible by storage server
   KEYS_NAMESPACE: KVNamespace,
   STORAGE_SERVER_NAME: string,
-  DEBUG_ON: boolean,
+  DEBUG_LEVEL_1: boolean,
   VERBOSE_ON: boolean,
   LOG_ERRORS: boolean,
   notifications: Fetcher,
