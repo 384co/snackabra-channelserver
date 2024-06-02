@@ -10,7 +10,7 @@
   "scripts": {
     "dev": "wrangler dev --port 3845",
     "start": "wrangler dev --port 3845",
-    "monitor" : "npx tsx wrangler_monitor.ts",
+    "monitor": "npx tsx wrangler_monitor.ts",
     "tail": "wrangler tail",
     "deploy": "wrangler deploy",
     "deploy:prod": "wrangler deploy --env production"
@@ -24,7 +24,7 @@
     "typescript": "^5.3.3",
     "webpack": "^5.90.3",
     "worker-loader": "^3.0.8",
-    "wrangler": "^3.36.0"
+    "wrangler": "^3.57.0"
   },
   "dependencies": {
     "strip-ansi": "^7.1.0"

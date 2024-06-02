@@ -97,6 +97,10 @@ export var dbg = {
 
 const _STORAGE_SIZE_UNIT = 4096 // 4KB
 
+import {
+    DeepHistory
+ } from 'snackabra'
+
 export const serverConstants = {
     // minimum unt of storage
     STORAGE_SIZE_UNIT: _STORAGE_SIZE_UNIT,
@@ -123,8 +127,11 @@ export const serverConstants = {
 
     // maximum number of (perma) messages kept in KV format; beyond this,
     // messages are shardified. note that current CF hard limit is 1000.
-    MAX_MESSAGE_SET_SIZE: 512, // should be around half of 1000, to give headroom
-    MESSAGE_HISTORY_BRANCH_FACTOR: 32, // per-node branching factor
+    // production around half of 1000 (eg 512), testing set to 12
+    MAX_MESSAGE_SET_SIZE: DeepHistory.MAX_MESSAGE_SET_SIZE,
+
+    // in testing this will be low value such as 4.  production is 32.
+    MESSAGE_HISTORY_BRANCH_FACTOR: DeepHistory.MESSAGE_HISTORY_BRANCH_FACTOR, // for testing XXX
 }
 
 // used by both storage and channel servers to create 'key' into IMAGES KV
@@ -224,11 +231,20 @@ export type ResponseCode = 101 | 200 | 400 | 401 | 403 | 404 | 405 | 413 | 418 |
 const SEP = '='.repeat(60) + '\n'
 
 function _headers(_request: Request, contentType: string | null, immutable: boolean = false): HeadersInit {
+    // let corsHeaders: HeadersInit = {
+    //     "Access-Control-Allow-Methods": "POST, OPTIONS, GET",
+    //     "Access-Control-Allow-Headers": "Content-Type, authorization, Access-Control-Request-Headers",
+    //     "Access-Control-Allow-Credentials": "true",
+    //     "Access-Control-Allow-Origin": "*",
+    //     "Cross-Origin-Resource-Policy": "cross-origin",
+    // };
+    // switching to max permissiveness, sb/os384 servers are essentially global
     let corsHeaders: HeadersInit = {
-        "Access-Control-Allow-Methods": "POST, OPTIONS, GET",
-        "Access-Control-Allow-Headers": "Content-Type, authorization",
-        "Access-Control-Allow-Credentials": "true",
-        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Origin": "*", // Allow all origins
+        "Access-Control-Allow-Methods": "*", // Allow all methods
+        "Access-Control-Allow-Headers": "*", // Allow all headers
+        "Access-Control-Allow-Credentials": "true", // Allow credentials
+        "Cross-Origin-Resource-Policy": "cross-origin" // Allow cross-origin resource sharing
     };
     if (contentType)
         corsHeaders = { ...corsHeaders, "Content-Type": contentType };

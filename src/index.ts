@@ -23,7 +23,7 @@
 */
 
 // this feature is under development
-const MESSAGE_HISTORY = false;
+const MESSAGE_HISTORY = true;
 
 import {
   Channel,
@@ -36,7 +36,7 @@ import {
   SBError,
   Snackabra, // stringify_SBObjectHandle,
   // arrayBufferToBase64url,
-  MessageHistoryEntry, MessageHistoryDirectory,
+  DeepHistory, MessageHistory, HistoryTree, stringify_SBObjectHandle, Freezable
 } from 'snackabra';
 
 import type { SBChannelId, ChannelAdminData, SBUserId, SBChannelData, ChannelApiBody, SBObjectHandle } from 'snackabra';
@@ -63,7 +63,7 @@ const SEPx = '='.repeat(76)
 const SEP = '\n' + SEPx + '\n'
 const SEPxStar = '\n' + '*'.repeat(76) + '\n'
 
-const DBG0 = true; // set to true to enable specific debug output
+const DBG0 = true; // set to true to enable specific debug output (not production) XXX
 
 // called on all 'entry points' to set the debug level
 function setServerDebugLevel(env: EnvType) {
@@ -219,10 +219,12 @@ function serverInfo(request: Request, env: EnvType) {
     return { success: false, error: msg }
   }
   var retVal = {
+    success: true,
     version: env.VERSION,
     channelServer: url.hostname,
     storageServer: storageUrl,
     jslibVersion: Snackabra.version,
+    maxMessageSetSize: serverConstants.MAX_MESSAGE_SET_SIZE,
 
     // ... we would have to go to DO for this info, and we don't want to
     // apiEndpoints: {
@@ -277,6 +279,7 @@ interface PageMetaData {
 
 let storageFetchFunction: ((input: RequestInfo | URL, init?: RequestInit) => Promise<Response>) | null = null;
 let storageServerBinding: any = null;
+let mySB: Snackabra | null = null;
 
 
 // in a comment section, list the most common MIME types on the Internet
@@ -432,6 +435,17 @@ export class TTL0BufferClass {
 }
 
 
+class ChannelHistory extends HistoryTree<MessageHistory, SBObjectHandle, string> {
+  constructor(data: any, public storeData: (data: any) => Promise<SBObjectHandle>) {
+      super(DeepHistory.MESSAGE_HISTORY_BRANCH_FACTOR, data);
+  }
+  async freeze(data: Freezable<MessageHistory, SBObjectHandle>): Promise<SBObjectHandle> {
+      return this.storeData(data)
+  }
+  async deFrost(_handle: SBObjectHandle): Promise<Freezable<MessageHistory, SBObjectHandle>> {
+    throw new Error("ChanneHistory: deFrost should not be needed (write-only mode). Internal Error (L451)");
+  }
+}
 
 
 /**
@@ -457,9 +471,13 @@ export class ChannelServer implements DurableObject {
   /* 'accepted'            */ accepted: Set<SBUserId> = new Set();
   /* ----- these track message history         ----- */
   /* 'messageCount'        */ messageCount: number = 0;        // total non-ephemeral messages in DO KV
-  /* 'allMessagesCount'    */ allMessageCount: number = 0;     // total number of all messages
+  /* 'allMessageCount'    */ allMessageCount: number = 0;     // total number of all messages
   /* 'newMessageCount'     */ newMessageCount: number = 0;     // the subset of 'messageCount' that has not been shardified  
-  /* 'messageHistory'      */ messageHistory: MessageHistoryDirectory | null = null;
+  /* 'messageSize'         */ messageSize: number = 0;         // size of ditto (size of all messages not yet shardified/archived)
+  
+  /* 'messageHistory'      */ // messageHistory: MessageHistoryDirectory | null = null;
+  /* 'messageHistory'      */ messageHistory: HistoryTree<MessageHistory, SBObjectHandle, string> | null = null;
+                              deepHistoryWritebackLock: boolean = false; // 'LOCK' for deephistory work
 
   /* the rest are for run time and are not backed up as such to KVs  */
   visitorKeys: Map<SBUserId, SB384> = new Map();    // convenience caching of SB384 objects for any visitors
@@ -733,6 +751,7 @@ export class ChannelServer implements DurableObject {
           'visitors',
           'locked',
           'messageCount',
+          'messageSize',
           'allMessageCount',
           'newMessageCount',
           'messageHistory',
@@ -761,11 +780,12 @@ export class ChannelServer implements DurableObject {
       this.channelData = channelData
 
       this.messageCount = Number(channelState.get('messageCount')) || 0
+      this.messageSize = Number(channelState.get('messageSize')) || 0
       this.allMessageCount = Number(channelState.get('allMessageCount')) || 0
 
       const latestVisitors = channelState.get('visitors')
       if (latestVisitors && latestVisitors instanceof ArrayBuffer) {
-        this.visitors = extractPayload(latestVisitors as ArrayBuffer).payload as Map<SBUserId, SBUserPublicKey>
+        this.visitors = extractPayload(latestVisitors).payload as Map<SBUserId, SBUserPublicKey>
         // now we bootstrap the visitorKeys cache
         for (const [userId, userPublicKey] of this.visitors)
           this.visitorKeys.set(userId, await (new SB384(userPublicKey).ready))      
@@ -776,12 +796,17 @@ export class ChannelServer implements DurableObject {
       if (dbg.DEBUG) console.log("Fetched visitors for channel: ", this.visitors)
 
       this.newMessageCount = Number(channelState.get('newMessageCount')) || 0
+
       const oldMessageHistory = channelState.get('messageHistory')
-      if (oldMessageHistory) {
-        this.messageHistory = extractPayload(oldMessageHistory as ArrayBuffer).payload as MessageHistoryDirectory
+      if (oldMessageHistory && oldMessageHistory instanceof ArrayBuffer) {
+        // this.messageHistory = extractPayload(oldMessageHistory as ArrayBuffer).payload as MessageHistoryDirectory
+        const h = extractPayload(oldMessageHistory).payload
+        if (DBG0) console.log(SEP, "Loaded MessageHistory:\n", h, SEP)
+        this.messageHistory = new ChannelHistory(h, this.storeData.bind(this))
       } else {
-        this.messageHistory = null
+        this.messageHistory = new ChannelHistory(undefined, this.storeData.bind(this))
       }
+      if (DBG0) console.log(SEP, "this.messageHistory:\n", this.messageHistory, SEP)
 
       // const oldTTL0Buffer = channelState.get('ttl0Buffer')
       // if (oldTTL0Buffer)
@@ -991,43 +1016,115 @@ export class ChannelServer implements DurableObject {
   //   this.messageKeysCacheMap.set(newKey, this.messageKeysCache.length - 1);
   // }
 
-  async #incrementMessageCount(perma: boolean): Promise<void> {
-    this.messageCount++;
-    if (perma) this.allMessageCount++;
-    this.newMessageCount++;
+  async #incrementMessageCount(perma: boolean, messageSize: number): Promise<void> {
 
-    await this.storage.put('messageCount', this.messageCount.toString())
-    await this.storage.put('allMessageCount', this.allMessageCount.toString())
-    await this.storage.put('newMessageCount', this.newMessageCount.toString()) // in case of interruption
+    // log and writeback core stats
+    this.messageCount++;               // reminder: all messages
+    const writebackPromises = [this.storage.put('messageCount', this.messageCount.toString())]
+    if (perma) {
+      this.allMessageCount++;          // non-ephemeral messages
+      this.newMessageCount++;          // non-ephemeral messages not yet shardified
+      this.messageSize += messageSize  // size of ditto
+      writebackPromises.push(
+        this.storage.put('messageSize', this.messageSize.toString()),
+        this.storage.put('allMessageCount', this.allMessageCount.toString()),
+        this.storage.put('newMessageCount', this.newMessageCount.toString()) // in case of interruption
+      )
+    }
+    await Promise.all(writebackPromises)
+    writebackPromises.length = 0
 
+    // update our hibernation state
     this.state.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', Channel.timestampToBase4String(this.latestTimestamp)))
 
     // if we are over our preferred limit, we initiate shardification
-    if (MESSAGE_HISTORY && this.newMessageCount >= serverConstants.MAX_MESSAGE_SET_SIZE) {
-      if (dbg.DEBUG) console.log(`---- initiating shardification .. we have ${this.messageCount} messages`)
-      const newHistory = await this.messageCacheToHistoryEntry(this.env)
-      // ToDo: add support for depth greater than '0', eg directories of directories etc
-      _sb_assert(newHistory && newHistory.depth === 0 && this.messageHistory && this.messageHistory.depth === 0, "Internal Error (L729)")
-      if (this.messageHistory) {
-        // we have history already, so, we merge the directories
-        // ToDo: test this some more
-        if (newHistory.shards) {
-          if (!this.messageHistory.shards) this.messageHistory.shards = new Map()
-          this.messageHistory.shards.set(newHistory.from, newHistory.shards.get(newHistory.from)!)
+    if (MESSAGE_HISTORY && perma && !this.deepHistoryWritebackLock &&
+      (this.newMessageCount >= DeepHistory.MAX_MESSAGE_SET_SIZE || this.messageSize >= DeepHistory.MAX_MESSAGE_HISTORY_SHARD_SIZE)
+    ) {
+      this.deepHistoryWritebackLock = true; // LOCK out other writebacks (before any async operations)
+      if (DBG0 || dbg.DEBUG) console.log(`---- initiating shardification .. we have ${this.newMessageCount} messages`)
+      _sb_assert(MESSAGE_HISTORY, "MESSAGE_HISTORY not set, fatal")
+      if (!this.messageHistory) throw new SBError("ERROR: messageHistory not set, fatal (Internal Error L1046)")
+      try {
+
+        console.log("1111 1111 [DeepHistory] We have overflow, initiating shardification ..")
+        const messageHistory = new Map<string, ChannelMessage>();
+        const keysMap = await this.#_getMessageKeys('0', false) // get everything; don't cache
+        const keys = Array.from(keysMap.keys())
+        console.log("0000 0000 [storeMessageCache] Got keys: ", keys)
+        const getOptions: DurableObjectGetOptions = { allowConcurrency: true };
+        let lowestFrom = Channel.HIGHEST_TIMESTAMP
+        let highestTo = Channel.LOWEST_TIMESTAMP
+        let totalMessageSize = 0
+        while (keys.length > 0) {
+          // '100' is max number of values we can get in a single go from CF storage
+          const batchKeys = keys.splice(0, 100);
+          // we fetch from local, and delete from same. this operation doesn't touch global replica.
+          const results: Map<string, ArrayBuffer> = await this.storage.get(batchKeys, getOptions)
+          if (!(results instanceof Map)) throw new SBError("Unexpected result format from storage.get, fatal (Internal Error L1396)");
+          for (const [key, value] of results) {
+            if (value) {
+              totalMessageSize += value.byteLength
+              const msg = extractPayload(value).payload as ChannelMessage
+              if (!msg) throw new SBError("Failed to extract payload from message (Internal Error L1887)")
+              if (msg.ttl && msg.ttl !== 0xF)
+                continue // skip any ephemeral messages
+              const { channelId, i2, timestamp } = Channel.deComposeMessageKey(key)
+              if (channelId != this.channelId) throw new SBError("ERROR: channelId mismatch (Internal Error L1898)")
+              if (i2 !== '____')
+                continue; // skipping subchannels by default; ToDo: separate API for owner history?
+              if (timestamp < lowestFrom) lowestFrom = timestamp
+              if (timestamp > highestTo) highestTo = timestamp
+              messageHistory.set(key, msg);
+            }
+          }
         }
-        this.messageHistory.to = newHistory.to
-        this.messageHistory.count += newHistory.count
-        this.messageHistory.lastModified = newHistory.lastModified
-        await this.storage.put('messageHistory', assemblePayload(this.messageHistory))
-        if (dbg.DEBUG) console.log("---- merged (and stored) updated messageHistory:", this.messageHistory)
-      } else {
-        this.messageHistory = newHistory
-        await this.storage.put('messageHistory', assemblePayload(newHistory))
-        if (dbg.DEBUG) console.log("---- created (and stored) new message history:", newHistory)
+  
+        console.log(SEP, "2222 2222 [DeepHistory] About to store with payload")
+        const historyEntry: MessageHistory = {
+          version: '20240601.0',
+          channelId: this.channelId!,
+          ownerPublicKey: this.channelData!.ownerPublicKey,
+          created: Date.now(),
+          from: lowestFrom,
+          to: highestTo,
+          count: messageHistory.size,
+          size: totalMessageSize,
+          shard: await this.storeData(messageHistory),
+        }
+        await this.messageHistory.insertValue(historyEntry, lowestFrom, highestTo)
+
+        const newHistoryContents = this.messageHistory.export()
+        console.log(SEP, "3333 3333 [DeepHistory] Message history should be up to date:\n", SEP, newHistoryContents, SEP)
+
+        // we await this separately from counters below
+        const newHistoryContentsBuf = assemblePayload(newHistoryContents)
+        await this.storage.put('messageHistory', newHistoryContentsBuf)
+
+        // we also add the history entry to the GLOBAL message KV
+        const i2Key = Channel.composeMessageKey(this.channelId!, Channel.base4StringToTimestamp(lowestFrom), '_H__')
+        await this.env.MESSAGES_NAMESPACE.put(i2Key, newHistoryContentsBuf!);
+
+        console.log(SEP, "4444 4444 [DeepHistory] Deleting old messages from local storage", SEP)
+        const keysToDelete = Array.from(messageHistory.keys())
+        while (keysToDelete.length > 0) {
+          const batchKeys = keysToDelete.splice(0, 128); // 128 is max number of keys we can delete in a single go
+          await this.storage.delete(batchKeys)
+        }
+
+        console.log(SEP, "5555 5555 [DeepHistory] Updating history done, cleaning up", SEP)
+        // reset counter; we do this last, so if we're restarted during the above, should just pick it back up
+        this.newMessageCount = 0;
+        this.messageSize = 0;
+        await Promise.all([
+          this.storage.put('newMessageCount', this.newMessageCount.toString()),
+          this.storage.put('messageSize', this.messageSize.toString())
+        ])
+        this.deepHistoryWritebackLock = false; // UNLOCK
+
+      } catch (error: any) {
+        throw new SBError("ERROR: failed to get storage server info: " + error)
       }
-      // reset counter; we do this last, so if we're restarted during the above, should just pick it back up
-      this.newMessageCount = 0;
-      await this.storage.put('newMessageCount', this.newMessageCount.toString())
     }
   }
 
@@ -1119,7 +1216,7 @@ export class ChannelServer implements DurableObject {
         throw new Error(msg);
       }
 
-      if (message.i2 && !/* apiBody.*/ isOwner) {
+      if (message.i2 && !isOwner) {
         if (dbg.DEBUG) console.error("ERROR: non-owner message setting subchannel")
         throw new Error("Only Owner can set subchannel. Discarding message.");
       } else if (!message.i2) {
@@ -1175,15 +1272,16 @@ export class ChannelServer implements DurableObject {
         if (payloadAsMetaData.length <= 1000) { // some margin
           console.log(SEPx)
           // we're tracking this as 'fyi' for near future optimization
-          console.log(`[info] this message could be stored as metadata (size would be ${messagePayloadSize} chars)`)
+          console.log(`[info] this message could have been stored as metadata (size would be ${messagePayloadSize} chars)`)
           console.log(payloadAsMetaData.slice(0, 200) + "..." + payloadAsMetaData.slice(-50))
           console.log(SEPx)
         }
       }
 
-      // consume storage budget; 'TTL0' handling
+      // consume storage budget; includes 'TTL0' handling
       const multiplier = message.ttl === 0 ? CHANNEL_STORAGE_MULTIPLIER_TEMP : CHANNEL_STORAGE_MULTIPLIER_PERMA
       const spaceNeeded = messagePayloadSize * multiplier
+
       // if (spaceNeeded > this.storageLimit) {
       //   if (dbg.LOG_ERRORS) console.error(`ERROR: storage limit (${this.storageLimit}) exceeded, need ${spaceNeeded} bytes.`)
       //   throw new Error(`Storage limit exceeded. Message cannot be stored or broadcast. Discarding message. Storage amount needed: ${spaceNeeded} bytes.`);
@@ -1193,12 +1291,22 @@ export class ChannelServer implements DurableObject {
 
       await this.#consumeStorage(spaceNeeded, false); // don't need results
 
-      // todo: add per-user budget limits; also adjust down cost for TTL, especially '0'
+      // todo: add per-user budget limits
 
       // if (DBG0) console.log("Message so far:", message)
       if (message.ttl !== 0) {
+        //
+        // --- here is where messages are stored both in local (Durable Obj) and global KV
+        //     note that local (DO) copies are what are later fetched, and these are also
+        //     migrated to shards and cleared from DO. the global KV is NOT cleared by
+        //     this DO or any servers, but from offline admin management. related to this:
+        //     global KV will AUTOMATICALLY clear out based on TTL, local will not.
+        //
         await this.storage.put(key, messagePayload); // local storage
         await this.env.MESSAGES_NAMESPACE.put(key, messagePayload); // global storage
+        //
+        // ---
+        //
         if (i2Key) {
           // we don't block on these (messages with TTLs have slightly lower SLA)
           this.storage.put(i2Key, messagePayload);
@@ -1216,7 +1324,7 @@ export class ChannelServer implements DurableObject {
       this.ttl0Buffer.addMessage(key, messagePayload, message.t)
 
       // after broadcast, we update the message count
-      await this.#incrementMessageCount(!message.ttl || message.ttl === 0xF)
+      await this.#incrementMessageCount(!message.ttl || message.ttl === 0xF, messagePayload.byteLength)
     } catch (error: any) {
       if (dbg.LOG_ERRORS) console.error("ERROR: failed to process message", error)
       throw new SBError("Failed to process message: " + error.message)
@@ -1550,14 +1658,17 @@ export class ChannelServer implements DurableObject {
 
   timestampRegex = /^[0-3]*$/;
 
-  // gets as many keys as possible
-  async #_getMessageKeys(prefix: string) {
+  // get keys. if limit is not provided, then don't put a constraint on the CF API;
+  // note that actual limit is currently (2024.05) at 1000.  'cache' tells whether
+  // the callee expects these keys to be needed again / soon (inverse of noCache)
+  async #_getMessageKeys(prefix: string, cache: boolean, limit?: number ) {
     const listOptions: DurableObjectListOptions = {
-      limit: serverConstants.MAX_MESSAGE_SET_SIZE * 2, // we allow more, in case there's some racing 
       prefix: this.channelId! + '______' + prefix,
       reverse: true,
       allowConcurrency: true,
+      noCache: !cache,
     };
+    if (limit) listOptions.limit = limit;
     return await this.storage.list(listOptions)
   }
 
@@ -1587,12 +1698,13 @@ export class ChannelServer implements DurableObject {
     if (prefix && !this.timestampRegex.test(prefix))
       return returnError(request, "Invalid timestamp prefix (must be [0-3]*)", 400);
 
-    const listQuery = await this.#_getMessageKeys(prefix)
+    const listQuery = await this.#_getMessageKeys(prefix, true, serverConstants.MAX_MESSAGE_SET_SIZE * 2)
 
-    if (listQuery.size > serverConstants.MAX_MESSAGE_SET_SIZE) {
-      if (dbg.LOG_ERRORS) console.error("ERROR: message set too large")
-      return returnError(request, `Message set too large (current limit is ${serverConstants.MAX_MESSAGE_SET_SIZE}), awaiting launch of 'deep history' feature on channel histories.`, 400);
-    }
+    // update: the server specifically supports RETURNING up to 2x the limit
+    // if (listQuery.size > serverConstants.MAX_MESSAGE_SET_SIZE) {
+    //   if (dbg.LOG_ERRORS) console.error("ERROR: message set too large")
+    //   return returnError(request, `Message set too large (requested ${listQuery.size}, this server's limit is ${serverConstants.MAX_MESSAGE_SET_SIZE}).`, 400);
+    // }
 
     // // we check for any matches in ttl0 buffer
     // const ttl0Messages = this.ttl0Buffer.getMessageKeys(prefix)
@@ -1821,80 +1933,118 @@ export class ChannelServer implements DurableObject {
   //   }
   // }
 
+
+
   /**
-   * Takes current message cache, and constructs a history entry from it.
+   * Store data in the storage server. Returns cleaned-up handle / compacted handle.
    */
-  async messageCacheToHistoryEntry(env: EnvType): Promise<MessageHistoryDirectory> {
-    _sb_assert(MESSAGE_HISTORY, "MESSAGE_HISTORY not set, fatal")
-    if (!storageFetchFunction) storageFetchFunction = this.createCustomFetch(env);
-    if (!storageServerBinding) storageServerBinding = env.STORAGE_SERVER_BINDING
-    try {
-      const sb = new Snackabra("<CHANNEL_SERVER_REDIRECT>", { sbFetch: storageFetchFunction, DEBUG: env.DEBUG_ON })
-      const messageHistory = new Map<string, ArrayBuffer>();
-      const keysMap = await this.#_getMessageKeys('0')
-      const keys = Array.from(keysMap.keys())
-      console.log("0000 0000 [storeMessageCache] Got keys: ", keys)
-      const getOptions: DurableObjectGetOptions = { allowConcurrency: true };
-      let lowestFrom = Channel.LOWEST_TIMESTAMP
-      let highestTo = Channel.HIGHEST_TIMESTAMP
-      while (keys.length > 0) {
-        // '100' is max number of values we can get in one go from CF storage
-        const batchKeys = keys.splice(0, 100);
-        const results: Map<string, ArrayBuffer> = await this.storage.get(batchKeys, getOptions)
-        // global doesn't support fetchin with a batch of keys
-        // const results: Map<string, ArrayBuffer> = await this.env.MESSAGES_NAMESPACE.get(batchKeys, getOptions)
-        if (results instanceof Map) {
-          for (const [key, value] of results) {
-            if (value) {
-              messageHistory.set(key, value);
-              const { timestamp } = Channel.deComposeMessageKey(key)
-              if (timestamp > lowestFrom) lowestFrom = key
-              if (timestamp < highestTo) highestTo = key
-            }
-          }
-        } else {
-          throw new SBError("Unexpected result format from storage.get, fatal (Internal Error L1407)");
-        }
-      }
-      console.log("1111 1111 [storeMessageCache] Got messageHistory: ", messageHistory)
-      let lastModified, created = lastModified = Date.now();
-      const historyEntry: MessageHistoryEntry = {
-        type: 'entry',
-        version: '20240228001',
-        channelId: this.channelId!,
-        ownerPublicKey: this.channelData!.ownerPublicKey,
-        created: created,
-        from: lowestFrom,
-        to: highestTo,
-        count: messageHistory.size,
-        messages: messageHistory,
-      }
-      const messageEntryPayload = assemblePayload(historyEntry)!
-      const token = this.#generateStorageToken(messageEntryPayload.byteLength);
-      // authorize the storage
-      await this.env.LEDGER_NAMESPACE.put(token.hash, JSON.stringify(token))
-      console.log("2222 2222 [storeMessageCache] About to store with payload")
-      const shardHandle = await sb.storage.storeData(messageEntryPayload, token)
-      console.log("3333 3333 [storeMessageCache] Got handle in return:\n", shardHandle)
-      await shardHandle.verification
-      console.log('\n', SEP, "Reply from 'SB.storage.storeData()': \n", shardHandle, '\n', SEP)
-      const historyDirectory: MessageHistoryDirectory = {
-        ...historyEntry,
-        depth: 0, // indicates all entries (in this case just the one) are shards of message maps
-        type: 'directory',
-        lastModified: lastModified,
-        shards: new Map<string, SBObjectHandle>().set(lowestFrom, shardHandle),
-      }
-      //@ts-ignore
-      delete historyDirectory.messages // hack to work around TS type limitations
-      return historyDirectory
-    } catch (error: any) {
-      throw new SBError("ERROR: failed to get storage server info: " + error)
-    }
+  async storeData(data: any): Promise<SBObjectHandle> {
+    // various magic to work edge<->edge server
+    if (!storageFetchFunction) storageFetchFunction = this.createCustomFetch(this.env);
+    if (!storageServerBinding) storageServerBinding = this.env.STORAGE_SERVER_BINDING
+    if (!mySB) mySB = new Snackabra("<CHANNEL_SERVER_REDIRECT>", { sbFetch: storageFetchFunction })
+    // need to pre-calculate what storage.storeData() will need, and get token set up
+    const b = assemblePayload(data)!;
+    const s = b.byteLength
+    if (s > serverConstants.STORAGE_SIZE_MAX)
+      throw new SBError("Message set too large. Internal Error (L1892)")
+    const token = this.#generateStorageToken(s);
+    await this.env.LEDGER_NAMESPACE.put(token.hash, JSON.stringify(token))
+    // now we should be able to store the data
+    const h = await mySB.storage.storeData(data, token)
+    const x = await stringify_SBObjectHandle(h)
+    // clean up and return
+    return {
+        id: x.id!,
+        key: x.key!,
+        verification: x.verification!
+    }    
   }
+
+  // async messageCacheToHistoryEntry(_env: EnvType): Promise<MessageHistory> {
+  //   _sb_assert(MESSAGE_HISTORY, "MESSAGE_HISTORY not set, fatal")
+  //   _sb_assert(this.messageHistory, "ERROR: ChannelHistory object not set, fatal")
+  //   // if (!storageFetchFunction) storageFetchFunction = this.createCustomFetch(env);
+  //   // if (!storageServerBinding) storageServerBinding = env.STORAGE_SERVER_BINDING
+  //   try {
+  //     // const sb = new Snackabra("<CHANNEL_SERVER_REDIRECT>", { sbFetch: storageFetchFunction, DEBUG: env.DEBUG_ON })
+  //     const messageHistory = new Map<string, ChannelMessage>();
+  //     const keysMap = await this.#_getMessageKeys('0', false) // get everything; don't cache
+  //     const keys = Array.from(keysMap.keys())
+  //     console.log("0000 0000 [storeMessageCache] Got keys: ", keys)
+  //     const getOptions: DurableObjectGetOptions = { allowConcurrency: true };
+  //     let lowestFrom = Channel.HIGHEST_TIMESTAMP
+  //     let highestTo = Channel.LOWEST_TIMESTAMP
+  //     let totalMessageSize = 0
+  //     while (keys.length > 0) {
+  //       // '100' is max number of values we can get in a single go from CF storage
+  //       const batchKeys = keys.splice(0, 100);
+  //       // we fetch from local, and delete from same. this operation doesn't touch global replica.
+  //       const results: Map<string, ArrayBuffer> = await this.storage.get(batchKeys, getOptions)
+  //       if (results instanceof Map) {
+  //         for (const [key, value] of results) {
+  //           if (value) {
+  //             totalMessageSize += value.byteLength
+  //             const msg = extractPayload(value).payload as ChannelMessage
+  //             if (!msg) throw new SBError("Failed to extract payload from message (Internal Error L1887)")
+  //             if (msg.ttl && msg.ttl !== 0xF)
+  //               continue // skip any ephemeral messages
+  //             const { channelId, i2, timestamp } = Channel.deComposeMessageKey(key)
+  //             if (channelId != this.channelId) throw new SBError("ERROR: channelId mismatch (Internal Error L1898)")
+  //             if (i2 !== '____')
+  //               continue; // skipping subchannels by default; ToDo: separate API for owner history?
+  //             if (timestamp < lowestFrom) lowestFrom = timestamp
+  //             if (timestamp > highestTo) highestTo = timestamp
+  //             // messageHistory.set(key, value); // update: package extracted messages
+  //             messageHistory.set(key, msg);
+  //           }
+  //         }
+  //       } else {
+  //         throw new SBError("Unexpected result format from storage.get, fatal (Internal Error L1407)");
+  //       }
+  //     }
+  //     // let lastModified, created = lastModified = Date.now();
+
+  //     console.log("2222 2222 [storeMessageCache] About to store with payload")
+  //     const historyEntry: MessageHistory = {
+  //       version: '20240601.0',
+  //       channelId: this.channelId!,
+  //       ownerPublicKey: this.channelData!.ownerPublicKey,
+  //       created: Date.now(),
+  //       from: lowestFrom,
+  //       to: highestTo,
+  //       count: messageHistory.size,
+  //       size: totalMessageSize,
+  //       shard: await this.storeData(messageHistory),
+  //     }
+  //     console.log("1111 1111 [storeMessageCache] Created new history entry: ", historyEntry)
+  //     this.messageHistory!.insertValue(historyEntry, lowestFrom, highestTo)
+
+  //     // console.log("2222 2222 [storeMessageCache] About to store with payload")
+  //     // const shardHandle = await sb.storage.storeData(messageEntryPayload, token)
+  //     // console.log("3333 3333 [storeMessageCache] Got handle in return:\n", shardHandle)
+  //     // await shardHandle.verification
+  //     // console.log('\n', SEP, "Reply from 'SB.storage.storeData()': \n", shardHandle, '\n', SEP)
+  //     // const historyDirectory: MessageHistoryDirectory = {
+  //     //   ...historyEntry,
+  //     //   depth: 0, // indicates all entries (in this case just the one) are shards of message maps
+  //     //   type: 'directory',
+  //     //   lastModified: lastModified,
+  //     //   shards: new Map<string, SBObjectHandle>().set(lowestFrom, shardHandle),
+  //     // }
+  //     // //@ts-ignore
+  //     // delete historyDirectory.messages // hack to work around TS type limitations
+
+  //     return historyEntry
+  //   } catch (error: any) {
+  //     throw new SBError("ERROR: failed to get storage server info: " + error)
+  //   }
+  // }
 
   async #getHistory(request: Request, _apiBody: ChannelApiBody) {
     _sb_assert(MESSAGE_HISTORY, "MESSAGE_HISTORY not set, fatal")
+
+    return returnResult(request, this.messageHistory ? this.messageHistory.export() : {})
 
     // const testInfo = await this.getStorageServerInfo(this.env)
     // console.log("Got storage server info: ", testInfo)
@@ -1908,7 +2058,7 @@ export class ChannelServer implements DurableObject {
 
     // return returnResult(request, { shardHandle: shardHandle, greeting: 'hello from /getHistory' })
 
-    return returnResult(request, this.messageHistory)
+    // return returnResult(request, this.messageHistory || { type: 'directory', number: -1 })
   }
 
   // return messages matching set of keys
@@ -2064,13 +2214,12 @@ export class ChannelServer implements DurableObject {
     return size // return what was actually consumed
   }
 
-  // prints the token, doesn't validate anything
   #generateStorageToken(size: number): SBStorageToken {
     const hash = SBStorageTokenPrefix + arrayBufferToBase62(crypto.getRandomValues(new Uint8Array(32)).buffer);
     const token: SBStorageToken = {
       hash: hash,
       used: false,
-      size: size, // note that this is actual size, not requested (might be the same)
+      size: size, // note that this is actual size, not requested (could be same or different)
       motherChannel: this.channelId!,
       created: Date.now()
     }
