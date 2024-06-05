@@ -4,7 +4,7 @@
  * this file should be the same between channel and storage server
  */
 
-import { assemblePayload, SBError } from 'snackabra';
+import { assemblePayload, SBError, setDebugLevel } from 'snackabra';
 import { NEW_CHANNEL_MINIMUM_BUDGET as _NEW_CHANNEL_MINIMUM_BUDGET } from 'snackabra'
 
 export var dbg = {
@@ -12,7 +12,34 @@ export var dbg = {
     DEBUG2: false,
     LOG_ERRORS: true,
     myOrigin: '',     // tracks our origin as well
-  }
+}
+
+// called on all 'entry points' to set the debug level
+var debugLevelSet = false;
+export function setServerDebugLevel(env: EnvType) {
+    if (debugLevelSet) return;
+    
+    if (typeof env.DEBUG_LEVEL_1 === 'boolean') dbg.DEBUG = env.DEBUG_LEVEL_1;
+    else if (typeof env.DEBUG_LEVEL_1 === 'string') dbg.DEBUG = env.DEBUG_LEVEL_1 === 'true' ? true : false;
+
+    if (typeof env.LOG_ERRORS === 'boolean') dbg.LOG_ERRORS = env.LOG_ERRORS;
+    else if (typeof env.LOG_ERRORS === 'string') dbg.LOG_ERRORS = env.LOG_ERRORS === 'true' ? true : false;
+
+    if (typeof env.VERBOSE_ON === 'boolean') dbg.DEBUG2 = env.VERBOSE_ON;
+    else if (typeof env.VERBOSE_ON === 'string') dbg.DEBUG2 = env.VERBOSE_ON === 'true' ? true : false;
+
+    if (dbg.DEBUG2) {
+        dbg.DEBUG = true; // if we're verbose, we're also debug
+        dbg.LOG_ERRORS = true; // if we're verbose, we're also logging errors
+        setDebugLevel(dbg.DEBUG) // poke jslib
+    }
+
+    if (dbg.DEBUG) {
+        console.log(SEP, "Setting debug levels from environment:", SEP, env, SEP, dbg)
+        console.log(SEP_, "Debug settings:", SEP, '', dbg, SEP)
+    }
+    debugLevelSet = true; // don't keep re-evaluating
+}
 
 /**
  * API calls are in one of two forms:
@@ -95,7 +122,7 @@ export var dbg = {
 const _STORAGE_SIZE_UNIT = 4096 // 4KB
 
 import {
-    DeepHistory
+    ServerDeepHistory
  } from 'snackabra'
 
 export const serverConstants = {
@@ -125,10 +152,10 @@ export const serverConstants = {
     // maximum number of (perma) messages kept in KV format; beyond this,
     // messages are shardified. note that current CF hard limit is 1000.
     // production around half of 1000 (eg 512), testing set to 12
-    MAX_MESSAGE_SET_SIZE: DeepHistory.MAX_MESSAGE_SET_SIZE,
+    MAX_MESSAGE_SET_SIZE: ServerDeepHistory.MAX_MESSAGE_SET_SIZE,
 
     // in testing this will be low value such as 4.  production is 32.
-    MESSAGE_HISTORY_BRANCH_FACTOR: DeepHistory.MESSAGE_HISTORY_BRANCH_FACTOR, // for testing XXX
+    MESSAGE_HISTORY_BRANCH_FACTOR: ServerDeepHistory.MESSAGE_HISTORY_BRANCH_FACTOR, // for testing XXX
 }
 
 // used by both storage and channel servers to create 'key' into IMAGES KV
@@ -225,7 +252,10 @@ console.log(isTextLikeMimeType("image/jpeg")); // false
 // 507: Insufficient Storage (WebDAV/RFC4918)
 //
 export type ResponseCode = 101 | 200 | 400 | 401 | 403 | 404 | 405 | 413 | 418 | 429 | 500 | 501 | 507;
-const SEP = '='.repeat(60) + '\n'
+const _SEP_ = '='.repeat(76)
+const _SEP = '\n' + _SEP_
+const SEP_ = _SEP_ + '\n'
+const SEP = _SEP + '\n'
 
 function _headers(_request: Request, contentType: string | null, immutable: boolean = false): HeadersInit {
     // let corsHeaders: HeadersInit = {
@@ -289,9 +319,11 @@ export function returnResultJson(request: Request, contents: any, status: Respon
         setTimeout(() => {
             const json = JSON.stringify(contents);
             if (dbg.DEBUG) console.log(
-                SEP, `++++ returnResult() - status '${status}':\n`,
-                SEP, 'contents:\n', contents, '\n',
-                SEP, 'json:\n', json, '\n', SEP)
+                SEP, `++++ returnResultJson(${status}). JSON:\n`,
+                // '++++ contents:\n', contents,
+                // '++++ json:\n',
+                json,
+                SEP)
             resolve(new Response(json, { status: status, headers: corsHeaders }));
         }, delay);
     });
@@ -365,7 +397,7 @@ import type { EnvType } from './env'
 import { handleApiRequest } from './index'
 
 export async function serverFetch(request: Request, env: EnvType) {
-    if (dbg.DEBUG) console.log("serverFetch() called with url:", request.url)
+    if (dbg.DEBUG2) console.log("serverFetch() called with url:", request.url)
     // todo: might want to add a timeout of sorts here, to prevent hanging
     return await handleErrors(request, async () => {
         if (request.method == "OPTIONS")
@@ -475,10 +507,10 @@ let activeTasks = 0;
 const MAX_CONCURRENT = 4;
 export default {
     async fetch(request: Request, env: EnvType) {
-        // debug output section
-        dbg.DEBUG = env.DEBUG_LEVEL_1 === true
-        dbg.DEBUG2 = env.VERBOSE_ON === true
-        dbg.LOG_ERRORS = env.LOG_ERRORS === true
+        // // debug output section
+        // dbg.DEBUG = env.DEBUG_LEVEL_1 === true
+        // dbg.DEBUG2 = env.VERBOSE_ON === true
+        // dbg.LOG_ERRORS = env.LOG_ERRORS === true
         if (!dbg.myOrigin) dbg.myOrigin = new URL(request.url).origin
         if (dbg.DEBUG) {
             const msg = `==== [${request.method}] Fetch called: ${request.url}`;

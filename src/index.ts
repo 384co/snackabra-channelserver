@@ -28,7 +28,7 @@ const MESSAGE_HISTORY = true;
 import {
   Channel,
   sbCrypto, extractPayload, assemblePayload, ChannelMessage,
-  stripChannelMessage, setDebugLevel, SBStorageToken,
+  stripChannelMessage, SBStorageToken,
   validate_SBStorageToken, SBStorageTokenPrefix,
   SB384, arrayBufferToBase62, jsonParseWrapper,
   validate_ChannelMessage, validate_SBChannelData,
@@ -36,10 +36,13 @@ import {
   SBError,
   Snackabra, // stringify_SBObjectHandle,
   // arrayBufferToBase64url,
-  DeepHistory, MessageHistory, HistoryTree, stringify_SBObjectHandle, Freezable
+  // DeepHistory,
+  MessageHistory, stringify_SBObjectHandle, ServerDeepHistory,
 } from 'snackabra';
 
-import type { SBChannelId, ChannelAdminData, SBUserId, SBChannelData, ChannelApiBody, SBObjectHandle } from 'snackabra';
+import type {
+  SBChannelId, ChannelAdminData, SBUserId, SBChannelData, ChannelApiBody, SBObjectHandle
+} from 'snackabra';
 
 import type { EnvType } from './env'
 
@@ -50,7 +53,7 @@ import {
   genKey, genKeyPrefix,
   return304,
   textLikeMimeTypes,
-  dbg,
+  dbg, setServerDebugLevel,
   serverFetch,
 } from './workers'
 
@@ -59,39 +62,23 @@ function arrayBufferToText(buf: ArrayBuffer) {
   return decoder.decode(new Uint8Array(buf)); // Decode an ArrayBuffer to text
 }
 
-const SEPx = '='.repeat(76)
-const SEP = '\n' + SEPx + '\n'
-const SEP_ = SEPx + '\n'
+const _SEP_ = '='.repeat(76)
+const SEP = '\n' + _SEP_ + '\n'
+const SEP_ = _SEP_ + '\n'
+const _SEP = '\n' + _SEP_
 const SEPxStar = '\n' + '*'.repeat(76) + '\n'
 
-// enable for stress testing larger trees (narrower branching), but NOT in production
-const TEST_WITH_SMALL_BRANCHING = false
 
 // set to true to enable specific debug output or testing (local only, production will not allow this)
 var DBG0 = false;
 
 if (DBG0) console.log('', SEP_, SEP_, SEP_, "============     Starting Channel Server with DBG0 ENABLED     =============\n", SEP_, SEP_, SEP_)
 
-if (TEST_WITH_SMALL_BRANCHING && !DBG0)
-    throw new Error("TEST_WITH_SMALL_BRANCHING should not be set unless DBG0 is also set (local only)")
-const MSG_HISTORY_BRANCHING = TEST_WITH_SMALL_BRANCHING ? 3 : DeepHistory.MESSAGE_HISTORY_BRANCH_FACTOR
-const MSG_HISTORY_SET_SIZE = TEST_WITH_SMALL_BRANCHING ? 5 : DeepHistory.MAX_MESSAGE_SET_SIZE
-
-// called on all 'entry points' to set the debug level
-var debugLevelSet = false;
-function setServerDebugLevel(env: EnvType) {
-  if (debugLevelSet) return;
-  if (DBG0 === true && env.ENVIRONMENT === 'production') {
-    const msg = "DBG0 is set in development environment (Internal Error) [L77]"
-    console.error(msg)
-    throw new Error(msg)
+// channel server 'binding' for DeepHistory
+class ChannelHistory extends ServerDeepHistory {
+  constructor(data: any, public storeData: (data: any) => Promise<SBObjectHandle>) {
+    super(data);
   }
-  dbg.DEBUG = env.DEBUG_LEVEL_1 === true ? true : false;
-  dbg.LOG_ERRORS = env.LOG_ERRORS === true || dbg.DEBUG === true ? true : false;
-  dbg.DEBUG2 = env.VERBOSE_ON === true ? true : false;
-  if (dbg.DEBUG2 === true) setDebugLevel(dbg.DEBUG) // poke jslib
-  console.log(SEP, "Setting debug levels from environment:", SEP, env, SEP, dbg, SEP)
-  debugLevelSet = true;
 }
 
 const base62mi = "0123456789ADMRTxQjrEywcLBdHpNufk" // "v05.05" (strongpinVersion ^0.6.0)
@@ -109,6 +96,12 @@ const CHANNEL_STORAGE_MULTIPLIER_TEMP = serverApiCosts.CHANNEL_STORAGE_MULTIPLIE
 // // simple way to track what our origin is
 // var myOrigin: string = '';
 
+// if (DBG0 && env.ENVIRONMENT === 'production') {
+//   const msg = "DBG0 is set in development environment (Internal Error) [L77]"
+//   console.error(msg)
+//   throw new Error(msg)
+// }
+
 
 export async function handleApiRequest(path: Array<string>, request: Request, env: EnvType) {
   setServerDebugLevel(env)
@@ -123,64 +116,64 @@ export async function handleApiRequest(path: Array<string>, request: Request, en
         if (!path[1]) return returnError(request, "ERROR: invalid API (should be '/api/v2/channel/<channelId>/<api>')", 400);
         return callDurableObject(path[1], path.slice(2), request, env);
       case 'page':
-          // todo: if the pages view is 'locked', we need to proceed to the DO,
-          // but we need to construct how to call the DO (eg, we need to know
-          // the channel id from the api payload etc)
-          if (dbg.DEBUG) console.log("==== Page Fetch ====")
-          // make sure there is a page key
-          if (!path[1]) return returnError(request, "ERROR: invalid API (should be '/api/v2/page/<pageKey>')", 400);
-          const pageKey = path[1]
-          // some sanity checks: pageKey must be regex b32, and at least 6 characters long, and no more than 48 characters long
-          if (!base62Regex.test(pageKey) || pageKey.length < 6 || pageKey.length > 48) {
-            if (dbg.LOG_ERRORS) console.error("ERROR: invalid page key [L085]")
-            return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
-          }
-          const pageKeyKVprefix = genKeyPrefix(pageKey, 'G')
-          // we now use 'list' to get all prefix matching this
-          const listOptions: DurableObjectListOptions = { limit: 4, prefix: pageKeyKVprefix, reverse: true };
-          const resultList = await env.PAGES_NAMESPACE.list(listOptions)
-          if (resultList.keys.length === 0) {
-            // if there are no entries, well, there's no such Page
-            if (dbg.LOG_ERRORS) console.error(`ERROR: no entry found for page key ${pageKey} [L093]`)
-            return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
-          }
-          if (resultList.keys.length !== 1) {
-            // if there is an entry, then there must only be one
-            if (dbg.LOG_ERRORS) console.error("ERROR: found multiple entries, should not happen [L095]", resultList)
-            return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
-          }
-          // now we grab it's full key and fetch the object
-          const pageKeyKV = resultList.keys[0]!.name
-          // now read from the PAGES namespace
-          const { value, metadata } = await env.PAGES_NAMESPACE.getWithMetadata(pageKeyKV, { type: "arrayBuffer" });
-          const pageMetaData = metadata as PageMetaData
-          if (dbg.DEBUG) console.log("Got this SPECIFIC entry from KV: ", value, metadata)
-          if (!value) {
-            if (dbg.LOG_ERRORS) console.error("ERROR: no value found for page key [L105]")
-            return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
-          }
-          // some meta data sanity checks
-          // unless otherwise requested, we default to shortest permitted
-          const shortestPrefix = pageMetaData.shortestPrefix || 6
-          if (pageKey.length < shortestPrefix) {
-            if (dbg.LOG_ERRORS) console.error("ERROR: page key too short [L112]")
-            return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
-          }
-          // todo: improve cache headers, including stale-while-revalidate cache policy
-          // for now at least we handle Etags
-          const clientEtag = request.headers.get("If-None-Match");
-          if (clientEtag === pageMetaData.hash) {
-            if (dbg.DEBUG) console.log("Returning 304 (not modified)")
-            return return304(request, clientEtag); // mirror it back, it hasn't changed
-          }
-          let returnValue: ArrayBuffer | string = value
-          if (pageMetaData.type && textLikeMimeTypes.has(pageMetaData.type)) {
-            if (dbg.DEBUG) console.log("It was stored explicit text-like type, recoding to text")
-            returnValue = arrayBufferToText(value)
-          } else {
-            if (dbg.DEBUG) console.log("Not recoding return result.")
-          }
-          return returnResult(request, returnValue, { type: pageMetaData.type, headers: { "Etag": pageMetaData.hash }})
+        // todo: if the pages view is 'locked', we need to proceed to the DO,
+        // but we need to construct how to call the DO (eg, we need to know
+        // the channel id from the api payload etc)
+        if (dbg.DEBUG) console.log("==== Page Fetch ====")
+        // make sure there is a page key
+        if (!path[1]) return returnError(request, "ERROR: invalid API (should be '/api/v2/page/<pageKey>')", 400);
+        const pageKey = path[1]
+        // some sanity checks: pageKey must be regex b32, and at least 6 characters long, and no more than 48 characters long
+        if (!base62Regex.test(pageKey) || pageKey.length < 6 || pageKey.length > 48) {
+          if (dbg.LOG_ERRORS) console.error("ERROR: invalid page key [L085]")
+          return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
+        }
+        const pageKeyKVprefix = genKeyPrefix(pageKey, 'G')
+        // we now use 'list' to get all prefix matching this
+        const listOptions: DurableObjectListOptions = { limit: 4, prefix: pageKeyKVprefix, reverse: true };
+        const resultList = await env.PAGES_NAMESPACE.list(listOptions)
+        if (resultList.keys.length === 0) {
+          // if there are no entries, well, there's no such Page
+          if (dbg.LOG_ERRORS) console.error(`ERROR: no entry found for page key ${pageKey} [L093]`)
+          return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
+        }
+        if (resultList.keys.length !== 1) {
+          // if there is an entry, then there must only be one
+          if (dbg.LOG_ERRORS) console.error("ERROR: found multiple entries, should not happen [L095]", resultList)
+          return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
+        }
+        // now we grab it's full key and fetch the object
+        const pageKeyKV = resultList.keys[0]!.name
+        // now read from the PAGES namespace
+        const { value, metadata } = await env.PAGES_NAMESPACE.getWithMetadata(pageKeyKV, { type: "arrayBuffer" });
+        const pageMetaData = metadata as PageMetaData
+        if (dbg.DEBUG) console.log("Got this SPECIFIC entry from KV: ", value, metadata)
+        if (!value) {
+          if (dbg.LOG_ERRORS) console.error("ERROR: no value found for page key [L105]")
+          return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
+        }
+        // some meta data sanity checks
+        // unless otherwise requested, we default to shortest permitted
+        const shortestPrefix = pageMetaData.shortestPrefix || 6
+        if (pageKey.length < shortestPrefix) {
+          if (dbg.LOG_ERRORS) console.error("ERROR: page key too short [L112]")
+          return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
+        }
+        // todo: improve cache headers, including stale-while-revalidate cache policy
+        // for now at least we handle Etags
+        const clientEtag = request.headers.get("If-None-Match");
+        if (clientEtag === pageMetaData.hash) {
+          if (dbg.DEBUG) console.log("Returning 304 (not modified)")
+          return return304(request, clientEtag); // mirror it back, it hasn't changed
+        }
+        let returnValue: ArrayBuffer | string = value
+        if (pageMetaData.type && textLikeMimeTypes.has(pageMetaData.type)) {
+          if (dbg.DEBUG) console.log("It was stored explicit text-like type, recoding to text")
+          returnValue = arrayBufferToText(value)
+        } else {
+          if (dbg.DEBUG) console.log("Not recoding return result.")
+        }
+        return returnResult(request, returnValue, { type: pageMetaData.type, headers: { "Etag": pageMetaData.hash } })
       case "notifications":
         return returnError(request, "Device (Apple) notifications are disabled (use web notifications)", 400);
       case "getLastMessageTimes":
@@ -206,7 +199,7 @@ async function callDurableObject(channelId: SBChannelId, path: Array<string>, re
   const newUrl = new URL(request.url);
   newUrl.pathname = "/" + channelId + "/" + path.join("/");
   const newRequest = new Request(newUrl.toString(), request);
-  if (dbg.DEBUG) {
+  if (dbg.DEBUG2) {
     console.log(
       "==== callDurableObject():\n",
       "channelId:", channelId, "\n",
@@ -299,7 +292,7 @@ interface TTL0Buffer {
   first: number, // points to first entry (unless equal to 'last', in which case buffer is empty)
   last: number, // always points to next 'free' spot
   totalSize: number,
-   // from ring buffer, to message Map; 'x' is expiration, 'id' is message key, 't' is userId (if targeted)
+  // from ring buffer, to message Map; 'x' is expiration, 'id' is message key, 't' is userId (if targeted)
   ring: Map<number, { x: number, id: string, t: SBUserId | undefined }>
   messages: Map<string, ArrayBuffer>
 }
@@ -314,23 +307,22 @@ const TTL0_EXPIRATION = 30 * 1000; // 30 seconds
  */
 export class TTL0BufferClass {
   constructor(public buffer: TTL0Buffer =
-    { first: 0, last: 0, totalSize: 0, ring: new Map(), messages: new Map() })
-    {
-      // we do a few sanity checks on the buffer before using it
-      let tail = this.buffer.first;
-      while (tail !== this.buffer.last) {
-        const id = this.buffer.ring.get(tail)?.id;
-        _sb_assert(id, "Message not found in buffer (Internal Error) [L280]");
-        const m = this.buffer.messages.get(id!);
-        _sb_assert(m, "Message not found in buffer (Internal Error) [L282]");
-        tail = (tail + 1) % TTL0_MAX_MESSAGES;
-      }
-      let totalSize = 0;
-      for (const m of this.buffer.messages.values()) totalSize += m.byteLength;
-      _sb_assert(totalSize === this.buffer.totalSize, "Total size does not match (Internal Error) [L290]");
-      this.deleteExpired(); // looks good, let's clean it up
-      if (DBG0 && this.buffer.first !== this.buffer.last) console.log("Loaded TTL0BufferClass from storage: ", this.buffer);
+    { first: 0, last: 0, totalSize: 0, ring: new Map(), messages: new Map() }) {
+    // we do a few sanity checks on the buffer before using it
+    let tail = this.buffer.first;
+    while (tail !== this.buffer.last) {
+      const id = this.buffer.ring.get(tail)?.id;
+      _sb_assert(id, "Message not found in buffer (Internal Error) [L280]");
+      const m = this.buffer.messages.get(id!);
+      _sb_assert(m, "Message not found in buffer (Internal Error) [L282]");
+      tail = (tail + 1) % TTL0_MAX_MESSAGES;
     }
+    let totalSize = 0;
+    for (const m of this.buffer.messages.values()) totalSize += m.byteLength;
+    _sb_assert(totalSize === this.buffer.totalSize, "Total size does not match (Internal Error) [L290]");
+    this.deleteExpired(); // looks good, let's clean it up
+    if (dbg.DEBUG2 && this.buffer.first !== this.buffer.last) console.log("Loaded TTL0BufferClass from storage: ", this.buffer);
+  }
 
   // remove from the 'top' (start) of the buffer
   removeFirst() {
@@ -351,7 +343,7 @@ export class TTL0BufferClass {
     if (dbg.DEBUG2) console.log("... adding message to buffer:", id)
     this.deleteExpired(); // just keeping things tight
     this.buffer.totalSize += m.byteLength;
-    this.buffer.ring.set(this.buffer.last, { x: Date.now() + TTL0_EXPIRATION, id: id, t: userId});
+    this.buffer.ring.set(this.buffer.last, { x: Date.now() + TTL0_EXPIRATION, id: id, t: userId });
     this.buffer.messages.set(id, m);
     this.buffer.last = (this.buffer.last + 1) % TTL0_MAX_MESSAGES;
     if (this.buffer.last === this.buffer.first)
@@ -362,12 +354,12 @@ export class TTL0BufferClass {
       this.removeFirst();
     }
   }
-    
+
   // remove all messages that have expire
   deleteExpired() {
     const now = Date.now();
     while (this.buffer.ring.get(this.buffer.first)?.x! < now) {
-      if (DBG0) console.log("... deleting expired message from buffer")
+      if (dbg.DEBUG2) console.log("... deleting expired message from buffer")
       this.removeFirst();
     }
   }
@@ -427,7 +419,7 @@ export class TTL0BufferClass {
       _sb_assert(id, "Message not found in buffer (Internal Error) [L412]");
       const m = this.buffer.messages.get(id!);
       _sb_assert(m, "Message not found in buffer (Internal Error) [L414]");
-      if (id! > start && callback(id!, info.t,  m!)) return;
+      if (id! > start && callback(id!, info.t, m!)) return;
       tail = (tail + 1) % TTL0_MAX_MESSAGES;
     }
   }
@@ -443,20 +435,6 @@ export class TTL0BufferClass {
     return this.buffer;
   }
 }
-
-
-class ChannelHistory extends HistoryTree<MessageHistory, SBObjectHandle, string> {
-  constructor(data: any, public storeData: (data: any) => Promise<SBObjectHandle>) {
-      super(MSG_HISTORY_BRANCHING, data);
-  }
-  async freeze(data: Freezable<MessageHistory, SBObjectHandle>): Promise<SBObjectHandle> {
-      return this.storeData(data)
-  }
-  async deFrost(_handle: SBObjectHandle): Promise<Freezable<MessageHistory, SBObjectHandle>> {
-    throw new Error("ChanneHistory: deFrost should not be needed (write-only mode). Internal Error (L451)");
-  }
-}
-
 
 /**
  *
@@ -481,13 +459,13 @@ export class ChannelServer implements DurableObject {
   /* 'accepted'            */ accepted: Set<SBUserId> = new Set();
   /* ----- these track message history         ----- */
   /* 'messageCount'        */ messageCount: number = 0;        // total non-ephemeral messages in DO KV
-  /* 'allMessageCount'    */ allMessageCount: number = 0;     // total number of all messages
+  /* 'allMessageCount'     */ allMessageCount: number = 0;     // total number of all messages
   /* 'newMessageCount'     */ newMessageCount: number = 0;     // the subset of 'messageCount' that has not been shardified  
   /* 'messageSize'         */ messageSize: number = 0;         // size of ditto (size of all messages not yet shardified/archived)
-  
+
   /* 'messageHistory'      */ // messageHistory: MessageHistoryDirectory | null = null;
-  /* 'messageHistory'      */ messageHistory: HistoryTree<MessageHistory, SBObjectHandle, string> | null = null;
-                              deepHistoryWritebackLock: boolean = false; // 'LOCK' for deephistory work
+  /* 'messageHistory'      */ messageHistory: ChannelHistory | null = null;
+  deepHistoryWritebackLock: boolean = false; // 'LOCK' for deephistory work
 
   /* the rest are for run time and are not backed up as such to KVs  */
   visitorKeys: Map<SBUserId, SB384> = new Map();    // convenience caching of SB384 objects for any visitors
@@ -538,10 +516,11 @@ export class ChannelServer implements DurableObject {
   // ToDo: evaluate if and where we might need 'blockConcurrencyWhile()'
   constructor(public state: DurableObjectState, public env: EnvType) {
     setServerDebugLevel(env)
+    console.log(SEP, "[ChannelServer] [constructor] Running with these debug settings:\n", '', dbg, SEP)
 
-    if (dbg.DEBUG) console.log("++++ channel server code loaded ++++ dbg.DEBUG is enabled ++++")
-    else console.log("++++ channel server code loaded (NO DEBUG) ++++")
-    if (dbg.DEBUG2) console.log("++++ dbg.DEBUG2 (verbose) enabled ++++")
+    // if (dbg.DEBUG) console.log("++++ channel server code loaded ++++ dbg.DEBUG is enabled ++++")
+    // else console.log("++++ channel server code loaded (NO DEBUG) ++++")
+    // if (dbg.DEBUG2) console.log("++++ dbg.DEBUG2 (verbose) enabled ++++")
 
     // durObj storage has a different API than global KV, see:
     // https://developers.cloudflare.com/workers/runtime-apis/durable-objects/#transactional-storage-api
@@ -577,24 +556,24 @@ export class ChannelServer implements DurableObject {
 
     // todo: presumed to be a good idea to limit this?
     this.state.setHibernatableWebSocketEventTimeout(1 * 60 * 1000) // milliseconds thus this is 1 minute
-    if (DBG0) console.log("++++ setting websocket handler timeout to (seconds):", this.state.getHibernatableWebSocketEventTimeout()! / 1000)
+    if (dbg.DEBUG2) console.log("++++ setting websocket handler timeout to (seconds):", this.state.getHibernatableWebSocketEventTimeout()! / 1000)
 
-    if (DBG0) console.log("++++ setting autoresponse to timestamp ++++")
+    if (dbg.DEBUG2) console.log("++++ setting autoresponse to timestamp ++++")
     this.state.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', Channel.timestampToBase4String(this.latestTimestamp)))
 
-    if (DBG0) console.log("++++ CURRENT WEBSOCKETS  ++++")
+    if (dbg.DEBUG2) console.log("++++ CURRENT WEBSOCKETS  ++++")
     const wsList = this.state.getWebSockets()
     if (wsList.length > 0) {
       this.hibernationPromise = new Promise<void>(async (resolve, _reject) => {
         // ToDo: refactor, '#setUpNewSession' code overlap
         // we've returned from hibernation ... first we need to initialize
-        if (DBG0) console.log(SEP, "[RETURNING FROM HIBERNATION] Beginning recovery ... ", SEP)
+        if (dbg.DEBUG2) console.log(SEP, "[RETURNING FROM HIBERNATION] Beginning recovery ... ", SEP)
         const channelData = jsonParseWrapper(await (this.storage.get('channelData') as Promise<string>), 'L512') as SBChannelData
         await this.#initialize(channelData)
-        if (DBG0) console.log(SEP, "[RETURNING FROM HIBERNATION] MAIN CHANNEL object should be initialized now ...", SEP)
+        if (dbg.DEBUG2) console.log(SEP, "[RETURNING FROM HIBERNATION] MAIN CHANNEL object should be initialized now ...", SEP)
         for (const ws of wsList) {
           let wsInfo = ws.deserializeAttachment() as SessionInfo
-          if (DBG0) console.log('state:', ws.readyState, ', url:', ws.url, ', info:', wsInfo)
+          if (dbg.DEBUG2) console.log('state:', ws.readyState, ', url:', ws.url, ', info:', wsInfo)
           // reconstruct things that weren't serialized
           const userKeys = this.visitorKeys.get(wsInfo.userId)!
           _sb_assert(userKeys, "Internal Error [L535]")
@@ -608,16 +587,16 @@ export class ChannelServer implements DurableObject {
           }
           this.sessions.set(wsInfo.userId, wsInfo)
         }
-        if (DBG0) console.log(SEP, "[RETURNING FROM HIBERNATION] done with post-hibernation work", SEP)
-        if (DBG0) console.log(this.sessions)
+        if (dbg.DEBUG2) console.log(SEP, "[RETURNING FROM HIBERNATION] done with post-hibernation work", SEP)
+        if (dbg.DEBUG2) console.log(this.sessions)
         resolve(void 0)
       });
-      if (DBG0) console.log(SEP, "[RETURNING FROM HIBERNATION] 'blockConcurrencyWhile' now awaiting setup finishing", SEP)
+      if (dbg.DEBUG2) console.log(SEP, "[RETURNING FROM HIBERNATION] 'blockConcurrencyWhile' now awaiting setup finishing", SEP)
       this.state.blockConcurrencyWhile(() => this.hibernationPromise!)
     }
-    if (DBG0) console.log("++++ ++++ ++++ ++++ ++++ ++++")
+    if (dbg.DEBUG2) console.log("++++ ++++ ++++ ++++ ++++ ++++")
 
-    if (DBG0) console.log("++++ ChannelServer constructor done ++++")
+    if (dbg.DEBUG2) console.log("++++ ChannelServer constructor done ++++")
   }
 
   // called after a DO channel is initialized. kitchen sink for a variety of
@@ -625,9 +604,9 @@ export class ChannelServer implements DurableObject {
   // called, though what it does and/or prints out will depend on DEBUG level.
   async #startupDebugOrTest() {
     _sb_assert(this.channelId, "ERROR: channelId is not set (fatal)")
-    if (dbg.DEBUG2) console.log(SEP, 'Full DO info\n', this, '\n', SEP)
+    console.log('.', SEP, `[ChannelServer] Class contents for channelId '${this.channelId}':`, SEP, '', this, _SEP)
     const _currentMessageKeys = await this.storage.list({ limit: 1000, prefix: this.channelId!, reverse: true });
-    if (dbg.DEBUG2) console.log(_currentMessageKeys)
+    if (dbg.DEBUG2) console.log('.', SEP, "Current message keys in DO KV for channel " + this.channelId + ":", SEP, _currentMessageKeys, SEP)
     // these keys are returned as a Map(); we iterate to find lowest and highest (lex) key
     let lowest = '', highest = '';
     // while we are at it, lets accumulate size of the 'values', they're all arraybuffers
@@ -679,7 +658,7 @@ export class ChannelServer implements DurableObject {
       //   console.log("Meta data size:", payloadAsMetaData.length, "chars")
       //   if (value.byteLength > biggestSoFar) {
       //   biggestSoFar = value.byteLength;
-      //   console.log(SEPx)
+      //   console.log(_SEP_)
       //   // console.log("Biggest so far: ", value.byteLength, "bytes")
       //   const contents = extractPayload(value).payload
       //   console.log(`Biggest so far: ${value.byteLength} bytes (b62 ${payloadAsMetaData.length} chars) (contents ${contents.c.byteLength} bytes)`)
@@ -688,7 +667,7 @@ export class ChannelServer implements DurableObject {
 
       totalSize += value.byteLength;
     }
-    if (dbg.DEBUG2) console.log(SEPx)
+    if (dbg.DEBUG2) console.log(_SEP_)
 
     // extract the timestamp from 'lowest' and 'highest' keys
     const { timestamp: lowTimestamp } = Channel.deComposeMessageKey(lowest)
@@ -696,11 +675,8 @@ export class ChannelServer implements DurableObject {
     const { timestamp: highTimestamp } = Channel.deComposeMessageKey(highest);
     const highDate = Channel.base4StringToDate(highTimestamp);
 
-    if (dbg.DEBUG) {
-      console.log("\n")
-      console.log(SEPx)
-      console.log(SEPx)
-      console.log("Summary information about DO KV entries (all): ")
+    if (dbg.DEBUG || dbg.LOG_ERRORS) {
+      console.log('\n.', SEP, "Summary information about DO KV entries (all): ", _SEP)
       console.log("          ChannelID: ", this.channelId)
       console.log("           Map size: ", _currentMessageKeys.size)
       console.log("    Counted entries: ", i)
@@ -710,34 +686,43 @@ export class ChannelServer implements DurableObject {
       console.log("        Highest key: ", highest)
       console.log("        (high date): ", highDate)
       console.log(" Total size of data: ", totalSize)
-      console.log("       storage left: ", this.storageLimit)
+      console.log("       storage left: ", this.storageLimit, "(channel budget)")
       if (foundErrors) console.log(SEPxStar)
       console.log("       Found errors: ", foundErrors)
       if (foundErrors) console.log(SEPxStar)
-      console.log(SEPx)
-      console.log("ChannelData:")
+      console.log(SEP_, "ChannelData:", _SEP)
       console.log(JSON.stringify(this.channelData, null, 2))
-      console.log(SEPx, SEP)
+      console.log(_SEP_)
     } else if (foundErrors && dbg.LOG_ERRORS) {
       console.error("ERROR: found errors in DO KV entries in channel " + this.channelId)
     }
 
+    if (dbg.DEBUG || dbg.LOG_ERRORS) {
+      console.log('\n.', SEP, "DeepHistory summary", _SEP)
+      console.log("      unsharded messages: ", this.newMessageCount)
+      console.log("     total size of ditto: ", this.messageSize)
+      console.log(SEP_, "DeepHistory details", _SEP)
+      console.log('', JSON.stringify(this.messageHistory?.export(), null, 2), SEP)
+    }
+
     this.latestTimestamp = Channel.base4StringToTimestamp(highTimestamp)
-    if (DBG0) console.log(
+    if (dbg.DEBUG2) console.log(
       "\n", SEP,
       "ChannelServer startup, latest timestamp:\n",
       "  number format: ", this.latestTimestamp, "\n",
       "   base4 format: ", highTimestamp, "\n",
       "    date format: ", highDate, "\n",
-      SEPx, "\n");
+      _SEP_, "\n");
   }
 
   // load channel from storage: either it's been descheduled, or it's a new
   // channel (that has already been created)
   async #initialize(channelData: SBChannelData) {
     try {
+      setServerDebugLevel(this.env)
       _sb_assert(channelData && channelData.channelId, "ERROR: no channel data found in parameters (fatal)")
-      if (dbg.DEBUG) console.log(`==== ChannelServer.initialize() called for channel: ${channelData.channelId} ====`)
+
+      if (dbg.DEBUG) console.log(`==== ChannelServer.initialize() called for channel: ${channelData.channelId} ====\n`, this.env)
       if (dbg.DEBUG) console.log("\n", channelData, "\n", SEP)
 
       const channelState = await this.storage.get(
@@ -788,7 +773,7 @@ export class ChannelServer implements DurableObject {
         this.visitors = extractPayload(latestVisitors).payload as Map<SBUserId, SBUserPublicKey>
         // now we bootstrap the visitorKeys cache
         for (const [userId, userPublicKey] of this.visitors)
-          this.visitorKeys.set(userId, await (new SB384(userPublicKey).ready))      
+          this.visitorKeys.set(userId, await (new SB384(userPublicKey).ready))
       } else {
         this.visitors = new Map()
         this.visitorKeys = new Map()
@@ -845,7 +830,7 @@ export class ChannelServer implements DurableObject {
     try {
       if (!dbg.myOrigin) dbg.myOrigin = url.origin;
 
-      if (dbg.DEBUG) console.log("111111 ==== ChannelServer.fetch() ==== phase ONE ==== 111111")
+      if (dbg.DEBUG2) console.log("111111 ==== ChannelServer.fetch() ==== phase ONE ==== 111111")
       // phase 'one' - sort out parameters
 
       // const requestClone = request.clone(); // appears to no longer be needed
@@ -854,7 +839,7 @@ export class ChannelServer implements DurableObject {
       const apiBody = await processApiBody(requestClone) as Response | ChannelApiBody
       if (apiBody instanceof Response) return apiBody
 
-      if (dbg.DEBUG) {
+      if (dbg.DEBUG2) {
         console.log(
           SEP,
           '[Durable Object] fetch() called:\n',
@@ -867,22 +852,22 @@ export class ChannelServer implements DurableObject {
         if (dbg.DEBUG2) console.log(request.headers, '\n', SEP)
       }
 
-      if (dbg.DEBUG) console.log("222222 ==== ChannelServer.fetch() ==== phase TWO ==== 222222")
+      if (dbg.DEBUG2) console.log("222222 ==== ChannelServer.fetch() ==== phase TWO ==== 222222")
       // phase 'two' - catch 'create' call (budding against a new channelId)
 
       if (apiCall === '/budd' && !this.channelId) {
-        if (dbg.DEBUG) console.log('\n', SEP, '\n', 'Budding against a new channelId (eg creating/authorizing channel)\n', SEP, apiBody, '\n', SEP)
+        if (dbg.DEBUG2) console.log('\n', SEP, '\n', 'Budding against a new channelId (eg creating/authorizing channel)\n', SEP, apiBody, '\n', SEP)
         return this.#create(requestClone, apiBody);
       }
 
       // if (and only if) both are in place, they must be consistent
       if (this.channelId && channelId && (this.channelId !== channelId)) return returnError(request, "Internal Error (L478)");
 
-      if (dbg.DEBUG) console.log("333333 ==== ChannelServer.fetch() ==== phase THREE ==== 333333")
+      if (dbg.DEBUG2) console.log("333333 ==== ChannelServer.fetch() ==== phase THREE ==== 333333")
       // phase 'three' - check if 'we' just got created, in which case now we self-initialize
       // (we've been created but not initialized if there's no channelId, yet api call is not 'create')
       if (!this.channelId) {
-        if (dbg.DEBUG) console.log("**** channel object not initialized ...")
+        if (dbg.DEBUG2) console.log("**** channel object not initialized ...")
         const channelData = jsonParseWrapper(await (this.storage.get('channelData') as Promise<string>), 'L495') as SBChannelData
         if (!channelData || !channelData.channelId) {
           // no channel, no object, no upload, no dice
@@ -891,7 +876,7 @@ export class ChannelServer implements DurableObject {
         }
         // channel exists but object needs reloading
         if (channelId !== channelData.channelId) {
-          if (dbg.DEBUG) console.log("**** channelId mismatch:\n", channelId, "\n", channelData);
+          if (dbg.LOG_ERRORS) console.log("**** channelId mismatch:\n", channelId, "\n", channelData);
           return returnError(request, "Internal Error (L327)");
         }
         // bootstrap from storage
@@ -903,7 +888,7 @@ export class ChannelServer implements DurableObject {
           });
       }
 
-      if (dbg.DEBUG) console.log("444444 ==== ChannelServer.fetch() ==== phase FOUR ==== 444444")
+      if (dbg.DEBUG2) console.log("444444 ==== ChannelServer.fetch() ==== phase FOUR ==== 444444")
       // phase 'four' - if we're locked, then only accepted visitors can do anything at all
 
       if (this.channelId !== path[0])
@@ -929,7 +914,7 @@ export class ChannelServer implements DurableObject {
         this.visitorKeys.set(apiBody.userId, await (new SB384(apiBody.userPublicKey).ready))
       }
 
-      if (dbg.DEBUG) console.log("555555 ==== ChannelServer.fetch() ==== phase FIVE ==== 555555")
+      if (dbg.DEBUG2) console.log("555555 ==== ChannelServer.fetch() ==== phase FIVE ==== 555555")
       // phase 'five' - every single api call is separately verified with provided visitor public key
 
       // check signature, check for owner status
@@ -958,33 +943,33 @@ export class ChannelServer implements DurableObject {
       // form our own opinion if this is the Owner
       apiBody.isOwner = this.channelId === sender.ownerChannelId
 
-      if (dbg.DEBUG) console.log("666666 ==== ChannelServer.fetch() ==== phase SIX ==== 666666")
+      if (dbg.DEBUG2) console.log("666666 ==== ChannelServer.fetch() ==== phase SIX ==== 666666")
       // phase 'six' - we're ready to process the api call!
 
       // ToDo: verify that the 'embeded' path is same as path coming through in request
 
       if (apiCall === "/websocket") {
-        if (dbg.DEBUG) console.log("==== ChannelServer.fetch() ==== websocket request ====")
-        if (dbg.DEBUG) console.log("---- websocket request")
+        if (dbg.DEBUG2) console.log("==== ChannelServer.fetch() ==== websocket request ====")
+        if (dbg.DEBUG2) console.log("---- websocket request")
         if (request.headers.get("Upgrade") != "websocket") {
-          if (dbg.DEBUG) console.log("---- websocket request, but not websocket (error)")
+          if (dbg.LOG_ERRORS) console.log("---- websocket request, but not websocket (error)")
           return returnError(request, "Expected websocket", 400);
         }
         const ip = request.headers.get("CF-Connecting-IP");
         const pair = new WebSocketPair(); // that's CF websocket pair
-        if (dbg.DEBUG) console.log("---- websocket request, creating session")
+        if (dbg.DEBUG2) console.log("---- websocket request, creating session")
         await this.#setUpNewSession(pair[1], ip, apiBody); // we use one ourselves
-        if (dbg.DEBUG) console.log("---- websocket request, returning session")
+        if (dbg.DEBUG2) console.log("---- websocket request, returning session")
         return new Response(null, { status: 101, webSocket: pair[0] }); // we return the other to the client
       } else if (this.ownerCalls[apiCall]) {
-        if (dbg.DEBUG) console.log("==== ChannelServer.fetch() ==== owner call ====")
+        if (dbg.DEBUG2) console.log("==== ChannelServer.fetch() ==== owner call ====")
         if (!apiBody.isOwner) {
           if (dbg.LOG_ERRORS) console.log("---- owner call, but not owner (error)");
           return returnError(request, ANONYMOUS_CANNOT_CONNECT_MSG, 401);
         }
         try {
           const result = await this.ownerCalls[apiCall]!(request, apiBody);
-          if (dbg.DEBUG) console.log("owner call succeeded")
+          if (dbg.DEBUG2) console.log("owner call succeeded")
           return result
         } catch (error: any) {
           console.log("ERROR: owner call failed: ", error)
@@ -992,7 +977,7 @@ export class ChannelServer implements DurableObject {
           return returnError(request, `API ERROR [L410] [${apiCall}]: ${error.message} \n ${error.stack}`);
         }
       } else if (this.visitorCalls[apiCall]) {
-        if (dbg.DEBUG) console.log("==== ChannelServer.fetch() ==== visitor call ====")
+        if (dbg.DEBUG2) console.log("==== ChannelServer.fetch() ==== visitor call ====")
         return await this.visitorCalls[apiCall]!(request, apiBody);
       } else {
         return returnError(request, "API endpoint not found: " + apiCall, 404)
@@ -1017,12 +1002,13 @@ export class ChannelServer implements DurableObject {
   // }
 
   async #incrementMessageCount(perma: boolean, messageSize: number): Promise<void> {
+    let deletedMessages = 0;
 
     // log and writeback core stats
     this.messageCount++;               // reminder: all messages
     const writebackPromises = [this.storage.put('messageCount', this.messageCount.toString())]
     if (perma) {
-      this.allMessageCount++;          // non-ephemeral messages
+      this.allMessageCount++;          // non-ephemeral messages, never zeroed
       this.newMessageCount++;          // non-ephemeral messages not yet shardified
       this.messageSize += messageSize  // size of ditto
       writebackPromises.push(
@@ -1039,19 +1025,18 @@ export class ChannelServer implements DurableObject {
 
     // if we are over our preferred limit, we initiate shardification
     if (MESSAGE_HISTORY && perma && !this.deepHistoryWritebackLock &&
-      (this.newMessageCount >= MSG_HISTORY_SET_SIZE || this.messageSize >= DeepHistory.MAX_MESSAGE_HISTORY_SHARD_SIZE)
+      (this.newMessageCount >= ChannelHistory.MAX_MESSAGE_SET_SIZE || this.messageSize >= ChannelHistory.MAX_MESSAGE_HISTORY_SHARD_SIZE)
     ) {
       this.deepHistoryWritebackLock = true; // LOCK out other writebacks (before any async operations)
-      if (DBG0 || dbg.DEBUG) console.log(`---- initiating shardification .. we have ${this.newMessageCount} messages`)
+      // if (DBG0 || dbg.DEBUG) console.log(`---- initiating shardification .. we have ${this.newMessageCount} messages`)
       _sb_assert(MESSAGE_HISTORY, "MESSAGE_HISTORY not set, fatal")
       if (!this.messageHistory) throw new SBError("ERROR: messageHistory not set, fatal (Internal Error L1046)")
       try {
-
-        if (DBG0) console.log("1111 1111 [DeepHistory] We have overflow, initiating shardification ..")
+        if (DBG0) console.log(SEP, `1111 1111 [DeepHistory] We have overflow (${this.newMessageCount} messages, ${this.messageSize} bytes), initiating shardification.`)
         const messageHistory = new Map<string, ChannelMessage>();
         const keysMap = await this.#_getMessageKeys('0', false) // get everything; don't cache
         const keys = Array.from(keysMap.keys())
-        if (DBG0) console.log("0000 0000 [storeMessageCache] Got keys: ", keys)
+        if (DBG0) console.log(SEP, "2222 2222 [storeMessageCache] Got keys:\n", keys)
         const getOptions: DurableObjectGetOptions = { allowConcurrency: true };
         let lowestFrom = Channel.HIGHEST_TIMESTAMP
         let highestTo = Channel.LOWEST_TIMESTAMP
@@ -1079,10 +1064,11 @@ export class ChannelServer implements DurableObject {
             }
           }
         }
-  
-        if (DBG0) console.log(SEP, "2222 2222 [DeepHistory] About to store with payload")
+
+        if (DBG0) console.log(SEP, "3333 3333 [DeepHistory] About to store with payload")
         const historyEntry: MessageHistory = {
-          version: '20240601.0',
+          type: 'messageHistory',
+          version: '20240603.0',
           channelId: this.channelId!,
           ownerPublicKey: this.channelData!.ownerPublicKey,
           created: Date.now(),
@@ -1092,30 +1078,44 @@ export class ChannelServer implements DurableObject {
           size: totalMessageSize,
           shard: await this.storeData(messageHistory),
         }
-        await this.messageHistory.insertValue(historyEntry, lowestFrom, highestTo)
+        await this.messageHistory.insert(historyEntry)
 
         const newHistoryContents = this.messageHistory.export()
-        if (DBG0) console.log(SEP, "3333 3333 [DeepHistory] Message history should be up to date:\n", SEP, newHistoryContents, SEP)
+        if (DBG0) console.log(SEP,
+          "4444 4444 [DeepHistory] Message history should be up to date:\n",
+          JSON.stringify(newHistoryContents, null, 2)
+        )
 
         // we await this separately from counters below
         const newHistoryContentsBuf = assemblePayload(newHistoryContents)
+        if (!newHistoryContentsBuf) throw new SBError("ERROR: failed to export message history (Internal Error L1100)")
+        if (newHistoryContentsBuf.byteLength >= 131072) {
+          console.error(SEP,
+            "ERROR: new history contents too large, aborting (Internal Error L1106)", SEP,
+            JSON.stringify(newHistoryContents, null, 2), SEP)
+          throw new SBError("ERROR: new history contents too large, aborting (Internal Error L1106)")
+        }
+
+        // TODO: oops it gets too big for local quick storage (limited to 128 KB)
         await this.storage.put('messageHistory', newHistoryContentsBuf)
 
         // we also add the history entry to the GLOBAL message KV
         const i2Key = Channel.composeMessageKey(this.channelId!, Channel.base4StringToTimestamp(lowestFrom), '_H__')
-        await this.env.MESSAGES_NAMESPACE.put(i2Key, newHistoryContentsBuf!);
+        // update: not the whole thing, just each new history entry as they come along
+        // await this.env.MESSAGES_NAMESPACE.put(i2Key, newHistoryContentsBuf!);
+        await this.env.MESSAGES_NAMESPACE.put(i2Key, assemblePayload(historyEntry)!);
 
-        if (DBG0) console.log(SEP, "4444 4444 [DeepHistory] Deleting old messages from local storage", SEP)
+        if (DBG0) console.log(SEP, "5555 5555 [DeepHistory] Deleting old messages from local storage")
         const keysToDelete = Array.from(messageHistory.keys())
+        deletedMessages += keysToDelete.length
         while (keysToDelete.length > 0) {
           const batchKeys = keysToDelete.splice(0, 128); // 128 is max number of keys we can delete in a single go
           await this.storage.delete(batchKeys)
         }
-
-        if (DBG0) console.log(SEP, "5555 5555 [DeepHistory] Updating history done, cleaning up", SEP)
+        if (DBG0) console.log(SEP, "6666 6666 [DeepHistory] Updating history done, cleaning up, deleted", deletedMessages, "messages")
         // reset counter; we do this last, so if we're restarted during the above, should just pick it back up
-        this.newMessageCount = 0;
-        this.messageSize = 0;
+        this.newMessageCount -= deletedMessages;
+        this.messageSize -= totalMessageSize;
         await Promise.all([
           this.storage.put('newMessageCount', this.newMessageCount.toString()),
           this.storage.put('messageSize', this.messageSize.toString())
@@ -1123,7 +1123,7 @@ export class ChannelServer implements DurableObject {
         this.deepHistoryWritebackLock = false; // UNLOCK
 
       } catch (error: any) {
-        throw new SBError("ERROR: failed to get storage server info: " + error)
+        throw new SBError("[DeepHistory] Error during operation: " + error)
       }
     }
   }
@@ -1142,7 +1142,7 @@ export class ChannelServer implements DurableObject {
         "\n", msg, "\n",
         // "-------------------------------------------------",
         // "\n", "apiBody:\n", apiBody, "\n",
-        )
+      )
 
       const message: ChannelMessage = validate_ChannelMessage(msg) // will throw if anything wrong
       // if (DBG0) console.log("Message after validation:", message)
@@ -1210,11 +1210,11 @@ export class ChannelServer implements DurableObject {
       if (dbg.DEBUG) {
         const payloadAsMetaData = arrayBufferToBase62(messagePayload)
         if (payloadAsMetaData.length <= 1000) { // some margin
-          console.log(SEPx)
+          console.log(_SEP_)
           // we're tracking this as 'fyi' for near future optimization
           console.log(`[info] this message could have been stored as metadata (size would be ${messagePayloadSize} chars)`)
           console.log(payloadAsMetaData.slice(0, 200) + "..." + payloadAsMetaData.slice(-50))
-          console.log(SEPx)
+          console.log(_SEP_)
         }
       }
 
@@ -1271,10 +1271,8 @@ export class ChannelServer implements DurableObject {
       if (dbg.LOG_ERRORS) console.error("[ChannelServer.send] No payload found?")
       return returnError(request, "No payload included - 'send' needs payload (...perhaps a missing 'await' at your end?)");
     }
-    if (dbg.DEBUG) {
-      console.log("==== ChannelServer.handleSend() called ====")
-      console.log(apiBody)
-    }
+    if (dbg.DEBUG2)
+      console.log("==== ChannelServer.handleSend() called ====\n", apiBody)
     try {
       await this.#processMessage(apiBody.apiPayload!, /* apiBody.userId, */ apiBody.isOwner! /*, apiBody */)
       return returnSuccess(request)
@@ -1379,7 +1377,7 @@ export class ChannelServer implements DurableObject {
       const session = this.sessions.get(userId)
       if (!session) {
         ws.close(1011, "[ChannelServer.webSocketMessage] No current session (closing socket), userId: " + userId);
-        if (DBG0 || dbg.LOG_ERRORS) console.log("[ChannelServer.webSocketMessage]: No sesssion for: ", userId)
+        if (dbg.DEBUG2 || dbg.LOG_ERRORS) console.log("[ChannelServer.webSocketMessage]: No sesssion for: ", userId)
       } else if (session.quit) {
         ws.close(1011, "[ChannelServer.webSocketMessage] The session has been closed (quit) for userId: " + userId);
         this.sessions.delete(userId);
@@ -1393,14 +1391,14 @@ export class ChannelServer implements DurableObject {
             // if we're asked for something that is before our oldest TTL0 message, then we
             // disconnect
             if (this.ttl0Buffer.bufferOldestTimestamp > msg && msg !== '0'.repeat(26)) {
-              if (DBG0) console.log(
+              if (dbg.DEBUG2) console.log(
                 SEP,
                 "Disconnecting client, requested TTL0 buffer is too old",
                 SEP,
                 "requested:", msg,
                 "oldest:   ", this.ttl0Buffer.bufferOldestTimestamp,
                 SEP
-                )
+              )
               ws.close(1011, "Requested TTL0 buffer is too old.");
               session.quit = true;
               this.sessions.delete(userId);
@@ -1409,7 +1407,7 @@ export class ChannelServer implements DurableObject {
               // console.log("CALLING iterate with msg:", msg)
               this.ttl0Buffer.iterate((_key, userId, message) => {
                 if (!userId || userId !== userId || session.isOwner) {
-                  if (DBG0) console.log(SEP, "sending TTL0 (and other) messages to client", SEP, extractPayload(message).payload, SEP)
+                  if (dbg.DEBUG2) console.log(SEP, "sending TTL0 (and other) messages to client", SEP, extractPayload(message).payload, SEP)
                   ws.send(message);
                 }
                 return true; // continue
@@ -1418,7 +1416,7 @@ export class ChannelServer implements DurableObject {
           } else switch (msg) {
             case 'close':
               // client sends 'close' if it's shutting down connection
-              if (DBG0 || dbg.DEBUG) console.log("client is shutting down connection")
+              if (dbg.DEBUG2 || dbg.DEBUG) console.log("client is shutting down connection")
               session.quit = true;
               ws.close(1011, "Client requested 'close'.");
               this.sessions.delete(userId);
@@ -1426,17 +1424,17 @@ export class ChannelServer implements DurableObject {
             case 'ping':
               // 'keep alive' message from client, respond with timestamp prefix; if running on
               // hibernation-capable network stack, this is caught before getting here
-              if (DBG0 || dbg.DEBUG) console.log("[ChannelServer.webSocketMessage] Sending ping response to client")
+              if (dbg.DEBUG2 || dbg.DEBUG) console.log("[ChannelServer.webSocketMessage] Sending ping response to client")
               ws.send(Channel.timestampToBase4String(this.latestTimestamp))
               return;
             case 'ready':
               // client sends a "ready" message when it can start receiving; reception means websocket is all set up
-              if (DBG0 || dbg.DEBUG) console.log("got 'ready' message from client, UserId:", userId)
+              if (dbg.DEBUG2 || dbg.DEBUG) console.log("got 'ready' message from client, UserId:", userId)
               session.ready = true;
               ws.send(this.readyMessage());
               return;
             default:
-              if (DBG0 || dbg.DEBUG) console.log("Got string message from client, but not recognized: ", msg)
+              if (dbg.DEBUG2 || dbg.DEBUG) console.log("Got string message from client, but not recognized: ", msg)
               ws.send(assemblePayload({ error: "[ChannelServer.webSocketMessage] Message not recognized (fatal): " + msg })!);
               return;
           }
@@ -1459,7 +1457,7 @@ export class ChannelServer implements DurableObject {
       ready: true,
       messageCount: this.messageCount,
       latestTimestamp: Channel.timestampToBase4String(this.latestTimestamp),
-     })!;
+    })!;
   }
 
   async #setUpNewSession(webSocket: WebSocket, _ip: string | null, apiBody: ChannelApiBody) {
@@ -1467,7 +1465,7 @@ export class ChannelServer implements DurableObject {
 
     // (webSocket as any).accept(); // typing override (old issue with CF types)
 
-    if (DBG0) console.log("Setting up new websocket session for user: ", apiBody.userId)
+    if (dbg.DEBUG2) console.log("Setting up new websocket session for user: ", apiBody.userId)
     this.state.acceptWebSocket(webSocket, [apiBody.userId])
 
     // attach (serializable) subset of info to websocket
@@ -1496,7 +1494,7 @@ export class ChannelServer implements DurableObject {
     // if same listener is already active, we close it; note we try to follow
     // https://www.rfc-editor.org/rfc/rfc6455.html#section-7.4.1
     if (this.sessions.has(apiBody.userId)) {
-      if (DBG0 || dbg.DEBUG) console.log("closing previous session for same user")
+      if (dbg.DEBUG2 || dbg.DEBUG) console.log("closing previous session for same user")
       this.sessions.get(apiBody.userId)!.webSocket!.close(1011, "Same user/key has opened a new session; closing this one.");
     }
 
@@ -1556,7 +1554,7 @@ export class ChannelServer implements DurableObject {
   // get keys. if limit is not provided, then don't put a constraint on the CF API;
   // note that actual limit is currently (2024.05) at 1000.  'cache' tells whether
   // the callee expects these keys to be needed again / soon (inverse of noCache)
-  async #_getMessageKeys(prefix: string, cache: boolean, limit?: number ) {
+  async #_getMessageKeys(prefix: string, cache: boolean, limit?: number) {
     const listOptions: DurableObjectListOptions = {
       prefix: this.channelId! + '______' + prefix,
       reverse: true,
@@ -1633,13 +1631,13 @@ export class ChannelServer implements DurableObject {
   createCustomFetch(env: EnvType) {
     // This function returns a new function that is "fetch-like"
     return async function (input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
-      if (DBG0) console.log("Custom fetch called with: ", input);
+      if (dbg.DEBUG2) console.log("Custom fetch called with: ", input);
       if (typeof input === 'string' && input.includes("<CHANNEL_SERVER_REDIRECT>")) {
         _sb_assert(dbg.myOrigin, "Our origin still unknown. Internal Error [L1238]")
         input = dbg.myOrigin + input.replace("<CHANNEL_SERVER_REDIRECT>", "");
         const request = new Request(input, init);
         const result = await serverFetch(request, env); // closure over env
-        if (DBG0) {
+        if (dbg.DEBUG2) {
           const clonedResult = result.clone();
           console.log("Got response from ourselves: ", clonedResult);
           console.log("Content type: ", clonedResult.headers.get('content-type'));
@@ -1659,12 +1657,12 @@ export class ChannelServer implements DurableObject {
         return result;
       }
       if (env.IS_LOCAL || env.ENVIRONMENT === 'development') {
-        if (DBG0) console.log(SEP, "Running LOCAL. We just relay the fetch ('development'):\n", input, SEP)
+        if (dbg.DEBUG2) console.log(SEP, "Running LOCAL. We just relay the fetch ('development'):\n", input, SEP)
         return fetch(input, init);
       } else {
-        if (DBG0) console.log(SEP, "Deployed. We redirect storage API calls to service binding:\n", input, SEP)
+        if (dbg.DEBUG2) console.log(SEP, "Deployed. We redirect storage API calls to service binding:\n", input, SEP)
         const response = await storageServerBinding.fetch(input, init);
-        if (DBG0) console.log("Got response from storage server (NON LOCAL): ", response);
+        if (dbg.DEBUG2) console.log("Got response from storage server (NON LOCAL): ", response);
         return response;
       }
     };
@@ -1690,10 +1688,10 @@ export class ChannelServer implements DurableObject {
     const x = await stringify_SBObjectHandle(h)
     // clean up and return
     return {
-        id: x.id!,
-        key: x.key!,
-        verification: x.verification!
-    }    
+      id: x.id!,
+      key: x.key!,
+      verification: x.verification!
+    }
   }
 
   async #getHistory(request: Request, _apiBody: ChannelApiBody) {
@@ -1711,7 +1709,7 @@ export class ChannelServer implements DurableObject {
       if (clientKeys.size === 0) return returnError(request, "[getMessages] No keys provided", 400)
       const regex = /^([a-zA-Z0-9]+)______([0-3]{26})$/;
       const validKeys: Array<string> = [];
-      
+
       // const ttl0bufferKeys = this.ttl0Buffer.getMessageKeys()
       // const requestedTTL0Keys = []
       for (const key of clientKeys) {
@@ -1720,7 +1718,7 @@ export class ChannelServer implements DurableObject {
           // if (ttl0bufferKeys.has(key)) {
           //   requestedTTL0Keys.push(key)
           // } else {
-            validKeys.push(key);
+          validKeys.push(key);
           // }
         } else if (dbg.DEBUG) {
           console.error("ERROR: tried to read key with invalid key format: ", key)
@@ -1811,7 +1809,7 @@ export class ChannelServer implements DurableObject {
       throw new Error(`[ChannelServer] Storage size too large (max 2^52 and we got ${size})`);
     } else {
       const blockSize = BLOCK_SIZE;
-      const roundedSize = Math.floor(size / blockSize) * blockSize;  
+      const roundedSize = Math.floor(size / blockSize) * blockSize;
       return size > roundedSize && roundUp ? roundedSize + blockSize : roundedSize;
     }
   }
@@ -1839,18 +1837,18 @@ export class ChannelServer implements DurableObject {
       }
       if (size > this.storageLimit)
         // if a specific amount is requested that exceeds the budget, we do NOT interpret it as plunder
-        throw new SBError(`Not enough storage budget in mother channel - requested ${size} from '${this.channelId?.slice(0,16)}...', ${this.storageLimit} available`);
+        throw new SBError(`Not enough storage budget in mother channel - requested ${size} from '${this.channelId?.slice(0, 16)}...', ${this.storageLimit} available`);
     } else {
       // if it's negative, it's interpreted as how much to leave behind
       const _leaveBehind = -size;
       if (_leaveBehind > this.storageLimit)
         throw new SBError(`Not enough storage budget in mother channel - requested to leave behind ${_leaveBehind}, ${this.storageLimit} available`);
-        size = this.storageLimit - _leaveBehind;
+      size = this.storageLimit - _leaveBehind;
     }
     this.storageLimit -= size; // apply reduction
     this.storageLimit = Math.floor(this.storageLimit); // make sure it's an integer
     await this.storage.put('storageLimit', this.storageLimit); // here we've consumed it
-    if (dbg.DEBUG2) console.log("[#consumeSTorage] Storage amount consumed:", size, "bytes; new limit:", this.storageLimit, "bytes") 
+    if (dbg.DEBUG2) console.log("[#consumeSTorage] Storage amount consumed:", size, "bytes; new limit:", this.storageLimit, "bytes")
     return size // return what was actually consumed
   }
 
