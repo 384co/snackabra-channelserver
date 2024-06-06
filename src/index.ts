@@ -463,8 +463,7 @@ export class ChannelServer implements DurableObject {
   /* 'newMessageCount'     */ newMessageCount: number = 0;     // the subset of 'messageCount' that has not been shardified  
   /* 'messageSize'         */ messageSize: number = 0;         // size of ditto (size of all messages not yet shardified/archived)
 
-  /* 'messageHistory'      */ // messageHistory: MessageHistoryDirectory | null = null;
-  /* 'messageHistory'      */ messageHistory: ChannelHistory | null = null;
+  /* 'messageHistoryV2'    */ messageHistory: ChannelHistory | null = null;
   deepHistoryWritebackLock: boolean = false; // 'LOCK' for deephistory work
 
   /* the rest are for run time and are not backed up as such to KVs  */
@@ -739,7 +738,7 @@ export class ChannelServer implements DurableObject {
           'messageSize',
           'allMessageCount',
           'newMessageCount',
-          'messageHistory',
+          'messageHistoryV2',
           // 'ttl0Buffer',
         ]
       )
@@ -782,7 +781,7 @@ export class ChannelServer implements DurableObject {
 
       this.newMessageCount = Number(channelState.get('newMessageCount')) || 0
 
-      const oldMessageHistory = channelState.get('messageHistory')
+      const oldMessageHistory = channelState.get('messageHistoryV2')
       if (oldMessageHistory && oldMessageHistory instanceof ArrayBuffer) {
         // this.messageHistory = extractPayload(oldMessageHistory as ArrayBuffer).payload as MessageHistoryDirectory
         const h = extractPayload(oldMessageHistory).payload
@@ -1097,7 +1096,7 @@ export class ChannelServer implements DurableObject {
         }
 
         // TODO: oops it gets too big for local quick storage (limited to 128 KB)
-        await this.storage.put('messageHistory', newHistoryContentsBuf)
+        await this.storage.put('messageHistoryV2', newHistoryContentsBuf)
 
         // we also add the history entry to the GLOBAL message KV
         const i2Key = Channel.composeMessageKey(this.channelId!, Channel.base4StringToTimestamp(lowestFrom), '_H__')
