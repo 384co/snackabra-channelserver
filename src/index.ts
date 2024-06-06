@@ -238,7 +238,7 @@ function serverInfo(request: Request, env: EnvType) {
     channelServer: url.hostname,
     storageServer: storageUrl,
     jslibVersion: Snackabra.version,
-    maxMessageSetSize: serverConstants.MAX_MESSAGE_SET_SIZE,
+    maxMessageRequestSize: serverConstants.MAX_MESSAGE_REQUEST_SIZE,
 
     // ... we would have to go to DO for this info, and we don't want to
     // apiEndpoints: {
