@@ -1384,35 +1384,38 @@ export class ChannelServer implements DurableObject {
       } else {
         if (typeof msg === "string") {
           // the channel server responds directly to any string type messages,
-          // these are 'link level' (kind of).
+          // these are OSI 'link level' messages (kind of).
           const regex = /^[0-3]{26}$/;
           if (regex.test(msg)) {
             // if it's a (timestamp) prefix string, then it's a request for TTL0 buffer
-            // if we're asked for something that is before our oldest TTL0 message, then we
-            // disconnect
-            if (this.ttl0Buffer.bufferOldestTimestamp > msg && msg !== '0'.repeat(26)) {
-              if (dbg.DEBUG2) console.log(
+
+            // update: with DeepHistory and websocket-based message generation
+            // testing, TTL0 buffer gets blown out all the time. Originally this
+            // was coded conservatively and would disconnect. but just ignoring
+            // seems better (or? might merit revisiting).
+            if (dbg.DEBUG2 && this.ttl0Buffer.bufferOldestTimestamp > msg && msg !== '0'.repeat(26)) {
+              console.log(
                 SEP,
-                "Disconnecting client, requested TTL0 buffer is too old",
+                "Requested TTL0 buffer is too old. We used to disconnect, now we just ignore.",
                 SEP,
                 "requested:", msg,
                 "oldest:   ", this.ttl0Buffer.bufferOldestTimestamp,
                 SEP
               )
-              ws.close(1011, "Requested TTL0 buffer is too old.");
-              session.quit = true;
-              this.sessions.delete(userId);
-            } else {
-              // we iterate through TTL0 buffer and send all messages with timestamp > prefix
-              // console.log("CALLING iterate with msg:", msg)
-              this.ttl0Buffer.iterate((_key, userId, message) => {
-                if (!userId || userId !== userId || session.isOwner) {
-                  if (dbg.DEBUG2) console.log(SEP, "sending TTL0 (and other) messages to client", SEP, extractPayload(message).payload, SEP)
-                  ws.send(message);
-                }
-                return true; // continue
-              }, msg);
+              // ws.close(1011, "Requested TTL0 buffer is too old.");
+              // session.quit = true;
+              // this.sessions.delete(userId);
             }
+
+            // we iterate through TTL0 buffer and send all messages with timestamp > prefix
+            // console.log("CALLING iterate with msg:", msg)
+            this.ttl0Buffer.iterate((_key, userId, message) => {
+              if (!userId || userId !== userId || session.isOwner) {
+                if (dbg.DEBUG2) console.log(SEP, "sending TTL0 (and other) messages to client", SEP, extractPayload(message).payload, SEP)
+                ws.send(message);
+              }
+              return true; // continue
+            }, msg);
           } else switch (msg) {
             case 'close':
               // client sends 'close' if it's shutting down connection
