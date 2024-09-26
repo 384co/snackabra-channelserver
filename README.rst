@@ -7,6 +7,10 @@
 Snackabra Room Server
 =====================
 
+_This is main branch off a fork of snackabra/snackabra-channelserver. This is outdated.
+ In os384 this is superceded by 'servers-2024-rcN'. Do NOT develop here further_
+
+
 This repository is for the chat room server. For general documentation
 on Snackabra see: https://snackabra.io
 
