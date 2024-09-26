@@ -7,7 +7,8 @@
 Snackabra Room Server
 =====================
 
-_This is all very, very outdated_
+_This is branch 'psm-refactor' off a fork of snackabra/snackabra-channelserver.
+ In os384 this is superceded by 'servers-2024-rcN'. Do NOT develop here further_
 
 This repository is for the chat room server. For general documentation
 on Snackabra see: https://snackabra.io
